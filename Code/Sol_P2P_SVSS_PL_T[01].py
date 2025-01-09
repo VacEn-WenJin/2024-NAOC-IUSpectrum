@@ -451,6 +451,40 @@ def CK_SpFT(I_index, J_index):
 
 
 ### ------------------------------------------------- ### ------------------------------------------------- ### ------------------------------------------------- ###
+# Emission Line
+### ------------------------------------------------- ### ------------------------------------------------- ### ------------------------------------------------- ###
+
+H_Beta_EL_map = np.ndarray(shape=Galaxy_info.cube.shape[1:3])
+H_Beta_EL_AN_map = np.ndarray(shape=Galaxy_info.cube.shape[1:3])
+O_5007_EL_map = np.ndarray(shape=Galaxy_info.cube.shape[1:3])
+O_5007_EL_AN_map = np.ndarray(shape=Galaxy_info.cube.shape[1:3])
+
+names = ['Hbeta', '[OIII]5007_d']
+c_kms = 299792.458  # speed of light in km/s
+
+# for i in tqdm(range(galaxies.shape[1])):
+for i in range(galaxies.shape[1]):
+    for j in range(galaxies.shape[2]):
+        # if(i == 11 and j ==43):
+            K_index = i*max(Galaxy_info.col)+j
+            rms = robust_sigma(Galaxy_info.spectra[:,i*max(Galaxy_info.col)+j] - PP_box[K_index].bestfit, zero=1)
+            for p, name in enumerate(names):
+                kk = gas_names == name + '_(1)'   # Extract first gas kinematic component
+                # print(kk)
+                dlam = line_wave[kk]*Galaxy_info.velscale/c_kms   # Angstrom per pixel at line wavelength (dlam/lam = dv/c)
+                flux = (PP_box[K_index].gas_flux[kk]*dlam)[0]  # Convert to ergs/(cm^2 s)
+                an = np.max(PP_box[K_index].gas_bestfit_templates[:, kk])/rms
+                # print(f"{name:12s} - Amplitude/Noise: {an:6.4g}; gas flux: {flux:6.0f} ergs/(cm^2 s)")
+                if(kk[0]):
+                    H_Beta_EL_map[i,j] = flux
+                    H_Beta_EL_AN_map[i,j] = an
+                if(kk[1]):
+                    O_5007_EL_map[i,j] = flux
+                    O_5007_EL_AN_map[i,j] = an
+
+
+
+### ------------------------------------------------- ### ------------------------------------------------- ### ------------------------------------------------- ###
 # Spectrum Index
 ### ------------------------------------------------- ### ------------------------------------------------- ### ------------------------------------------------- ###
 
@@ -505,3 +539,120 @@ for i in tqdm(range(galaxies.shape[1])):
         H_Beta_map[i,j] = np.trapz(NS, x_wave[:,i,j])
 
 #Fe 5015
+
+LP = np.mean([Index_Wave.loc[1,'BPC_range'][0],Index_Wave.loc[1,'BPC_range'][1]])
+RP = np.mean([Index_Wave.loc[1,'RPC_range'][0],Index_Wave.loc[1,'RPC_range'][1]])
+
+x_wave = np.ndarray(shape=(len(lam_gal[ np.where((lam_gal>LP) & (lam_gal<RP)) ]),Galaxy_info.cube.shape[1],Galaxy_info.cube.shape[2]))
+y_spectrum = np.ndarray(shape=(len(lam_gal[ np.where((lam_gal>LP) & (lam_gal<RP)) ]),Galaxy_info.cube.shape[1],Galaxy_info.cube.shape[2]))
+y_SL = np.ndarray(shape=(len(lam_gal[ np.where((lam_gal>LP) & (lam_gal<RP)) ]),Galaxy_info.cube.shape[1],Galaxy_info.cube.shape[2]))
+
+for i in tqdm(range(galaxies.shape[1])):
+    for j in range(galaxies.shape[2]):
+        
+        K_index = i*max(Galaxy_info.col)+j
+        spectrum_fit_NEL = PP_box[K_index].bestfit
+        for k in [0,1]:
+            spectrum_fit_NEL = spectrum_fit_NEL - PP_box[K_index].gas_bestfit_templates[:,k]
+
+        LP = np.mean([Index_Wave.loc[1,'BPC_range'][0],Index_Wave.loc[1,'BPC_range'][1]])
+        RP = np.mean([Index_Wave.loc[1,'RPC_range'][0],Index_Wave.loc[1,'RPC_range'][1]])
+        LCB = Index_Wave.loc[1,'CBP_range'][0]
+        RCB = Index_Wave.loc[1,'CBP_range'][1]
+        LPV = np.mean(spectrum_fit_NEL[ np.where((lam_gal>Index_Wave.loc[1,'BPC_range'][0]) & (lam_gal<Index_Wave.loc[1,'BPC_range'][1])) ])
+        RPV = np.mean(spectrum_fit_NEL[ np.where((lam_gal>Index_Wave.loc[1,'RPC_range'][0]) & (lam_gal<Index_Wave.loc[1,'RPC_range'][1])) ])
+
+        # H_Beta_map[i,j] = np.trapz(Bestfitfield[:,i,j][ np.where((lam_gal>LP) & (lam_gal<RP)) ], lam_gal[ np.where((lam_gal>LP) & (lam_gal<RP)) ]) - np.trapz([LPV,RPV],[LP,RP])
+
+        x_wave[:,i,j] = lam_gal[ np.where((lam_gal>LP) & (lam_gal<RP)) ]
+        y_spectrum[:,i,j] = spectrum_fit_NEL[ np.where((lam_gal>LP) & (lam_gal<RP)) ]
+        y_SL[:,i,j] = x_wave[:,i,j] * ((RPV-LPV)/(RP-LP)) - LP * ((RPV-LPV)/(RP-LP)) + LPV
+
+        NS = y_SL[:,i,j] - y_spectrum[:,i,j]
+        for k in range(len(y_SL[:,i,j])):
+            NS[k] = NS[k]/y_SL[k,i,j]
+
+        Fe_5015_map[i,j] = np.trapz(NS, x_wave[:,i,j])
+
+#Mg b
+
+LP = np.mean([Index_Wave.loc[2,'BPC_range'][0],Index_Wave.loc[2,'BPC_range'][1]])
+RP = np.mean([Index_Wave.loc[2,'RPC_range'][0],Index_Wave.loc[2,'RPC_range'][1]])
+
+x_wave = np.ndarray(shape=(len(lam_gal[ np.where((lam_gal>LP) & (lam_gal<RP)) ]),Galaxy_info.cube.shape[1],Galaxy_info.cube.shape[2]))
+y_spectrum = np.ndarray(shape=(len(lam_gal[ np.where((lam_gal>LP) & (lam_gal<RP)) ]),Galaxy_info.cube.shape[1],Galaxy_info.cube.shape[2]))
+y_SL = np.ndarray(shape=(len(lam_gal[ np.where((lam_gal>LP) & (lam_gal<RP)) ]),Galaxy_info.cube.shape[1],Galaxy_info.cube.shape[2]))
+
+for i in tqdm(range(galaxies.shape[1])):
+    for j in range(galaxies.shape[2]):
+        
+        K_index = i*max(Galaxy_info.col)+j
+        spectrum_fit_NEL = PP_box[K_index].bestfit
+        for k in [0,1]:
+            spectrum_fit_NEL = spectrum_fit_NEL - PP_box[K_index].gas_bestfit_templates[:,k]
+
+
+        LP = np.mean([Index_Wave.loc[2,'BPC_range'][0],Index_Wave.loc[2,'BPC_range'][1]])
+        RP = np.mean([Index_Wave.loc[2,'RPC_range'][0],Index_Wave.loc[2,'RPC_range'][1]])
+        LCB = Index_Wave.loc[2,'CBP_range'][0]
+        RCB = Index_Wave.loc[2,'CBP_range'][1]
+        LPV = np.mean(spectrum_fit_NEL[ np.where((lam_gal>Index_Wave.loc[2,'BPC_range'][0]) & (lam_gal<Index_Wave.loc[2,'BPC_range'][1])) ])
+        RPV = np.mean(spectrum_fit_NEL[ np.where((lam_gal>Index_Wave.loc[2,'RPC_range'][0]) & (lam_gal<Index_Wave.loc[2,'RPC_range'][1])) ])
+
+        # H_Beta_map[i,j] = np.trapz(Bestfitfield[:,i,j][ np.where((lam_gal>LP) & (lam_gal<RP)) ], lam_gal[ np.where((lam_gal>LP) & (lam_gal<RP)) ]) - np.trapz([LPV,RPV],[LP,RP])
+
+        x_wave[:,i,j] = lam_gal[ np.where((lam_gal>LP) & (lam_gal<RP)) ]
+        y_spectrum[:,i,j] = spectrum_fit_NEL[ np.where((lam_gal>LP) & (lam_gal<RP)) ]
+        y_SL[:,i,j] = x_wave[:,i,j] * ((RPV-LPV)/(RP-LP)) - LP * ((RPV-LPV)/(RP-LP)) + LPV
+
+        NS = y_SL[:,i,j] - y_spectrum[:,i,j]
+        for k in range(len(y_SL[:,i,j])):
+            NS[k] = NS[k]/y_SL[k,i,j]
+
+        Mg_b_map[i,j] = np.trapz(NS, x_wave[:,i,j])
+
+
+### ------------------------------------------------- ### ------------------------------------------------- ### ------------------------------------------------- ###
+# Data Collection
+### ------------------------------------------------- ### ------------------------------------------------- ### ------------------------------------------------- ###
+
+VNB_Sol = pd.DataFrame({'H_beta_EL_value':[],'H_beta_EL_ANR':[],
+                        'O_3_5007_EL_value':[],'O_3_5007_EL_ANR':[],
+                        'Component_Sol':[],
+                        'Component_Sol_00':[],'Component_Sol_01':[],
+                        'Component_Sol_10':[],'Component_Sol_11':[],
+                        'H_beta_SI':[],'Mg_b_SI':[],'Fe_5015_SI':[],
+                        'R':[],'SNR':[],'Signal':[],'Noise':[],
+                        'K_index':[]})
+
+def TB_reindex(TB_now):
+    TB_now = TB_now.reset_index()
+    TB_now = TB_now.drop(columns='index')
+    return TB_now
+
+for i in range(Galaxy_info.cube.shape[1]):
+    for j in range(Galaxy_info.cube.shape[2]):
+        K_index = i*max(Galaxy_info.col)+j
+
+        S_val = np.mean(Galaxy_info.spectra[:,K_index][ np.where((lam_gal>5075) & (lam_gal<5125)) ]/PP_box[K_index].bestfit[ np.where((lam_gal>5075) & (lam_gal<5125)) ])
+        N_val = np.std(Galaxy_info.spectra[:,K_index][ np.where((lam_gal>5075) & (lam_gal<5125)) ]/PP_box[K_index].bestfit[ np.where((lam_gal>5075) & (lam_gal<5125)) ])
+
+
+        Ori_ra  = Galaxy_info.CRVAL1 + ((i)*Galaxy_info.CD1_2) + ((j)*Galaxy_info.CD1_1) + (Galaxy_info.CD1_2+Galaxy_info.CD1_1)/2
+        Ori_dec = Galaxy_info.CRVAL2 + ((i)*Galaxy_info.CD2_2) + ((j)*Galaxy_info.CD2_1) + (Galaxy_info.CD2_2+Galaxy_info.CD2_1)/2
+        O_x = (Galaxy_info.CRVAL1 + (((Galaxy_info.cube.shape[1])*Galaxy_info.CD1_2) + ((Galaxy_info.cube.shape[2])*Galaxy_info.CD1_1))/2)
+        O_y = (Galaxy_info.CRVAL2 + (((Galaxy_info.cube.shape[1])*Galaxy_info.CD2_2) + ((Galaxy_info.cube.shape[2])*Galaxy_info.CD2_1))/2)
+        R = np.sqrt((Ori_ra - O_x)**2 + (Ori_dec - O_y)**2)
+
+        VNB_Sol_lim = pd.DataFrame({'H_beta_EL_value':[H_Beta_EL_map[i,j]],'H_beta_EL_ANR':[H_Beta_EL_AN_map[i,j]],
+                        'O_3_5007_EL_value':[O_5007_EL_map[i,j]],'O_3_5007_EL_ANR':[O_5007_EL_AN_map[i,j]],
+                        'Component_Sol':[PP_box[K_index].sol],
+                        'Component_Sol_00':[PP_box[K_index].sol[0][0]],'Component_Sol_01':[PP_box[K_index].sol[0][1]],
+                        'Component_Sol_10':[PP_box[K_index].sol[1][0]],'Component_Sol_11':[PP_box[K_index].sol[1][1]],
+                        'H_beta_SI':[H_Beta_map[i,j]],'Mg_b_SI':[Fe_5015_map[i,j]],'Fe_5015_SI':[Mg_b_map[i,j]],
+                        'R':[R],'SNR':[S_val/N_val],'Signal':[S_val],'Noise':[N_val],
+                        'K_index':[[K_index]]})
+        
+        VNB_Sol = TB_reindex(pd.concat([VNB_Sol, VNB_Sol_lim]))
+
+VNB_Sol.to_csv('./../FitData/Fit_DS_09[25Jan07][VCC1588]/'+galaxy_name+'_P2P_SFR.csv')
