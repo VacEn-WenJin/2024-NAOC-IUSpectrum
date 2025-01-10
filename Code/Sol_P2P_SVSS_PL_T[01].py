@@ -69,8 +69,8 @@ spectrum_filename = 'VCC1588_stack.fits'
 spectrum_z = 0.0042
 
 redshift = spectrum_z           # redshift from
-objfile = Path('./../Ori_Data/'+spectrum_filename)
-
+# objfile = Path('./../Ori_Data/'+spectrum_filename)
+objfile = Path('E:/ProGram/Dr.Zheng/2024NAOC-IUS/Wkp/2024-NAOC-IUSpectrum/Ori_Data/'+spectrum_filename)
 
 
 
@@ -513,16 +513,18 @@ RP = np.mean([Index_Wave.loc[0,'RPC_range'][0],Index_Wave.loc[0,'RPC_range'][1]]
 
 for i in tqdm(range(galaxies.shape[1])):
     for j in range(galaxies.shape[2]):
+        K_index = i*max(Galaxy_info.col)+j
 
         V_cor = PP_box[K_index].sol[0][0]
-        lam_gal = lam_gal_save/(1+(V_cor/c))
+        # lam_gal = lam_gal_save/(1+(V_cor/c))
+        for k_loop in range(len(lam_gal_save)):
+            lam_gal[k_loop] = lam_gal_save[k_loop]/(1+(V_cor/c))
 
 
         x_wave = np.ndarray(shape=(len(lam_gal[ np.where((lam_gal>LP) & (lam_gal<RP)) ]),Galaxy_info.cube.shape[1],Galaxy_info.cube.shape[2]))
         y_spectrum = np.ndarray(shape=(len(lam_gal[ np.where((lam_gal>LP) & (lam_gal<RP)) ]),Galaxy_info.cube.shape[1],Galaxy_info.cube.shape[2]))
         y_SL = np.ndarray(shape=(len(lam_gal[ np.where((lam_gal>LP) & (lam_gal<RP)) ]),Galaxy_info.cube.shape[1],Galaxy_info.cube.shape[2]))
         
-        K_index = i*max(Galaxy_info.col)+j
         spectrum_fit_NEL = PP_box[K_index].bestfit
         for k in [0,1]:
             spectrum_fit_NEL = spectrum_fit_NEL - PP_box[K_index].gas_bestfit_templates[:,k]
@@ -556,15 +558,17 @@ RP = np.mean([Index_Wave.loc[1,'RPC_range'][0],Index_Wave.loc[1,'RPC_range'][1]]
 
 for i in tqdm(range(galaxies.shape[1])):
     for j in range(galaxies.shape[2]):
+        K_index = i*max(Galaxy_info.col)+j
         
         V_cor = PP_box[K_index].sol[0][0]
-        lam_gal = lam_gal_save/(1+(V_cor/c))
+        # lam_gal = lam_gal_save/(1+(V_cor/c))
+        for k_loop in range(len(lam_gal_save)):
+            lam_gal[k_loop] = lam_gal_save[k_loop]/(1+(V_cor/c))
 
         x_wave = np.ndarray(shape=(len(lam_gal[ np.where((lam_gal>LP) & (lam_gal<RP)) ]),Galaxy_info.cube.shape[1],Galaxy_info.cube.shape[2]))
         y_spectrum = np.ndarray(shape=(len(lam_gal[ np.where((lam_gal>LP) & (lam_gal<RP)) ]),Galaxy_info.cube.shape[1],Galaxy_info.cube.shape[2]))
         y_SL = np.ndarray(shape=(len(lam_gal[ np.where((lam_gal>LP) & (lam_gal<RP)) ]),Galaxy_info.cube.shape[1],Galaxy_info.cube.shape[2]))
         
-        K_index = i*max(Galaxy_info.col)+j
         spectrum_fit_NEL = PP_box[K_index].bestfit
         for k in [0,1]:
             spectrum_fit_NEL = spectrum_fit_NEL - PP_box[K_index].gas_bestfit_templates[:,k]
@@ -596,16 +600,17 @@ RP = np.mean([Index_Wave.loc[2,'RPC_range'][0],Index_Wave.loc[2,'RPC_range'][1]]
 
 for i in tqdm(range(galaxies.shape[1])):
     for j in range(galaxies.shape[2]):
-
+        K_index = i*max(Galaxy_info.col)+j
         
         V_cor = PP_box[K_index].sol[0][0]
-        lam_gal = lam_gal_save/(1+(V_cor/c))
+        # lam_gal = lam_gal_save/(1+(V_cor/c))
+        for k_loop in range(len(lam_gal_save)):
+            lam_gal[k_loop] = lam_gal_save[k_loop]/(1+(V_cor/c))
 
         x_wave = np.ndarray(shape=(len(lam_gal[ np.where((lam_gal>LP) & (lam_gal<RP)) ]),Galaxy_info.cube.shape[1],Galaxy_info.cube.shape[2]))
         y_spectrum = np.ndarray(shape=(len(lam_gal[ np.where((lam_gal>LP) & (lam_gal<RP)) ]),Galaxy_info.cube.shape[1],Galaxy_info.cube.shape[2]))
         y_SL = np.ndarray(shape=(len(lam_gal[ np.where((lam_gal>LP) & (lam_gal<RP)) ]),Galaxy_info.cube.shape[1],Galaxy_info.cube.shape[2]))
         
-        K_index = i*max(Galaxy_info.col)+j
         spectrum_fit_NEL = PP_box[K_index].bestfit
         for k in [0,1]:
             spectrum_fit_NEL = spectrum_fit_NEL - PP_box[K_index].gas_bestfit_templates[:,k]
@@ -674,4 +679,4 @@ for i in range(Galaxy_info.cube.shape[1]):
         
         VNB_Sol = TB_reindex(pd.concat([VNB_Sol, VNB_Sol_lim]))
 
-VNB_Sol.to_csv('./../FitData/Fit_DS_10[25Jan09][VCC1588]/'+galaxy_name+'_P2P_SFR.csv')
+VNB_Sol.to_csv('E:/ProGram/Dr.Zheng/2024NAOC-IUS/Wkp/2024-NAOC-IUSpectrum/FitData/Fit_DS_10[25Jan09][VCC1588]/'+galaxy_name+'_P2P_SFR.csv')
