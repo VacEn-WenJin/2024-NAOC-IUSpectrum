@@ -219,7 +219,7 @@ Galaxy_info = read_data_cube(objfile, lam_range_temp, redshift)
 ### ------------------------------------------------- ###
 
 FWHM_gal = None   # set this to None to skip templates broadening
-sps = lib.sps_lib(filename, Galaxy_info.velscale, FWHM_gal, norm_range=[4827.875, 5206.375])
+sps = lib.sps_lib(filename, Galaxy_info.velscale, FWHM_gal, norm_range=[4800, 5230])
 # sps = lib.sps_lib(filename, Galaxy_info.velscale, FWHM_gal)
 
 
@@ -658,6 +658,7 @@ for i in range(Galaxy_info.cube.shape[1]):
     for j in range(Galaxy_info.cube.shape[2]):
         K_index = i*max(Galaxy_info.col)+j
 
+        lam_gal = lam_gal_save
         S_val = np.mean(Galaxy_info.spectra[:,K_index][ np.where((lam_gal>5075) & (lam_gal<5125)) ]/PP_box[K_index].bestfit[ np.where((lam_gal>5075) & (lam_gal<5125)) ])
         N_val = np.std(Galaxy_info.spectra[:,K_index][ np.where((lam_gal>5075) & (lam_gal<5125)) ]/PP_box[K_index].bestfit[ np.where((lam_gal>5075) & (lam_gal<5125)) ])
 
@@ -679,4 +680,4 @@ for i in range(Galaxy_info.cube.shape[1]):
         
         VNB_Sol = TB_reindex(pd.concat([VNB_Sol, VNB_Sol_lim]))
 
-VNB_Sol.to_csv('E:/ProGram/Dr.Zheng/2024NAOC-IUS/Wkp/2024-NAOC-IUSpectrum/FitData/Fit_DS_10[25Jan09][VCC1588]/'+galaxy_name+'_P2P_SFR.csv')
+VNB_Sol.to_csv('E:/ProGram/Dr.Zheng/2024NAOC-IUS/Wkp/2024-NAOC-IUSpectrum/FitData/Fit_DS_11[25Jan13][VCC1588]/'+galaxy_name+'_P2P_SFR.csv')
