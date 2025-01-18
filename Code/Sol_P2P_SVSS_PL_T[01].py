@@ -92,7 +92,7 @@ filename = ppxf_dir / 'sps_models' / basename
 vel_s = 0
 vel_dis_s = 40 # Set the dis v = 40 km/s
 
-lam_range_temp = [4820, 5220]
+lam_range_temp = [4800, 5230]
 
 
 
@@ -174,8 +174,10 @@ class read_data_cube:
         the FITS file under analysis.                
         """
 
-        Cut_LHS = 150
-        Cut_RHS = 150
+        # Cut_LHS = 150
+        # Cut_RHS = 150
+        Cut_LHS = 100
+        Cut_RHS = 100
 
         hdu = fits.open(filename)
         head = hdu[0].header
@@ -213,7 +215,7 @@ Galaxy_info = read_data_cube(objfile, lam_range_temp, redshift)
 ### ------------------------------------------------- ### ------------------------------------------------- ### ------------------------------------------------- ###
 
 
-
+s
 ### ------------------------------------------------- ###
 # Fitting Pre-set
 ### ------------------------------------------------- ###
