@@ -92,7 +92,7 @@ filename = ppxf_dir / 'sps_models' / basename
 vel_s = 0
 vel_dis_s = 40 # Set the dis v = 40 km/s
 
-lam_range_temp = [4800, 5230]
+lam_range_temp = [4822, 5212]
 
 
 
@@ -176,8 +176,8 @@ class read_data_cube:
 
         # Cut_LHS = 150
         # Cut_RHS = 150
-        Cut_LHS = 100
-        Cut_RHS = 100
+        Cut_LHS = 1
+        Cut_RHS = 1
 
         hdu = fits.open(filename)
         head = hdu[0].header
@@ -215,7 +215,7 @@ Galaxy_info = read_data_cube(objfile, lam_range_temp, redshift)
 ### ------------------------------------------------- ### ------------------------------------------------- ### ------------------------------------------------- ###
 
 
-s
+
 ### ------------------------------------------------- ###
 # Fitting Pre-set
 ### ------------------------------------------------- ###
@@ -506,7 +506,7 @@ Fe_5015_map = np.ndarray(shape=Galaxy_info.cube.shape[1:3])
 Mg_b_map = np.ndarray(shape=Galaxy_info.cube.shape[1:3])
 
 
-lam_gal_save = lam_gal
+lam_gal_save = lam_gal.copy()
 
 # H
 LP = np.mean([Index_Wave.loc[0,'BPC_range'][0],Index_Wave.loc[0,'BPC_range'][1]])
@@ -518,6 +518,8 @@ for i in tqdm(range(galaxies.shape[1])):
         K_index = i*max(Galaxy_info.col)+j
 
         V_cor = PP_box[K_index].sol[0][0]
+        if V_cor>300 or V_cor<-300:
+            V_cor = 0
         # lam_gal = lam_gal_save/(1+(V_cor/c))
         for k_loop in range(len(lam_gal_save)):
             lam_gal[k_loop] = lam_gal_save[k_loop]/(1+(V_cor/c))
@@ -563,6 +565,8 @@ for i in tqdm(range(galaxies.shape[1])):
         K_index = i*max(Galaxy_info.col)+j
         
         V_cor = PP_box[K_index].sol[0][0]
+        if V_cor>300 or V_cor<-300:
+            V_cor = 0
         # lam_gal = lam_gal_save/(1+(V_cor/c))
         for k_loop in range(len(lam_gal_save)):
             lam_gal[k_loop] = lam_gal_save[k_loop]/(1+(V_cor/c))
@@ -605,6 +609,8 @@ for i in tqdm(range(galaxies.shape[1])):
         K_index = i*max(Galaxy_info.col)+j
         
         V_cor = PP_box[K_index].sol[0][0]
+        if V_cor>300 or V_cor<-300:
+            V_cor = 0
         # lam_gal = lam_gal_save/(1+(V_cor/c))
         for k_loop in range(len(lam_gal_save)):
             lam_gal[k_loop] = lam_gal_save[k_loop]/(1+(V_cor/c))
@@ -682,4 +688,4 @@ for i in range(Galaxy_info.cube.shape[1]):
         
         VNB_Sol = TB_reindex(pd.concat([VNB_Sol, VNB_Sol_lim]))
 
-VNB_Sol.to_csv('E:/ProGram/Dr.Zheng/2024NAOC-IUS/Wkp/2024-NAOC-IUSpectrum/FitData/Fit_DS_11[25Jan13][VCC1588]/'+galaxy_name+'_P2P_SFR.csv')
+VNB_Sol.to_csv('E:/ProGram/Dr.Zheng/2024NAOC-IUS/Wkp/2024-NAOC-IUSpectrum/FitData/Fit_DS_16[25Jan19][VCC1588]/'+galaxy_name+'_P2P_SFR.csv')
