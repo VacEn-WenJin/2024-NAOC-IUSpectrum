@@ -221,7 +221,7 @@ Galaxy_info = read_data_cube(objfile, lam_range_temp, redshift)
 ### ------------------------------------------------- ###
 
 FWHM_gal = None   # set this to None to skip templates broadening
-sps = lib.sps_lib(filename, Galaxy_info.velscale, FWHM_gal, norm_range=[4800, 5230])
+sps = lib.sps_lib(filename, Galaxy_info.velscale, FWHM_gal, norm_range=[4822, 5212])
 # sps = lib.sps_lib(filename, Galaxy_info.velscale, FWHM_gal)
 
 
