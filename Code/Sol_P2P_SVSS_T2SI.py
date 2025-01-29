@@ -3,7 +3,9 @@
 '''
     This python file is set for P2P run test.
     Running parameters are set in code.
-    Version 1.01    25Jan07    VacEnWenJin
+
+    Use template to calculate the spectrum index
+    Version 2.01    25Jan30    VacEnWenJin
 '''
 
 
