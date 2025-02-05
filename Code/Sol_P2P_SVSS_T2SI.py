@@ -848,8 +848,8 @@ for i in tqdm(range(galaxies.shape[1])):
 
 
         H_Beta_map[i,j] = calculator.calculate_index('Hbeta')
-        Fe_5015_map[i,j] = calculator.calculate_index('Mgb')
-        Mg_b_map[i,j] = calculator.calculate_index('Fe5015')
+        Fe_5015_map[i,j] = calculator.calculate_index('Fe5015')
+        Mg_b_map[i,j] = calculator.calculate_index('Mgb')
 
 
 ### ------------------------------------------------- ### ------------------------------------------------- ### ------------------------------------------------- ###
