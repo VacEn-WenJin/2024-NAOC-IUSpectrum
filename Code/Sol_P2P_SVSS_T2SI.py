@@ -626,7 +626,7 @@ def CK_SpFT(I_index, J_index):
     plt.clf()
     plt.close()
 
-    PP_box[K_index] = []
+    # PP_box[K_index] = []
 
 
 ### ------------------------------------------------- ### ------------------------------------------------- ### ------------------------------------------------- ###
@@ -669,11 +669,15 @@ for i in range(galaxies.shape[1]):
 
 optimal_templates_otp = np.ndarray(shape=optimal_templates.shape)
 
-for k_index in range(len(apoly)):
+for k_index in range(len(PP_box)):
     i = int(k_index/max(Galaxy_info.col))
     j = k_index%max(Galaxy_info.col)
-    apoly_se = np.polyfit(lam_gal, apoly[k_index], 3)
-    optimal_templates_otp[:,i,j] = np.poly1d(apoly_se)(sps.lam_temp) + optimal_templates[:,i,j]
+
+    stars_gas_templates = np.column_stack([optimal_templates[:,i,j], gas_templates])
+    # apoly_se = np.polyfit(lam_gal, apoly[k_index], 3)
+    apoly_se_2 = np.polyfit(lam_gal, PP_box[k_index].apoly, 3)
+    # optimal_templates_otp[:,i,j] = np.poly1d(apoly_se_2)(sps.lam_temp) + optimal_templates[:,i,j]
+    optimal_templates_otp[:,i,j] = (stars_gas_templates[:,0] * PP_box[k_index].weights[0]) + np.poly1d(apoly_se_2)(sps.lam_temp)
 
 
 
@@ -890,10 +894,10 @@ for i in range(Galaxy_info.cube.shape[1]):
                         'Component_Sol':[PP_box[K_index].sol],
                         'Component_Sol_00':[PP_box[K_index].sol[0][0]],'Component_Sol_01':[PP_box[K_index].sol[0][1]],
                         'Component_Sol_10':[PP_box[K_index].sol[1][0]],'Component_Sol_11':[PP_box[K_index].sol[1][1]],
-                        'H_beta_SI':[H_Beta_map[i,j]],'Mg_b_SI':[Fe_5015_map[i,j]],'Fe_5015_SI':[Mg_b_map[i,j]],
+                        'H_beta_SI':[H_Beta_map[i,j]],'Mg_b_SI':[Mg_b_map[i,j]],'Fe_5015_SI':[Fe_5015_map[i,j]],
                         'R':[R],'SNR':[S_val/N_val],'Signal':[S_val],'Noise':[N_val],
                         'K_index':[[K_index]]})
         
         VNB_Sol = TB_reindex(pd.concat([VNB_Sol, VNB_Sol_lim]))
 
-VNB_Sol.to_csv('E:/ProGram/Dr.Zheng/2024NAOC-IUS/Wkp/2024-NAOC-IUSpectrum/FitData/Fit_DS_20[25Feb05][VCC1588]/'+galaxy_name+'_P2P_SFR.csv')
+VNB_Sol.to_csv('E:/ProGram/Dr.Zheng/2024NAOC-IUS/Wkp/2024-NAOC-IUSpectrum/FitData/Fit_DS_21[25Feb07][VCC1588]/'+galaxy_name+'_P2P_SFR.csv')
