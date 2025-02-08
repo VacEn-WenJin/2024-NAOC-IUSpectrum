@@ -13,6 +13,12 @@
     Version 2.01    25Jan30    VacEnWenJin
     Change Fitting polynomial
     Use degree=3 in fitting and calculate spectrum templates.
+
+    Version 2.11    25Feb07    VacEnWenJin
+    Use new Spectrum index calculate formal in OOP
+
+
+    !!!Plot ON: line 669!!!
 '''
 
 
@@ -525,6 +531,9 @@ for i in tqdm(range(galaxies.shape[1])):
 
 def CK_SpFT(I_index, J_index):
     K_index = I_index*max(Galaxy_info.col)+J_index
+    lam_gal = np.exp(Galaxy_info.ln_lam_gal)
+    for i in range(len(lam_gal)):
+        lam_gal[i] = lam_gal[i]/(1+(PP_box[i].sol[0][0]/c))
 
     fig, ax = plt.subplots(1, 1, facecolor='white', figsize=(16,12), dpi=300, tight_layout=True)
     gs1 = gridspec.GridSpec(1, 1)
@@ -622,11 +631,11 @@ def CK_SpFT(I_index, J_index):
     ax2.legend()
     # ax3.legend()
 
-    plt.savefig('./../../FitPlot/Fit_08[24Dec17][VCC1588RDBFit]/P2P_res/'+galaxy_name+'Fig[{:}]{:}-{:}_SPTest.pdf'.format(K_index,I_index,J_index), format='pdf', bbox_inches='tight')
+    plt.savefig('./../../FitPlot/Fit_08[25Feb09][VCC1588RDBFit]/P2P_res/'+galaxy_name+'Fig[{:}]{:}-{:}_SPTest.pdf'.format(K_index,I_index,J_index), format='pdf', bbox_inches='tight')
     plt.clf()
     plt.close()
 
-    # PP_box[K_index] = []
+    PP_box[K_index] = []
 
 
 ### ------------------------------------------------- ### ------------------------------------------------- ### ------------------------------------------------- ###
@@ -661,7 +670,9 @@ for i in range(galaxies.shape[1]):
                     O_5007_EL_map[i,j] = flux
                     O_5007_EL_AN_map[i,j] = an
 
-
+for i in tqdm(range(galaxies.shape[1])):
+    for j in range(galaxies.shape[2]):
+        CK_SpFT(i,j)
 
 ### ------------------------------------------------- ### ------------------------------------------------- ### ------------------------------------------------- ###
 # Spectrum Index
