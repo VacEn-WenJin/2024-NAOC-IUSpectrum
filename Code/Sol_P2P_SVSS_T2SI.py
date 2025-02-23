@@ -235,24 +235,6 @@ def spectres(new_wavs, spec_wavs, spec_fluxes, spec_errs=None, fill=None,
         return new_fluxes
 
 class LineIndexCalculator:
-    @staticmethod
-    def _make_bins(wave, dlam):
-        """
-        根据给定的波长和波长宽度创建波长区间
-        
-        Parameters:
-        -----------
-        wave : float
-            中心波长
-        dlam : float
-            波长区间宽度
-            
-        Returns:
-        --------
-        tuple : (起始波长, 结束波长)
-        """
-        return (wave - dlam/2, wave + dlam/2)
-
     def __init__(self, wave, flux, fit_wave, fit_flux, em_wave=None, em_flux_list=None, velocity_correction=0, error=None):
         """
         初始化吸收线指数计算器
@@ -333,19 +315,19 @@ class LineIndexCalculator:
         """
         windows = {
             'Hbeta': {
-                'blue': self._make_bins(4837.875, 20),
-                'line': self._make_bins(4862.25, 28.75),
-                'red': self._make_bins(4884.125, 15)
+                'blue': (4827.875, 4847.875),
+                'line': (4847.875, 4876.625),
+                'red': (4876.625, 4891.625)
             },
             'Mgb': {
-                'blue': self._make_bins(5152.0, 18.75),
-                'line': self._make_bins(5176.375, 32.5),
-                'red': self._make_bins(5198.875, 15)
+                'blue': (5142.625, 5161.375),
+                'line': (5160.125, 5192.625),
+                'red': (5191.375, 5206.375)
             },
             'Fe5015': {
-                'blue': self._make_bins(4962.125, 31.25),
-                'line': self._make_bins(5015.875, 76.25),
-                'red': self._make_bins(5059.625, 11.25)
+                'blue': (4946.500, 4977.750),
+                'line': (4977.750, 5054.000),
+                'red': (5054.000, 5065.250)
             }
         }
         return windows.get(line_name)
@@ -388,72 +370,45 @@ class LineIndexCalculator:
         if windows is None:
             raise ValueError(f"未知的吸收线: {line_name}")
 
-        # 提取各个区域的数据 - 使用拟合光谱计算连续谱
+        # 提取各个区域的数据
         def get_fit_region(region):
             mask = (self.fit_wave >= windows[region][0]) & (self.fit_wave <= windows[region][1])
             return self.fit_wave[mask], self.fit_flux[mask]
 
-        # 提取各个区域的原始数据 - 用于计算指数
         def get_orig_region(region):
             mask = (self.wave >= windows[region][0]) & (self.wave <= windows[region][1])
             return self.wave[mask], self.flux[mask], self.error[mask]
 
-        # 获取拟合光谱的连续谱区域数据
+        # 获取数据
         blue_wave_fit, blue_flux_fit = get_fit_region('blue')
         red_wave_fit, red_flux_fit = get_fit_region('red')
-
-        # 获取原始光谱数据（已减去发射线）
         line_wave, line_flux, line_err = get_orig_region('line')
 
-        # 检查是否有足够的点
+        # 检查数据点数
         if len(blue_flux_fit) < 3 or len(line_flux) < 3 or len(red_flux_fit) < 3:
             return np.nan if not return_error else (np.nan, np.nan)
 
-        # 使用拟合光谱计算连续谱水平
+        # 计算连续谱
         blue_cont = self.calculate_pseudo_continuum(blue_wave_fit, blue_flux_fit)
         red_cont = self.calculate_pseudo_continuum(red_wave_fit, red_flux_fit)
-
-        # 计算连续谱
+        
         wave_cont = np.array([np.mean(blue_wave_fit), np.mean(red_wave_fit)])
         flux_cont = np.array([blue_cont, red_cont])
         
-        # 线性插值得到中心区域的连续谱
-        cont_at_line = spectres(line_wave, wave_cont, flux_cont)
+        # 线性插值得到连续谱
+        f_interp = interpolate.interp1d(wave_cont, flux_cont)
+        cont_at_line = f_interp(line_wave)
 
-        # 使用原始光谱（已减去发射线）计算指数
-        delta_lambda = np.mean(np.diff(line_wave))
-        index = np.sum((1.0 - line_flux/cont_at_line) * delta_lambda)
-
+        # 计算积分
+        delta_lambda = np.mean(np.diff(line_wave))  # 波长间隔
+        index = np.trapz((1.0 - line_flux/cont_at_line), line_wave)  # 使用梯形法则进行积分
+        
         if return_error:
-            error = self._calculate_error(line_wave, line_flux, line_err, 
-                                        cont_at_line, delta_lambda)
+            # 计算误差
+            error = np.sqrt(np.trapz((line_err/cont_at_line)**2, line_wave))
             return index, error
         
         return index
-    
-    def _calculate_error(self, wave, flux, error, cont, delta_lambda):
-        """
-        计算指数误差
-        
-        Parameters:
-        -----------
-        wave : array-like
-            波长数组
-        flux : array-like
-            流量数组
-        error : array-like
-            误差数组
-        cont : array-like
-            连续谱值
-        delta_lambda : float
-            波长间隔
-            
-        Returns:
-        --------
-        float : 误差值
-        """
-        variance = np.sum((error/cont * delta_lambda)**2)
-        return np.sqrt(variance)
 
     def plot_line_fit(self, line_name):
         """
@@ -705,6 +660,7 @@ def Cube_sol(Galaxy_cube, redshift):
                 noise = np.ones_like(tmpgalaxy)
                 if np.count_nonzero(tmpgalaxy) > 50:
                     pp = ppxf(sps.templates, tmpgalaxy, noise, velscale, [vel_s, vel_dis_s],
+                            degree=3,
                             plot=plot_TF, mask=mask0, lam=lam_gal, lam_temp=sps.lam_temp, quiet=not plot_TF)
                     # pp_field[i][j]=pp
                     Bestfitfield[:,i,j]=pp.bestfit
@@ -741,31 +697,37 @@ galaxies = np.ndarray(shape= (Galaxy_info.spectra[:,0].shape[0],Galaxy_info.cube
 PP_box = []
 for i in tqdm(range(galaxies.shape[1])):
     for j in range(galaxies.shape[2]):
-        galaxy = Galaxy_info.spectra[:,i*max(Galaxy_info.col)+j]
+        # 定义波长范围：从Hbeta蓝端到Mgb红端
+        wave_range = [4800, 5250]  # 这个范围覆盖了所有三个指数的计算区域
+        
+        # 只截取观测数据的波长范围
+        mask = (lam_gal >= wave_range[0]) & (lam_gal <= wave_range[1])
+        galaxy = Galaxy_info.spectra[:,i*max(Galaxy_info.col)+j][mask]
         noise = np.ones_like(galaxy)
-
+        
+        # 模板保持完整
         template = optimal_templates[:,i,j]
         stars_gas_templates = np.column_stack([template, gas_templates])
-
+        
         component = [0] + [1]*2
-        gas_component=np.array(component) > 0
+        gas_component = np.array(component) > 0
         moments = [-2, 2]
         ncomp = len(moments)
         tied = [['', ''] for _ in range(ncomp)]
 
         start = [[velfield[i,j], sigfield[i,j]],
-        [velfield[i,j], 50]]
+                [velfield[i,j], 50]]
 
         vlim = lambda x: velfield[i,j] + x*np.array([-100, 100])
         bounds = [[vlim(2), [20, 300]],
-                  [vlim(2), [20, 100]]]
+                 [vlim(2), [20, 100]]]
 
         pp = ppxf(stars_gas_templates, galaxy, noise, Galaxy_info.velscale, start,
-            plot=1, moments=moments, degree=8, mdegree=-1, component=component, 
-            gas_component=gas_component, gas_names=gas_names,
-            lam=lam_gal, lam_temp=sps.lam_temp, tied=tied,
-            bounds=bounds,
-            global_search=True)
+                 plot=1, moments=moments, degree=3, mdegree=-1, component=component, 
+                 gas_component=gas_component, gas_names=gas_names,
+                 lam=lam_gal[mask], lam_temp=sps.lam_temp, tied=tied,
+                 bounds=bounds,
+                 global_search=True)
         
         PP_box += [pp]
 
@@ -1118,7 +1080,9 @@ for i in tqdm(range(galaxies.shape[1])):
         em_flux_list = np.ndarray(shape=lam_gal.shape)
         for em_k in [0,1]:
             em_flux_list += PP_box[K_index].gas_bestfit[em_k]  # 使用ppxf的发射线拟合结果
-        calculator = LineIndexCalculator(lam_gal, Galaxy_info.spectra[:,K_index],
+        calculator = LineIndexCalculator(
+                                            # lam_gal, Galaxy_info.spectra[:,K_index],
+                                            wave, flux,
                                             wave, flux,
                                             em_wave=em_wave, em_flux_list=em_flux_list,
                                             velocity_correction=V_cor)
@@ -1173,4 +1137,4 @@ for i in range(Galaxy_info.cube.shape[1]):
         
         VNB_Sol = TB_reindex(pd.concat([VNB_Sol, VNB_Sol_lim]))
 
-VNB_Sol.to_csv('E:/ProGram/Dr.Zheng/2024NAOC-IUS/Wkp/2024-NAOC-IUSpectrum/FitData/Fit_DS_22[25Feb18][VCC1588]/'+galaxy_name+'_P2P_SFR.csv')
+VNB_Sol.to_csv('E:/ProGram/Dr.Zheng/2024NAOC-IUS/Wkp/2024-NAOC-IUSpectrum/FitData/Fit_DS_23[25Feb18][VCC1588]T/'+galaxy_name+'_P2P_SFR.csv')
