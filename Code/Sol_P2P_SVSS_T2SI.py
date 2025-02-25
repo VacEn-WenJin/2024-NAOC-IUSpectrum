@@ -264,7 +264,10 @@ class LineIndexCalculator:
         # 进行速度修正
         self.wave = self._apply_velocity_correction(wave)
         self.flux = flux.copy()  # 创建副本以避免修改原始数据
-        self.fit_wave = self._apply_velocity_correction(fit_wave)
+
+        # self.fit_wave = self._apply_velocity_correction(fit_wave)
+        self.fit_wave = fit_wave
+
         self.fit_flux = fit_flux
         self.error = error if error is not None else np.ones_like(flux)
         
@@ -298,7 +301,7 @@ class LineIndexCalculator:
         --------
         array-like : 修正后的波长数组
         """
-        return wave / (1 + self.velocity/self.c)
+        return wave / (1 + (self.velocity/self.c))
         
     def define_line_windows(self, line_name):
         """
@@ -412,7 +415,7 @@ class LineIndexCalculator:
 
     def plot_line_fit(self, line_name):
         """
-        绘制吸收线拟合结果
+        绘制吸收线拟合结果，包含原始输入数据的对比
         
         Parameters:
         -----------
@@ -421,22 +424,97 @@ class LineIndexCalculator:
         """
         windows = self.define_line_windows(line_name)
         
-        plt.figure(figsize=(10, 6))
+        # 设置x轴范围：窗口范围左右各扩展20埃
+        x_min = windows['blue'][0] - 20
+        x_max = windows['red'][1] + 20
         
-        # 绘制原始光谱
-        plt.plot(self.wave, self.flux, 'k-', label='Observed Spectrum')
+        # 创建两个子图
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), height_ratios=[1, 1])
+        
+        # 计算y轴范围
+        # 确保使用相同波长网格的数据
+        wave_mask = (self.wave >= x_min) & (self.wave <= x_max)
+        em_mask = (self.em_wave >= x_min) & (self.em_wave <= x_max)
+        fit_mask = (self.fit_wave >= x_min) & (self.fit_wave <= x_max)
+        
+        # 计算这个范围内的最大最小值
+        flux_range = self.flux[wave_mask] + self.em_flux_list[wave_mask]
+        fit_range = self.fit_flux[fit_mask]
+        
+        y_min = min(np.min(flux_range), np.min(fit_range)) * 0.9
+        y_max = max(np.max(flux_range), np.max(fit_range)) * 1.1
+        
+        # 第一个面板：原始输入数据
+        ax1.plot(self.wave, self.flux + self.em_flux_list, 'k-', label='Original Spectrum', alpha=0.7)
+        ax1.plot(self.em_wave, self.em_flux_list, 'r-', label='Emission Lines', alpha=0.7)
+        ax1.plot(self.fit_wave, self.fit_flux, 'b-', label='Template Fit', alpha=0.7)
         
         # 标记各个区域
         colors = {'blue': 'b', 'line': 'g', 'red': 'r'}
         for region, (start, end) in windows.items():
-            mask = (self.wave >= start) & (self.wave <= end)
-            plt.axvspan(start, end, alpha=0.2, color=colors[region])
-            
-        plt.xlabel('Wavelength (Å)')
-        plt.ylabel('Flux')
-        plt.title(f'{line_name} Index Measurement (v={self.velocity:.1f} km/s)')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
+            ax1.axvspan(start, end, alpha=0.2, color=colors[region])
+
+        ax1.xaxis.set_minor_locator(AutoMinorLocator(5))
+        ax1.yaxis.set_minor_locator(AutoMinorLocator(5))
+        ax1.tick_params(axis='both', which='both', labelsize='x-small', right=True, top=True, direction='in')
+        
+        ax1.set_xlim(x_min, x_max)
+        ax1.set_ylim(y_min, y_max)  # 设置y轴范围
+        ax1.set_xlabel('Rest-frame Wavelength (Å)')
+        ax1.set_ylabel('Flux')
+        ax1.set_title(f'Original Data Comparison (v={self.velocity:.1f} km/s)')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # 为第二个面板计算y轴范围
+        processed_flux = self.flux[wave_mask]
+        fit_flux_range = self.fit_flux[fit_mask]
+        y_min_processed = min(np.min(processed_flux), np.min(fit_flux_range)) * 0.9
+        y_max_processed = max(np.max(processed_flux), np.max(fit_flux_range)) * 1.1
+        
+        # 第二个面板：处理后的光谱
+        ax2.plot(self.wave, self.flux, 'k-', label='Processed Spectrum')
+        ax2.plot(self.fit_wave, self.fit_flux, 'b--', label='Template Fit', alpha=0.7)
+        
+        # 标记各个区域
+        for region, (start, end) in windows.items():
+            ax2.axvspan(start, end, alpha=0.2, color=colors[region])
+        
+        # 添加连续谱拟合
+        def get_fit_region(region):
+            mask = (self.fit_wave >= windows[region][0]) & (self.fit_wave <= windows[region][1])
+            return self.fit_wave[mask], self.fit_flux[mask]
+        
+        # 计算并绘制连续谱
+        blue_wave_fit, blue_flux_fit = get_fit_region('blue')
+        red_wave_fit, red_flux_fit = get_fit_region('red')
+        blue_cont = self.calculate_pseudo_continuum(blue_wave_fit, blue_flux_fit)
+        red_cont = self.calculate_pseudo_continuum(red_wave_fit, red_flux_fit)
+        wave_cont = np.array([np.mean(blue_wave_fit), np.mean(red_wave_fit)])
+        flux_cont = np.array([blue_cont, red_cont])
+        ax2.plot(wave_cont, flux_cont, 'r*', markersize=10, label='Continuum Points')
+        
+        # 绘制连续谱直线
+        f_interp = interpolate.interp1d(wave_cont, flux_cont)
+        line_mask = (self.wave >= windows['line'][0]) & (self.wave <= windows['line'][1])
+        line_wave = self.wave[line_mask]
+        cont_at_line = f_interp(line_wave)
+        ax2.plot(line_wave, cont_at_line, 'r--', label='Continuum Fit')
+
+        ax2.xaxis.set_minor_locator(AutoMinorLocator(5))
+        ax2.yaxis.set_minor_locator(AutoMinorLocator(5))
+        ax2.tick_params(axis='both', which='both', labelsize='x-small', right=True, top=True, direction='in')
+        
+        ax2.set_xlim(x_min, x_max)
+        ax2.set_ylim(y_min_processed, y_max_processed)  # 设置y轴范围
+        ax2.set_xlabel('Rest-frame Wavelength (Å)')
+        ax2.set_ylabel('Flux')
+        ax2.set_title(f'Processed Spectrum')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        
+        # 调整子图之间的间距
+        plt.tight_layout()
         plt.show()
 
 ### ------------------------------------------------- ### ------------------------------------------------- ### ------------------------------------------------- ###
@@ -1076,15 +1154,17 @@ for i in tqdm(range(galaxies.shape[1])):
         wave = sps.lam_temp
         flux = optimal_templates_otp[:,i,j]
 
-        em_wave = lam_gal
-        em_flux_list = np.ndarray(shape=lam_gal.shape)
-        for em_k in [0,1]:
-            em_flux_list += PP_box[K_index].gas_bestfit[em_k]  # 使用ppxf的发射线拟合结果
+        em_wave = lam_gal_save
+        # em_flux_list = np.ndarray(shape=lam_gal.shape)
+        # for em_k in [0,1]:
+        #     em_flux_list += PP_box[K_index].gas_bestfit[em_k]  # 使用ppxf的发射线拟合结果
+        em_flux_list = PP_box[K_index].gas_bestfit
         calculator = LineIndexCalculator(
-                                            # lam_gal, Galaxy_info.spectra[:,K_index],
-                                            wave, flux,
+                                            lam_gal_save, Galaxy_info.spectra[:,K_index],
+                                            # wave, flux,
                                             wave, flux,
                                             em_wave=em_wave, em_flux_list=em_flux_list,
+                                            # em_wave=em_wave, em_flux_list=np.ndarray(shape=em_wave.shape),
                                             velocity_correction=V_cor)
 
 
@@ -1137,4 +1217,4 @@ for i in range(Galaxy_info.cube.shape[1]):
         
         VNB_Sol = TB_reindex(pd.concat([VNB_Sol, VNB_Sol_lim]))
 
-VNB_Sol.to_csv('E:/ProGram/Dr.Zheng/2024NAOC-IUS/Wkp/2024-NAOC-IUSpectrum/FitData/Fit_DS_23[25Feb18][VCC1588]T/'+galaxy_name+'_P2P_SFR.csv')
+VNB_Sol.to_csv('E:/ProGram/Dr.Zheng/2024NAOC-IUS/Wkp/2024-NAOC-IUSpectrum/FitData/Fit_DS_25[25Feb25][VCC1588]/'+galaxy_name+'_P2P_SFR.csv')
