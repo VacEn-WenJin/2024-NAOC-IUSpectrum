@@ -6,13 +6,13 @@ calculates emission line properties, and computes spectral indices.
 
 Features:
 - Multi-threaded pixel fitting
-- Centralized configuration
-- Efficient spectral index calculation with template substitution
+- Two-stage fitting strategy (stellar first, then emission lines)
+- Efficient spectral index calculation 
 - Robust error handling and recovery
 - Customizable visualization
 - Single pixel testing capability
 
-Version 3.8.3    2025Mar08    Fixed spectral index calculation and improved error handling
+Version 3.9.6    2025Mar09    Corrected stellar template calculation to match original code
 """
 
 ### ------------------------------------------------- ###
@@ -29,6 +29,7 @@ from pathlib import Path
 from datetime import datetime
 from functools import partial
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import Union, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -123,11 +124,15 @@ class P2PConfig:
         # pPXF fitting parameters
         self.degree = 3  # Polynomial degree for additive component
         self.mdegree = -1  # Polynomial degree for multiplicative component (disabled)
-        self.moments = [4, 2]  # Moments to fit for stellar and gas components
+        self.moments = [-2, 2]  # Moments to fit for stellar and gas components
         self.gas_names = ['Hbeta', '[OIII]5007']  # Gas lines to fit
         self.ngas_comp = 1  # Number of gas components
         self.fwhm_gas = 1.0  # FWHM for emission line templates (Angstroms)
         self.mask_width = 1000  # Width parameter for determine_mask function
+        
+        # Two-stage fitting parameters
+        self.use_two_stage_fit = True  # Use two-stage fitting strategy
+        self.global_search = True  # Use global search in second stage fitting
         
         # Computational settings
         self.n_threads = os.cpu_count() // 2  # Default to half available cores
@@ -149,7 +154,9 @@ class P2PConfig:
         self.retry_with_degree_zero = True  # Retry with degree=0 if fit fails
         self.skip_bad_pixels = True  # Skip pixels with insufficient data
         self.safe_mode = False  # Extra-safe settings for difficult data
-        self.use_template_for_indices = True  # Use template for indices outside good wavelength range
+        
+        # Spectral index calculation
+        self.continuum_mode = 'auto'  # 'auto', 'fit', or 'original'
         
         # Constants
         self.c = 299792.458  # Speed of light in km/s
@@ -430,97 +437,120 @@ class LineIndexCalculator:
     """
     
     def __init__(self, wave, flux, fit_wave, fit_flux, em_wave=None, em_flux_list=None, 
-                 velocity_correction=0, error=None, good_wavelength_range=None):
+                 velocity_correction=0, error=None, continuum_mode='auto'):
         """
-        Initialize the line index calculator.
+        初始化吸收线指数计算器
         
-        Parameters
-        ----------
+        Parameters:
+        -----------
         wave : array-like
-            Original spectrum wavelength array
+            原始光谱的波长数组
         flux : array-like
-            Original spectrum flux array
+            原始光谱的流量数组
         fit_wave : array-like
-            Fitted template wavelength array for continuum calculation
+            拟合光谱的波长数组，用于计算连续谱
         fit_flux : array-like
-            Fitted template flux array for continuum calculation
+            拟合光谱的流量数组，用于计算连续谱
         em_wave : array-like, optional
-            Emission line wavelength array
+            发射线的波长数组
         em_flux_list : array-like, optional
-            Combined emission line spectrum
+            合并后的发射线光谱
         velocity_correction : float, optional
-            Velocity correction in km/s, default is 0
+            速度修正值，单位为km/s，默认为0
         error : array-like, optional
-            Error array for the spectrum
-        good_wavelength_range : list, optional
-            Good wavelength range [min, max] for diagnostic purposes
+            误差数组
+        continuum_mode : str, optional
+            连续谱计算模式
+            'auto': 仅在原始谱数据不足时使用拟合谱
+            'fit': 始终使用拟合谱
+            'original': 尽可能使用原始谱（数据不足时报警）
         """
-        self.c = 299792.458  # Speed of light in km/s
+        self.c = 299792.458  # 光速，单位为km/s
         self.velocity = velocity_correction
+        self.continuum_mode = continuum_mode
         
-        # Apply velocity correction
-        self.wave = self._apply_velocity_correction(wave)
-        self.flux = flux.copy()  # Create a copy to avoid modifying original data
-        
-        # Store template data
+        # 进行速度修正
+        if wave is not None:
+            self.wave = self._apply_velocity_correction(wave)
+            self.flux = flux.copy()  # 创建副本以避免修改原始数据
+        else:
+            self.wave = None
+            self.flux = None
+
         self.fit_wave = fit_wave
         self.fit_flux = fit_flux
-        self.error = error if error is not None else np.ones_like(flux)
-        self.good_wavelength_range = good_wavelength_range
+        self.error = error if error is not None else (np.ones_like(flux) if flux is not None else None)
         
-        # Handle emission lines
+        # 处理发射线
         if em_wave is not None and em_flux_list is not None:
-            self.em_wave = self._apply_velocity_correction(em_wave)
+            # self.em_wave = self._apply_velocity_correction(em_wave)
+            self.em_wave = em_wave
             self.em_flux_list = em_flux_list
             self._subtract_emission_lines()
     
     def _subtract_emission_lines(self):
         """
-        Subtract emission lines from the original spectrum.
-        The input em_flux_list is already the combined result.
+        从原始光谱中减去发射线
+        输入的em_flux_list已经是合并后的结果
         """
-        # Resample emission line spectrum to original spectrum wavelength grid
+        if self.wave is None or self.flux is None:
+            return
+            
         try:
+            # 将发射线光谱重采样到原始光谱的波长网格上
             em_flux_resampled = spectres(self.wave, self.em_wave, self.em_flux_list)
             
-            # Subtract emission lines from original spectrum
+            # 从原始光谱中减去发射线
             self.flux -= em_flux_resampled
         except Exception as e:
             logging.warning(f"Error subtracting emission lines: {str(e)}")
-            # Continue without subtracting emission lines
+            # 出错时继续，不减去发射线
     
     def _apply_velocity_correction(self, wave):
         """
-        Apply velocity correction to wavelength.
+        应用速度修正到波长
         
-        Parameters
-        ----------
+        Parameters:
+        -----------
         wave : array-like
-            Original wavelength array
+            原始波长数组
             
-        Returns
-        -------
-        array-like
-            Corrected wavelength array
+        Returns:
+        --------
+        array-like : 修正后的波长数组
         """
-        return wave / (1 + (self.velocity / self.c))
-    
-    @staticmethod
-    def define_line_windows(line_name):
+        return wave / (1 + (self.velocity/self.c))
+
+    def _check_data_coverage(self, wave_range):
         """
-        Define absorption line and continuum windows.
+        检查原始数据是否完整覆盖给定波长范围
         
-        Parameters
-        ----------
-        line_name : str
-            Absorption line name
+        Parameters:
+        -----------
+        wave_range : tuple
+            (min_wave, max_wave)
             
-        Returns
-        -------
-        dict
-            Dictionary containing blue, line, and red window ranges
+        Returns:
+        --------
+        bool : 是否完整覆盖
         """
-        # Define standard Lick index windows
+        if self.wave is None:
+            return False
+        return (wave_range[0] >= np.min(self.wave)) and (wave_range[1] <= np.max(self.wave))
+        
+    def define_line_windows(self, line_name):
+        """
+        定义吸收线和连续谱窗口
+        
+        Parameters:
+        -----------
+        line_name : str
+            吸收线名称
+            
+        Returns:
+        --------
+        dict : 包含蓝端、中心和红端窗口的字典
+        """
         windows = {
             'Hbeta': {
                 'blue': (4827.875, 4847.875),
@@ -536,339 +566,548 @@ class LineIndexCalculator:
                 'blue': (4946.500, 4977.750),
                 'line': (4977.750, 5054.000),
                 'red': (5054.000, 5065.250)
-            },
-            'Fe5270': {
-                'blue': (5233.150, 5248.150),
-                'line': (5245.650, 5285.650),
-                'red': (5285.650, 5318.150)
             }
         }
         return windows.get(line_name)
 
-    def calculate_pseudo_continuum(self, wave_range, flux_range):
+    def calculate_pseudo_continuum(self, wave_range, flux_range, region_type):
         """
-        Calculate pseudo-continuum.
+        计算伪连续谱
         
-        Parameters
-        ----------
-        wave_range : array-like
-            Wavelength range
-        flux_range : array-like
-            Corresponding flux values
+        Parameters:
+        -----------
+        wave_range : tuple or array-like
+            波长范围
+        flux_range : array-like or None
+            对应的流量值（如果使用拟合谱则不需要）
+        region_type : str
+            区域类型('blue' 或 'red')
             
-        Returns
-        -------
-        float
-            Pseudo-continuum value
+        Returns:
+        --------
+        float : 伪连续谱值
         """
-        return np.median(flux_range)
+        if self.continuum_mode == 'fit':
+            # 使用拟合谱
+            mask = (self.fit_wave >= wave_range[0]) & (self.fit_wave <= wave_range[1])
+            return np.median(self.fit_flux[mask])
+        
+        elif self.continuum_mode == 'auto':
+            # 检查原始数据覆盖
+            if self._check_data_coverage(wave_range):
+                mask = (self.wave >= wave_range[0]) & (self.wave <= wave_range[1])
+                return np.median(self.flux[mask])
+            else:
+                # 数据不足时使用拟合谱
+                mask = (self.fit_wave >= wave_range[0]) & (self.fit_wave <= wave_range[1])
+                return np.median(self.fit_flux[mask])
+        
+        else:  # 'original'
+            if not self._check_data_coverage(wave_range):
+                raise ValueError(f"原始数据不足以覆盖{region_type}端连续谱区域")
+            mask = (self.wave >= wave_range[0]) & (self.wave <= wave_range[1])
+            return np.median(self.flux[mask])
 
     def calculate_index(self, line_name, return_error=False):
         """
-        Calculate absorption line index using template for continuum estimation.
+        计算吸收线指数
         
-        Parameters
-        ----------
+        Parameters:
+        -----------
         line_name : str
-            Absorption line name
+            吸收线名称 ('Hbeta', 'Mgb', 或 'Fe5015')
         return_error : bool
-            Whether to return error
+            是否返回误差
             
-        Returns
-        -------
-        float
-            Absorption line index value
-        float
-            Error value (if return_error=True)
+        Returns:
+        --------
+        float : 吸收线指数值
+        float : 误差值（如果return_error=True）
         """
-        logging.debug(f"===== CALCULATING INDEX: {line_name} =====")
-        
-        # Get window definitions
+        if self.wave is None or self.flux is None:
+            return np.nan if not return_error else (np.nan, np.nan)
+            
+        # 获取窗口定义
         windows = self.define_line_windows(line_name)
         if windows is None:
-            raise ValueError(f"Unknown absorption line: {line_name}")
+            raise ValueError(f"未知的吸收线: {line_name}")
 
-        # Extract regions for calculations
-        def get_region_data(region_name, from_template=False):
-            """Get region data with possible template substitution"""
-            region_bounds = windows[region_name]
-            wave_in_region = (self.wave >= region_bounds[0]) & (self.wave <= region_bounds[1])
-            
-            if not np.any(wave_in_region):
-                return np.array([]), np.array([]), np.array([])
-            
-            region_wave = self.wave[wave_in_region]
-            
-            # Check if region is outside good wavelength range
-            if self.good_wavelength_range is not None and not from_template:
-                outside_good = ((region_bounds[0] < self.good_wavelength_range[0]) or 
-                               (region_bounds[1] > self.good_wavelength_range[1]))
-                
-                if outside_good:
-                    logging.debug(f"  - {region_name} region partially outside good range, using template substitution")
-                    
-                    # Get template flux for this region (through interpolation)
-                    template_flux = np.interp(region_wave, self.fit_wave, self.fit_flux)
-                    
-                    # Get original flux
-                    region_flux = self.flux[wave_in_region]
-                    region_err = self.error[wave_in_region]
-                    
-                    # Create mask for points inside/outside good range
-                    in_good_range = ((region_wave >= self.good_wavelength_range[0]) & 
-                                    (region_wave <= self.good_wavelength_range[1]))
-                    
-                    # For points outside good range, use normalized template
-                    if np.any(~in_good_range) and np.any(in_good_range):
-                        # Calculate normalization factor from points in good range
-                        good_points = region_flux[in_good_range]
-                        good_template = template_flux[in_good_range]
-                        norm_factor = np.median(good_points) / np.median(good_template) if np.median(good_template) != 0 else 1.0
-                        
-                        # Create synthetic flux
-                        synthetic_flux = region_flux.copy()
-                        synthetic_flux[~in_good_range] = template_flux[~in_good_range] * norm_factor
-                        
-                        # Use synthetic flux
-                        return region_wave, synthetic_flux, region_err
-            
-            # Default case - just use original data
-            return region_wave, self.flux[wave_in_region], self.error[wave_in_region]
-            
-        # Get fit template regions (always from template)
-        def get_fit_region(region):
-            mask = (self.fit_wave >= windows[region][0]) & (self.fit_wave <= windows[region][1])
-            return self.fit_wave[mask], self.fit_flux[mask]
-        
-        # Get data for each region
-        blue_wave, blue_flux, blue_err = get_region_data('blue')
-        line_wave, line_flux, line_err = get_region_data('line')
-        red_wave, red_flux, red_err = get_region_data('red')
-        
-        # Get template data for continuum estimation
-        blue_wave_fit, blue_flux_fit = get_fit_region('blue')
-        red_wave_fit, red_flux_fit = get_fit_region('red')
-        
-        # Check if we have enough data points
-        logging.debug(f"STEP: Checking if we have enough data points")
-        logging.debug(f"  - Blue continuum points: {len(blue_flux)}")
-        logging.debug(f"  - Line region points: {len(line_flux)}")
-        logging.debug(f"  - Red continuum points: {len(red_flux)}")
-        
-        if len(blue_flux) < 3 or len(line_flux) < 3 or len(red_flux) < 3:
-            logging.warning(f"Not enough points for index calculation: blue={len(blue_flux)}, line={len(line_flux)}, red={len(red_flux)}")
+        # 获取线心区域数据
+        line_mask = (self.wave >= windows['line'][0]) & (self.wave <= windows['line'][1])
+        line_wave = self.wave[line_mask]
+        line_flux = self.flux[line_mask]
+        line_err = self.error[line_mask]
+
+        # 检查数据点数
+        if len(line_flux) < 3:
             return np.nan if not return_error else (np.nan, np.nan)
 
-        # Calculate continuum using template data
-        blue_cont = self.calculate_pseudo_continuum(blue_wave_fit, blue_flux_fit)
-        red_cont = self.calculate_pseudo_continuum(red_wave_fit, red_flux_fit)
+        # 计算连续谱
+        blue_cont = self.calculate_pseudo_continuum(windows['blue'], None, 'blue')
+        red_cont = self.calculate_pseudo_continuum(windows['red'], None, 'red')
         
-        wave_cont = np.array([np.mean(blue_wave_fit), np.mean(red_wave_fit)])
+        wave_cont = np.array([
+            np.mean(windows['blue']), 
+            np.mean(windows['red'])
+        ])
         flux_cont = np.array([blue_cont, red_cont])
         
-        logging.debug(f"STEP: Calculating continuum")
-        logging.debug(f"  - Blue continuum: {blue_cont:.4f} at λ={np.mean(blue_wave_fit):.2f}")
-        logging.debug(f"  - Red continuum: {red_cont:.4f} at λ={np.mean(red_wave_fit):.2f}")
-        
-        # Linear interpolation for continuum
+        # 线性插值得到连续谱
         f_interp = interpolate.interp1d(wave_cont, flux_cont)
         cont_at_line = f_interp(line_wave)
 
-        # Calculate integral (use trapezoidal rule for integration)
-        logging.debug(f"STEP: Calculating index using trapezoidal integration")
+        # 计算积分
         index = np.trapz((1.0 - line_flux/cont_at_line), line_wave)
-        logging.debug(f"  - Index value: {index:.6f}")
         
-        # Store data for plotting
+        # 存储计算结果供绘图使用
         self._last_calc = {
             'line_name': line_name,
             'windows': windows,
-            'blue_wave_fit': blue_wave_fit,
-            'blue_flux_fit': blue_flux_fit,
-            'red_wave_fit': red_wave_fit,
-            'red_flux_fit': red_flux_fit,
-            'blue_wave': blue_wave,
-            'blue_flux': blue_flux,
-            'line_wave': line_wave,
-            'line_flux': line_flux,
-            'red_wave': red_wave,
-            'red_flux': red_flux,
+            'blue_cont': blue_cont,
+            'red_cont': red_cont,
             'wave_cont': wave_cont,
             'flux_cont': flux_cont,
+            'line_wave': line_wave,
+            'line_flux': line_flux,
             'cont_at_line': cont_at_line,
             'index': index
         }
         
         if return_error:
-            # Calculate error
+            # 计算误差
             error = np.sqrt(np.trapz((line_err/cont_at_line)**2, line_wave))
-            logging.debug(f"  - Index error: {error:.6f}")
             return index, error
         
         return index
 
     def plot_line_fit(self, line_name, output_path=None):
         """
-        Plot absorption line fitting result matching the original implementation style.
+        绘制单个吸收线拟合结果
         
-        Parameters
-        ----------
+        Parameters:
+        -----------
         line_name : str
-            Absorption line name
+            吸收线名称
         output_path : str, optional
-            Path to save the plot
+            保存图像的路径
         """
-        # Calculate index if not already done to populate the data
+        if self.wave is None or self.flux is None:
+            logging.warning(f"No data available for plotting {line_name}")
+            return
+            
+        # 如果还没有计算过指数，先计算一次
         if not hasattr(self, '_last_calc') or self._last_calc.get('line_name') != line_name:
             self.calculate_index(line_name)
             
         if not hasattr(self, '_last_calc'):
-            logging.warning(f"No data available for plotting {line_name}")
+            logging.warning(f"没有可用于绘图的数据: {line_name}")
             return
             
         data = self._last_calc
         windows = data['windows']
         
-        # Set x-axis range: extend window range on both sides by 20Å
+        # 设置X轴范围：窗口两侧各延伸20Å
         x_min = windows['blue'][0] - 20
         x_max = windows['red'][1] + 20
         
-        # Create plot with three panels using figure instead of gridspec for better tight_layout compatibility
-        fig = plt.figure(figsize=(12, 10))
+        # 创建图形和子图
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), height_ratios=[1, 1])
         
-        # Main panel: Original spectrum and fit
-        ax1 = fig.add_subplot(3, 1, 1)
-        
-        # Second panel: Zoomed view of line region
-        ax2 = fig.add_subplot(3, 1, 2)
-        
-        # Third panel: Absorption profile
-        ax3 = fig.add_subplot(3, 1, 3)
-        
-        # First panel: Full spectrum
+        # 第一个面板：原始光谱和拟合
+        # 根据需要绘制发射线
         if hasattr(self, 'em_flux_list'):
-            # Original data with emission lines
-            if hasattr(self, 'em_wave') and hasattr(self, 'em_flux_list'):
-                try:
-                    ax1.plot(self.wave, self.flux + self.em_flux_list, 'k-', 
-                           label='Original Spectrum', alpha=0.7)
-                    ax1.plot(self.em_wave, self.em_flux_list, 'r-', 
-                           label='Emission Lines', alpha=0.7)
-                except Exception as e:
-                    ax1.plot(self.wave, self.flux, 'k-', label='Original Spectrum', alpha=0.7)
-                    logging.warning(f"Could not plot emission lines: {str(e)}")
+            try:
+                # 绘制带有发射线的原始光谱
+                org_flux = self.flux.copy()
+                if hasattr(self, 'em_wave') and hasattr(self, 'em_flux_list'):
+                    em_flux_resampled = spectres(self.wave, self.em_wave, self.em_flux_list)
+                    orig_with_em = org_flux + em_flux_resampled
+                    ax1.plot(self.wave, orig_with_em, 'k-', label='Original+Emission', alpha=0.7)
+                    ax1.plot(self.em_wave, self.em_flux_list, 'r-', label='Emission Lines', alpha=0.7)
+            except Exception as e:
+                ax1.plot(self.wave, self.flux, 'k-', label='Original Spectrum', alpha=0.7)
+                logging.warning(f"无法绘制发射线: {str(e)}")
         else:
             ax1.plot(self.wave, self.flux, 'k-', label='Original Spectrum', alpha=0.7)
             
+        # 绘制拟合模板
         ax1.plot(self.fit_wave, self.fit_flux, 'b-', label='Template Fit', alpha=0.7)
         
-        # Mark regions
-        colors = {'blue': 'blue', 'line': 'green', 'red': 'red'}
+        # 标记吸收线区域
+        colors = {'blue': 'b', 'line': 'g', 'red': 'r'}
         for region, (start, end) in windows.items():
-            ax1.axvspan(start, end, alpha=0.2, color=colors[region], label=f'{region.capitalize()} Region')
+            ax1.axvspan(start, end, alpha=0.2, color=colors[region], 
+                       label=f'{region.capitalize()} Window')
             ax2.axvspan(start, end, alpha=0.2, color=colors[region])
-            ax3.axvspan(start, end, alpha=0.2, color=colors[region])
 
-        ax1.xaxis.set_minor_locator(AutoMinorLocator(5))
-        ax1.yaxis.set_minor_locator(AutoMinorLocator(5))
-        ax1.tick_params(axis='both', which='both', labelsize='x-small', right=True, top=True, direction='in')
+        # 第二个面板：吸收指数测量
+        ax2.plot(self.wave, self.flux, 'k-', label='Processed Spectrum')
         
-        # Mark good wavelength range if available
-        if self.good_wavelength_range is not None:
-            ax1.axvspan(self.good_wavelength_range[0], self.good_wavelength_range[1], 
-                      color='lightgreen', alpha=0.15, label='Good λ Range')
-            ax2.axvspan(self.good_wavelength_range[0], self.good_wavelength_range[1], 
-                      color='lightgreen', alpha=0.15)
-            ax3.axvspan(self.good_wavelength_range[0], self.good_wavelength_range[1], 
-                      color='lightgreen', alpha=0.15)
+        # 绘制连续谱点和线
+        ax2.plot(data['wave_cont'], data['flux_cont'], 'r*', markersize=10, label='Continuum Points')
+        ax2.plot(data['line_wave'], data['cont_at_line'], 'r--', label='Continuum Fit')
         
-        # Add continuum points and line
-        if 'wave_cont' in data and 'flux_cont' in data:
-            ax1.plot(data['wave_cont'], data['flux_cont'], 'ro', ms=8, label='Continuum Points')
-            
-            # Plot continuum line over index region
-            if 'line_wave' in data and 'cont_at_line' in data:
-                ax1.plot(data['line_wave'], data['cont_at_line'], 'r--', lw=2, label='Continuum Level')
-                
-        # Set y-axis limits using template range
-        try:
-            temp_mask = (self.fit_wave >= x_min) & (self.fit_wave <= x_max)
-            y_max = np.max(self.fit_flux[temp_mask]) * 1.1
-            y_min = np.min(self.fit_flux[temp_mask]) * 0.9
-            ax1.set_ylim(y_min, y_max)
-        except Exception as e:
-            logging.warning(f"Error setting y-limits: {str(e)}")
+        # 绘制填充的吸收区域（指数）
+        ax2.fill_between(data['line_wave'], data['line_flux'], data['cont_at_line'], 
+                        alpha=0.3, color='g', label='Absorption Index')
         
-        ax1.set_xlim(x_min, x_max)
-        ax1.set_title(f'Spectral Index Measurement: {line_name}')
+        # 添加文本标签显示指数值
+        ax2.text(0.05, 0.9, f"{line_name} Index = {data['index']:.4f} Å", 
+                transform=ax2.transAxes, fontsize=12, 
+                bbox=dict(facecolor='white', alpha=0.7))
+        
+        # 设置坐标轴属性
+        for ax in [ax1, ax2]:
+            ax.set_xlim(x_min, x_max)
+            ax.xaxis.set_minor_locator(AutoMinorLocator(5))
+            ax.yaxis.set_minor_locator(AutoMinorLocator(5))
+            ax.tick_params(axis='both', which='both', labelsize='x-small', 
+                          right=True, top=True, direction='in')
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc='upper right')
+        
+        # 设置标题和标签
+        ax1.set_title(f'Original Spectrum (v={self.velocity:.1f} km/s)')
+        ax2.set_title(f'Index Measurement: {line_name}')
+        ax2.set_xlabel('Rest-frame Wavelength (Å)')
         ax1.set_ylabel('Flux')
-        ax1.legend(loc='upper right')
-        ax1.grid(True, alpha=0.3)
-        
-        # Second panel: Zoomed view of index region
-        # Plot data in each region with different markers
-        if 'blue_wave' in data:
-            ax2.plot(data['blue_wave'], data['blue_flux'], 'o', color='blue', ms=4, alpha=0.8, label='Blue Continuum')
-        if 'line_wave' in data:
-            ax2.plot(data['line_wave'], data['line_flux'], 'o', color='green', ms=4, alpha=0.8, label='Line Region')
-        if 'red_wave' in data:
-            ax2.plot(data['red_wave'], data['red_flux'], 'o', color='red', ms=4, alpha=0.8, label='Red Continuum')
-        
-        # Plot continuum line
-        if 'line_wave' in data and 'cont_at_line' in data:
-            ax2.plot(data['line_wave'], data['cont_at_line'], 'r--', lw=2)
-        
-        # Adjust y-axis limits for second panel
-        padding = 10  # Å of padding around regions
-        zoom_min = windows['blue'][0] - padding
-        zoom_max = windows['red'][1] + padding
-        ax2.set_xlim(zoom_min, zoom_max)
-        
         ax2.set_ylabel('Flux')
-        ax2.legend(loc='upper right')
-        ax2.grid(True, alpha=0.3)
-        ax2.xaxis.set_minor_locator(AutoMinorLocator(5))
-        ax2.yaxis.set_minor_locator(AutoMinorLocator(5))
-        ax2.tick_params(axis='both', which='both', labelsize='x-small', right=True, top=True, direction='in')
-        
-        # Third panel: Absorption profile
-        if 'line_wave' in data and 'line_flux' in data and 'cont_at_line' in data:
-            # Calculate absorption profile
-            abs_profile = 1.0 - data['line_flux'] / data['cont_at_line']
-            
-            # Plot absorption profile
-            ax3.plot(data['line_wave'], abs_profile, 'g-', lw=2, label='Absorption Profile')
-            
-            # Fill area under the curve (represents the index)
-            ax3.fill_between(data['line_wave'], 0, abs_profile, color='green', alpha=0.3)
-            
-            # Add index value as text
-            index_val = data.get('index', np.nan)
-            ax3.text(0.05, 0.85, f"{line_name} Index = {index_val:.4f} Å", 
-                    transform=ax3.transAxes, fontsize=12, bbox=dict(facecolor='white', alpha=0.7))
-            
-            # Add horizontal line at y=0
-            ax3.axhline(y=0, color='k', linestyle='-', alpha=0.3)
-            
-            # Set limits for absorption profile
-            ax3.set_xlim(windows['line'][0] - 5, windows['line'][1] + 5)
-            ax3.set_ylim(-0.05, max(abs_profile) * 1.1 + 0.05)
-        
-        ax3.set_xlabel('Wavelength (Å)')
-        ax3.set_ylabel('1 - Flux/Continuum')
-        ax3.legend(loc='upper right')
-        ax3.grid(True, alpha=0.3)
-        ax3.xaxis.set_minor_locator(AutoMinorLocator(5))
-        ax3.yaxis.set_minor_locator(AutoMinorLocator(5))
-        ax3.tick_params(axis='both', which='both', labelsize='x-small', right=True, top=True, direction='in')
         
         plt.tight_layout()
         
+        # 保存或显示图像
         if output_path:
             plt.savefig(output_path, dpi=150, bbox_inches='tight')
             plt.close()
         else:
             plt.show()
+
+    def plot_all_lines(self, mode=None, number=None, save_path=None, show_index=False):
+        """
+        绘制包含所有谱线的完整图谱
+        
+        Parameters:
+        -----------
+        mode : str, optional
+            图像的模式，必须是'P2P'、'VNB'或'RNB'之一
+        number : int, optional
+            图像的编号，必须是整数
+        save_path : str, optional
+            图像保存的路径。如果提供，图像将被保存到该路径下
+        show_index : bool, optional
+            是否显示谱指数参数，默认为False
+        """
+        if self.wave is None or self.flux is None:
+            logging.warning("No data available for plotting all lines")
+            return
+            
+        # 验证mode和number参数
+        if mode is not None and number is not None:
+            valid_modes = ['P2P', 'VNB', 'RNB']
+            if mode not in valid_modes:
+                raise ValueError(f"Mode must be one of {valid_modes}")
+            if not isinstance(number, int):
+                raise ValueError("Number must be an integer")
+            mode_title = f"{mode}{number}"
+        else:
+            mode_title = None
+
+        # 获取所有定义的谱线
+        all_windows = {
+            'Hbeta': self.define_line_windows('Hbeta'),
+            'Mgb': self.define_line_windows('Mgb'),
+            'Fe5015': self.define_line_windows('Fe5015')
+        }
+        
+        # 设置固定的X轴范围
+        min_wave = 4800
+        max_wave = 5250
+        
+        # 创建图形和整体标题
+        fig = plt.figure(figsize=(15, 12))
+        if mode_title:
+            fig.suptitle(mode_title, fontsize=16, y=0.95)
+        
+        # 创建子图，调整高度比例以适应整体标题
+        gs = fig.add_gridspec(2, 1, height_ratios=[1, 1], hspace=0.2)
+        ax1 = fig.add_subplot(gs[0])
+        ax2 = fig.add_subplot(gs[1])
+        
+        # 设置统一的颜色方案
+        colors = {
+            'blue': 'tab:blue',
+            'line': 'tab:green',
+            'red': 'tab:red',
+            'orig_cont': 'tab:orange',   # 原始光谱连续谱颜色（橙色）
+            'fit_cont': 'tab:green',     # 拟合光谱连续谱颜色（绿色）
+            'inactive_cont': 'gray'      # 未使用的连续谱颜色
+        }
+        
+        # 第一个面板：原始数据对比
+        wave_mask = (self.wave >= min_wave) & (self.wave <= max_wave)
+        fit_mask = (self.fit_wave >= min_wave) & (self.fit_wave <= max_wave)
+        
+        # 计算y轴范围
+        if hasattr(self, 'em_flux_list'):
+            try:
+                em_flux_resampled = spectres(self.wave, self.em_wave, self.em_flux_list)
+                flux_range = self.flux[wave_mask] + em_flux_resampled[wave_mask]
+            except:
+                flux_range = self.flux[wave_mask]
+        else:
+            flux_range = self.flux[wave_mask]
+        fit_range = self.fit_flux[fit_mask]
+        
+        y_min = min(np.min(flux_range), np.min(fit_range)) * 0.9
+        y_max = max(np.max(flux_range), np.max(fit_range)) * 1.1
+        
+        # 绘制光谱
+        if hasattr(self, 'em_flux_list'):
+            try:
+                em_flux_resampled = spectres(self.wave, self.em_wave, self.em_flux_list)
+                ax1.plot(self.wave, self.flux + em_flux_resampled, color='tab:blue', 
+                        label='Original Spectrum', alpha=0.8)
+                ax1.plot(self.em_wave, self.em_flux_list, color='tab:orange', 
+                        label='Emission Lines', alpha=0.8)
+            except:
+                ax1.plot(self.wave, self.flux, color='tab:blue', 
+                        label='Original Spectrum', alpha=0.8)
+        else:
+            ax1.plot(self.wave, self.flux, color='tab:blue', 
+                    label='Original Spectrum', alpha=0.8)
+        ax1.plot(self.fit_wave, self.fit_flux, color='tab:red', 
+                label='Template Fit', alpha=0.8)
+        
+        # 为第二个面板计算y轴范围
+        processed_flux = self.flux[wave_mask]
+        fit_flux_range = self.fit_flux[fit_mask]
+        y_min_processed = min(np.min(processed_flux), np.min(fit_flux_range)) * 0.9
+        y_max_processed = max(np.max(processed_flux), np.max(fit_flux_range)) * 1.1
+        
+        # 第二个面板：处理后的光谱
+        ax2.plot(self.wave, self.flux, color='tab:blue', 
+                label='Processed Spectrum', alpha=0.8)
+        ax2.plot(self.fit_wave, self.fit_flux, '--', color='tab:red',
+                label='Template Fit', alpha=0.8)
+        
+        # 在两个面板中标记所有谱线区域
+        for line_name, windows in all_windows.items():
+            for panel in [ax1, ax2]:
+                # 标记蓝端、线心和红端区域
+                alpha = 0.2  # 恢复原来的透明度
+                # 只在图例中显示一次每种区域类型
+                if line_name == 'Hbeta':  # 第一个谱线用于图例
+                    panel.axvspan(windows['blue'][0], windows['blue'][1], 
+                                alpha=alpha, color=colors['blue'], label='Blue window')
+                    panel.axvspan(windows['line'][0], windows['line'][1], 
+                                alpha=alpha, color=colors['line'], label='Line region')
+                    panel.axvspan(windows['red'][0], windows['red'][1], 
+                                alpha=alpha, color=colors['red'], label='Red window')
+                else:
+                    panel.axvspan(windows['blue'][0], windows['blue'][1], 
+                                alpha=alpha, color=colors['blue'])
+                    panel.axvspan(windows['line'][0], windows['line'][1], 
+                                alpha=alpha, color=colors['line'])
+                    panel.axvspan(windows['red'][0], windows['red'][1], 
+                                alpha=alpha, color=colors['red'])
+                
+                # 添加文字标注到底部
+                if panel == ax1:
+                    y_text = y_min + 0.05 * (y_max - y_min)
+                else:
+                    y_text = y_min_processed + 0.05 * (y_max_processed - y_min_processed)
+                
+                # 基础标签
+                panel.text(np.mean(windows['line']), y_text, line_name,
+                        horizontalalignment='center', verticalalignment='top',
+                        bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
+                
+                # 在第二个面板添加连续谱点
+                if panel == ax2:
+                    # 计算连续谱点
+                    blue_cont_orig = None
+                    red_cont_orig = None
+                    blue_cont_fit = None
+                    red_cont_fit = None
+                    
+                    # 检查是否可以使用原始光谱
+                    if self._check_data_coverage(windows['blue']):
+                        mask = (self.wave >= windows['blue'][0]) & (self.wave <= windows['blue'][1])
+                        blue_cont_orig = np.median(self.flux[mask])
+                    if self._check_data_coverage(windows['red']):
+                        mask = (self.wave >= windows['red'][0]) & (self.wave <= windows['red'][1])
+                        red_cont_orig = np.median(self.flux[mask])
+                    
+                    # 计算拟合光谱的连续谱点
+                    mask_blue = (self.fit_wave >= windows['blue'][0]) & (self.fit_wave <= windows['blue'][1])
+                    mask_red = (self.fit_wave >= windows['red'][0]) & (self.fit_wave <= windows['red'][1])
+                    blue_cont_fit = np.median(self.fit_flux[mask_blue])
+                    red_cont_fit = np.median(self.fit_flux[mask_red])
+                    
+                    wave_cont = np.array([
+                        np.mean(windows['blue']), 
+                        np.mean(windows['red'])
+                    ])
+
+                    # 根据计算模式决定哪个是活动的连续谱
+                    is_orig_active = (self.continuum_mode == 'original' or 
+                                    (self.continuum_mode == 'auto' and 
+                                    blue_cont_orig is not None and 
+                                    red_cont_orig is not None))
+                    
+                    # 绘制原始光谱连续谱点和线（如果存在）
+                    if blue_cont_orig is not None and red_cont_orig is not None:
+                        flux_cont_orig = np.array([blue_cont_orig, red_cont_orig])
+                        if not is_orig_active:
+                            # 非活动状态
+                            panel.plot(wave_cont, flux_cont_orig, '*', color=colors['inactive_cont'], 
+                                    markersize=10, alpha=0.5,
+                                    label='Original spectrum continuum (inactive)' if line_name == 'Hbeta' else '')
+                            panel.plot(wave_cont, flux_cont_orig, '--', color=colors['inactive_cont'], 
+                                    alpha=0.5)
+                        else:
+                            # 活动状态
+                            panel.plot(wave_cont, flux_cont_orig, '*', color=colors['orig_cont'], 
+                                    markersize=10, alpha=0.8,
+                                    label='Original spectrum continuum (orange)' if line_name == 'Hbeta' else '')
+                            panel.plot(wave_cont, flux_cont_orig, '--', color=colors['orig_cont'], 
+                                    alpha=0.8)
+
+                    # 绘制拟合光谱连续谱点和线
+                    flux_cont_fit = np.array([blue_cont_fit, red_cont_fit])
+                    if is_orig_active:
+                        # 非活动状态
+                        panel.plot(wave_cont, flux_cont_fit, '*', color=colors['inactive_cont'], 
+                                markersize=10, alpha=0.5,
+                                label='Template continuum (inactive)' if line_name == 'Hbeta' else '')
+                        panel.plot(wave_cont, flux_cont_fit, '--', color=colors['inactive_cont'], 
+                                alpha=0.5)
+                    else:
+                        # 活动状态
+                        panel.plot(wave_cont, flux_cont_fit, '*', color=colors['fit_cont'], 
+                                markersize=10, alpha=0.8,
+                                label='Template continuum (green)' if line_name == 'Hbeta' else '')
+                        panel.plot(wave_cont, flux_cont_fit, '--', color=colors['fit_cont'], 
+                                alpha=0.8)
+
+                    # 添加原始谱计算的连续谱到图例
+                    if line_name == 'Hbeta':
+                        dummy_line = plt.Line2D([], [], color=colors['orig_cont'], linestyle='--', 
+                                            marker='*', markersize=10, alpha=0.8,
+                                            label='Original spectrum computed continuum (orange)')
+                        dummy_line2 = plt.Line2D([], [], color=colors['fit_cont'], linestyle='--', 
+                                            marker='*', markersize=10, alpha=0.8,
+                                            label='Template computed continuum (green)')
+                        panel.add_artist(dummy_line)
+                        panel.add_artist(dummy_line2)
+
+                    # 如果需要显示谱指数参数
+                    if show_index:
+                        try:
+                            # 保存当前的continuum_mode
+                            original_mode = self.continuum_mode
+                            
+                            # 计算原始光谱的指数值
+                            self.continuum_mode = 'original'
+                            try:
+                                orig_index = self.calculate_index(line_name)
+                                if np.isnan(orig_index):
+                                    orig_index = None
+                            except ValueError:
+                                orig_index = None
+                            
+                            # 计算拟合光谱的指数值
+                            self.continuum_mode = 'fit'
+                            fit_index = self.calculate_index(line_name)
+                            if np.isnan(fit_index):
+                                fit_index = None
+                            
+                            # 恢复原始的continuum_mode
+                            self.continuum_mode = original_mode
+                            
+                            # 计算文本位置
+                            base_y_text = y_text + 0.05 * (y_max_processed - y_min_processed)
+                            
+                            # 构建显示文本
+                            if orig_index is not None and fit_index is not None:
+                                # 分别显示两个值
+                                y_offset = 0.1 * (y_max_processed - y_min_processed)
+                                
+                                # 显示原始光谱的值（上面）
+                                panel.text(np.mean(windows['line']), 
+                                        base_y_text + y_offset,
+                                        f"{orig_index:.3f}", 
+                                        color=colors['orig_cont'], 
+                                        horizontalalignment='center',
+                                        verticalalignment='bottom', 
+                                        fontsize='x-small',
+                                        bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
+                                
+                                # 显示拟合光谱的值（下面）
+                                panel.text(np.mean(windows['line']), 
+                                        base_y_text + y_offset/2,
+                                        f"{fit_index:.3f}", 
+                                        color=colors['fit_cont'], 
+                                        horizontalalignment='center',
+                                        verticalalignment='bottom', 
+                                        fontsize='x-small',
+                                        bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
+                                
+                            elif fit_index is not None:
+                                # 只显示拟合光谱的值
+                                fit_text = f"{fit_index:.3f}"
+                                panel.text(np.mean(windows['line']), 
+                                        base_y_text + 0.02 * (y_max_processed - y_min_processed),
+                                        fit_text, 
+                                        color=colors['fit_cont'], 
+                                        horizontalalignment='center',
+                                        verticalalignment='bottom', 
+                                        fontsize='x-small',
+                                        bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
+                        
+                        except Exception as e:
+                            print(f"Error calculating index for {line_name}: {e}")
+        
+        # 设置两个面板的属性
+        ax1.set_xlim(min_wave, max_wave)
+        ax1.set_ylim(y_min, y_max)
+        ax2.set_xlim(min_wave, max_wave)
+        ax2.set_ylim(y_min_processed, y_max_processed)
+        
+        # 设置两个面板的共同属性
+        for ax in [ax1, ax2]:
+            ax.xaxis.set_minor_locator(AutoMinorLocator(5))
+            ax.yaxis.set_minor_locator(AutoMinorLocator(5))
+            ax.tick_params(axis='both', which='both', labelsize='x-small', 
+                        right=True, top=True, direction='in')
+            ax.set_xlabel('Rest-frame Wavelength (Å)')
+            ax.set_ylabel('Flux')
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc='upper right')
+        
+        ax1.set_title(f'Original Data Comparison (v={self.velocity:.1f} km/s)')
+        ax2.set_title('Processed Spectrum with Continuum Fits')
+        
+        # 调整布局
+        if mode_title:
+            plt.subplots_adjust(top=0.9, bottom=0.1, left=0.1, right=0.9, hspace=0.3)
+        else:
+            plt.subplots_adjust(top=0.95, bottom=0.1, left=0.1, right=0.9, hspace=0.3)
+        
+        # 如果提供了保存路径，保存图像
+        if save_path and mode_title:
+            # 确保save_path存在
+            if not os.path.exists(save_path):
+                os.makedirs(save_path)
+            
+            # 构建完整的文件路径
+            filepath = os.path.join(save_path, f"{mode_title}.pdf")
+            
+            # 保存图像
+            plt.savefig(filepath, format='pdf', bbox_inches='tight')
+            print(f"Figure saved as: {filepath}")
+        
+        plt.show()
 
 
 ### ------------------------------------------------- ###
@@ -1145,10 +1384,27 @@ def prepare_templates(config, velscale):
     
     return sps, gas_templates, gas_names, line_wave
 
+def Apply_velocity_correction(wave, z):
+        """
+        应用速度修正到波长
+        
+        Parameters:
+        -----------
+        wave : array-like
+            原始波长数组
+            
+        Returns:
+        --------
+        array-like : 修正后的波长数组
+        """
+        return wave / (1 + (z))
 
 def fit_single_pixel(args):
     """
-    Fit a single pixel with pPXF.
+    使用两阶段拟合策略拟合单个像素。
+    
+    阶段1: 仅使用恒星模板拟合
+    阶段2: 使用第一阶段最优恒星模板和气体模板一起拟合
     
     Parameters
     ----------
@@ -1173,308 +1429,301 @@ def fit_single_pixel(args):
         return i, j, None
     
     try:
+        wave_range = [(Apply_velocity_correction(config.good_wavelength_range[0], config.redshift)),
+                            (Apply_velocity_correction(config.good_wavelength_range[1], config.redshift))]
         # Get spectrum data
         spectrum = galaxy_data.spectra[:, k_index]
-        noise = np.ones_like(spectrum)  # Use uniform noise
+        noise = np.ones_like(spectrum)  
         
-        # Calculate wavelength ranges
-        gal_wave_range = np.exp(galaxy_data.ln_lam_gal[[0, -1]])
-        temp_wave_range = np.exp(sps.ln_lam_temp[[0, -1]])
+        # 波长范围
+        lam_gal = galaxy_data.lam_gal
+        lam_range_temp = np.exp(sps.ln_lam_temp[[0, -1]])
         
-        logging.debug(f"STEP: Wavelength ranges")
-        logging.debug(f"  - Galaxy wave range: {gal_wave_range}")
-        logging.debug(f"  - Template wave range: {temp_wave_range}")
+        spectrum = spectrum[ np.where((lam_gal > wave_range[0]) & (lam_gal < wave_range[1])) ]
+        lam_gal = lam_gal[ np.where((lam_gal > wave_range[0]) & (lam_gal < wave_range[1])) ]
+
+        noise = np.ones_like(spectrum)# Use uniform noise
+
+        # 自动计算掩码 - 与原始代码一致
+        mask = util.determine_mask(np.log(lam_gal), lam_range_temp, width=1000)
         
-        # Create wavelength mask for fitting
-        logging.debug(f"STEP: Creating wavelength mask with width={config.mask_width}")
-        
-        # First limit to good wavelength range
-        if hasattr(config, 'good_wavelength_range'):
-            good_ln_lam_min = np.log(config.good_wavelength_range[0])
-            good_ln_lam_max = np.log(config.good_wavelength_range[1])
-            
-            # Create template mask
-            mask_template = util.determine_mask(galaxy_data.ln_lam_gal, 
-                                            temp_wave_range, 
-                                            width=config.mask_width)
-            
-            # Create good wavelength mask
-            mask_good = (galaxy_data.ln_lam_gal >= good_ln_lam_min) & (galaxy_data.ln_lam_gal <= good_ln_lam_max)
-            
-            # Combine masks
-            mask = mask_template & mask_good
-            
-            logging.debug(f"  - Template mask points: {np.sum(mask_template)}")
-            logging.debug(f"  - Good wavelength mask points: {np.sum(mask_good)}")
-            logging.debug(f"  - Combined mask points: {np.sum(mask)}")
-        else:
-            # Just use template mask
-            mask = util.determine_mask(galaxy_data.ln_lam_gal, 
-                                     temp_wave_range, 
-                                     width=config.mask_width)
-            logging.debug(f"  - Template mask points: {np.sum(mask)}")
+        logging.debug(f"STEP: Automatically calculated mask with width=1000")
+        logging.debug(f"  - Mask has {np.sum(mask)} points")
         
         if not np.any(mask):
-            logging.warning(f"Empty mask for pixel ({i},{j}). Wavelength ranges may not overlap or good range too restrictive.")
+            logging.warning(f"Empty mask for pixel ({i},{j}). Wavelength ranges may not overlap.")
             return i, j, None
         
-        # First stellar fit with error handling
-        logging.debug(f"STEP: First stellar-only fit")
+        #################################################
+        # 第一阶段：仅拟合恒星成分 (与原始代码Cube_sol一致)
+        #################################################
+        logging.debug(f"STEP: FIRST STAGE - Stellar component only fit")
+        
         try:
+            
+            
+            # 使用与原始代码相同的参数
             pp_stars = ppxf(sps.templates, spectrum, noise, galaxy_data.velscale, 
                           [config.vel_s, config.vel_dis_s],
-                          degree=config.degree,
-                          plot=False, mask=mask, lam=galaxy_data.lam_gal, 
+                          degree=3,  # 原始代码使用degree=3
+                          plot=True, mask=mask, lam=lam_gal, 
                           lam_temp=sps.lam_temp, quiet=True)
-            logging.debug(f"  - First fit successful: v={pp_stars.sol[0]:.1f}, σ={pp_stars.sol[1]:.1f}")
+            
+            logging.debug(f"  - First stage fit successful: v={pp_stars.sol[0]:.1f}, σ={pp_stars.sol[1]:.1f}")
         except Exception as e:
             if config.retry_with_degree_zero:
                 logging.warning(f"Initial stellar fit failed for pixel ({i},{j}): {str(e)}")
-                logging.debug(f"  - Retrying with simplified parameters: degree=0, mdegree=-1")
+                logging.debug(f"  - Retrying with simplified parameters: degree=0")
                 # Try with simpler polynomial
                 pp_stars = ppxf(sps.templates, spectrum, noise, galaxy_data.velscale, 
                               [config.vel_s, config.vel_dis_s],
-                              degree=0, mdegree=-1, # Use simplest polynomial settings
-                              plot=False, mask=mask, lam=galaxy_data.lam_gal, 
+                              degree=0, 
+                              plot=True, mask=mask, lam=lam_gal, 
                               lam_temp=sps.lam_temp, quiet=True)
                 logging.debug(f"  - Retry successful: v={pp_stars.sol[0]:.1f}, σ={pp_stars.sol[1]:.1f}")
             else:
                 raise  # Re-raise the exception if we're not retrying
         
-        # Get best-fit template
-        logging.debug(f"STEP: Getting best-fit stellar template")
-        logging.debug(f"  - sps.templates shape: {sps.templates.shape}")
-        logging.debug(f"  - pp_stars.weights shape: {pp_stars.weights.shape}")
+        # 创建最优恒星模板 - 与原始代码一致，只做权重和模板相乘
+        logging.debug(f"STEP: Creating optimal stellar template")
         
-        # Ensure we have valid weights before matrix multiplication
+        # Ensure we have valid weights
         if pp_stars.weights is None or not np.any(np.isfinite(pp_stars.weights)):
             logging.warning(f"Invalid weights in stellar fit for pixel ({i},{j})")
             return i, j, None
-            
-        best_template = sps.templates @ pp_stars.weights
         
-        logging.debug(f"  - Resulting best_template shape: {best_template.shape}")
+        # 计算最优恒星模板 - 与原始代码一致: 只用权重和模板相乘
+        optimal_stellar_template = sps.templates @ pp_stars.weights
         
-        # Make sure best_template is 2D column vector
-        if best_template.ndim == 1:
-            logging.debug(f"STEP: Reshaping 1D template to 2D column vector")
-            best_template = best_template.reshape(-1, 1)
-            logging.debug(f"  - After reshape: best_template shape: {best_template.shape}")
+        # 记录apoly，但不添加到模板中
+        apoly = pp_stars.apoly if hasattr(pp_stars, 'apoly') and pp_stars.apoly is not None else None
         
-        # Combine stellar and gas templates
-        logging.debug(f"STEP: Combining stellar and gas templates")
-        logging.debug(f"  - Best template shape: {best_template.shape}")
-        logging.debug(f"  - Gas templates shape: {gas_templates.shape}")
-        
-        stars_gas_templates = np.column_stack([best_template, gas_templates])
-        logging.debug(f"  - Combined template shape: {stars_gas_templates.shape}")
-        
-        # Set up component array correctly
-        logging.debug(f"STEP: Setting up component array")
-        n_templates = stars_gas_templates.shape[1]
-        component = np.zeros(n_templates, dtype=int)
-        component[1:] = 1  # Mark gas templates as component 1
-        logging.debug(f"  - Component array: shape={component.shape}, unique values={np.unique(component)}")
-        
-        # Mark gas components
-        gas_component = np.zeros_like(component, dtype=bool)
-        gas_component[1:] = True
-        logging.debug(f"  - Gas component mask: sum={np.sum(gas_component)}")
-        
-        # Set up moments
-        logging.debug(f"STEP: Setting up moments array")
-        moments = config.moments
-        if isinstance(moments, int):
-            moments = [moments, 2]  # Default: stellar moments and gas=2
-        logging.debug(f"  - Moments: {moments}")
-        
-        # Set up start values
+        # 保存第一阶段结果
         vel_stars = to_scalar(pp_stars.sol[0])
         sigma_stars = to_scalar(pp_stars.sol[1]) 
+        bestfit_stars = pp_stars.bestfit
         
-        # Ensure sigma is positive
+        # 确保sigma值合理
         if sigma_stars < 0:
             logging.warning(f"Negative velocity dispersion detected: {sigma_stars:.1f} km/s. Setting to 10 km/s.")
             sigma_stars = 10.0
+        
+        #################################################
+        # 第二阶段：使用恒星模板和气体模板一起拟合 (与原始STF部分一致)
+        #################################################
+        if config.use_two_stage_fit and config.compute_emission_lines:
             
-        logging.debug(f"STEP: Setting up start values based on stellar fit: v={vel_stars:.1f}, σ={sigma_stars:.1f}")
-        
-        # Create properly sized start array based on moments
-        start = []
-        
-        # Stellar component
-        if moments[0] == 2:
-            start.append([vel_stars, sigma_stars])
-        elif moments[0] == 4:
-            start.append([vel_stars, sigma_stars, 0, 0])
+            logging.debug(f"STEP: SECOND STAGE - Combined fit with optimal stellar template")
+            
+            # 定义波长范围：从Hbeta蓝端到Mgb红端 - 与原始代码一致
+            # logging.info(f"=== TCA Here ===")
+            wave_range = [(Apply_velocity_correction(config.good_wavelength_range[0], config.redshift)),
+                            (Apply_velocity_correction(config.good_wavelength_range[1], config.redshift))]
+            
+            # 只截取观测数据的波长范围 - 与原始代码一致
+            wave_mask = (lam_gal >= wave_range[0]) & (lam_gal <= wave_range[1])
+            galaxy_subset = spectrum[wave_mask]
+            noise_subset = np.ones_like(galaxy_subset)
+            
+            # 确保恒星模板是正确的形状
+            if optimal_stellar_template.ndim > 1 and optimal_stellar_template.shape[1] == 1:
+                optimal_stellar_template = optimal_stellar_template.flatten()
+            
+            # 合并恒星和气体模板 - 与原始代码一致
+            stars_gas_templates = np.column_stack([optimal_stellar_template, gas_templates])
+            
+            # 设置成分数组 - 与原始代码一致，是气体模板的数量而不是固定为2
+            component = [0] + [1]*gas_templates.shape[1]  # 第一个是恒星模板，其余是气体模板
+            gas_component = np.array(component) > 0
+            
+            # 设置moments参数 - 与原始代码一致
+            moments = config.moments  # 使用配置中的值，默认为[-2, 2]
+            
+            # 设置起始值 - 与原始代码一致
+            start = [
+                [vel_stars, sigma_stars],  # 恒星成分
+                [vel_stars, 50]            # 气体成分
+            ]
+            
+            # 设置边界 - 与原始代码一致
+            vlim = lambda x: vel_stars + x*np.array([-100, 100])
+            bounds = [
+                [vlim(2), [20, 300]],  # 恒星成分
+                [vlim(2), [20, 100]]   # 气体成分
+            ]
+            
+            # 设置tied参数 - 与原始代码一致
+            ncomp = len(moments)
+            tied = [['', ''] for _ in range(ncomp)]
+            
+            try:
+                # 执行第二阶段拟合 - 与原始代码一致
+                pp = ppxf(stars_gas_templates, galaxy_subset, noise_subset, galaxy_data.velscale, start,
+                        plot=False, moments=moments, degree=3, mdegree=-1, 
+                        component=component, gas_component=gas_component, gas_names=gas_names,
+                        lam=lam_gal[wave_mask], lam_temp=sps.lam_temp, 
+                        tied=tied, bounds=bounds, quiet=True,
+                        global_search=config.global_search)
+                
+                logging.debug(f"  - Combined fit successful: v={to_scalar(pp.sol[0]):.1f}, "
+                            f"σ={to_scalar(pp.sol[1]):.1f}, χ²={to_scalar(pp.chi2):.3f}")
+                
+                # 检查是否成功拟合到发射线
+                has_emission = False
+                if hasattr(pp, 'gas_bestfit') and pp.gas_bestfit is not None:
+                    has_emission = np.any(np.abs(pp.gas_bestfit) > 1e-10)
+                
+                if has_emission:
+                    logging.debug(f"  - Gas emission detected in second stage fit")
+                else:
+                    logging.debug(f"  - No significant emission detected in second stage fit")
+                
+                # 创建完整的bestfit（波长范围可能只是子集）
+                full_bestfit = np.copy(bestfit_stars)  # 先用第一阶段结果填充
+
+                
+
+                # Add calculate template
+                Apoly_Params = np.polyfit(lam_gal[wave_mask], pp.apoly, 3)
+                Temp_Calu = (stars_gas_templates[:,0] * pp.weights[0]) + np.poly1d(Apoly_Params)(sps.lam_temp)
+
+                
+                
+                # 添加完整的气体模板 (如果有)
+                if hasattr(pp, 'gas_bestfit') and pp.gas_bestfit is not None:
+                    # 先在子集范围内替换为第二阶段的拟合结果
+                    full_bestfit[wave_mask] = pp.bestfit
+                    
+                    # 为了方便后续处理，也创建完整范围的gas_bestfit
+                    full_gas_bestfit = np.zeros_like(spectrum)
+                    if has_emission:
+                        # 只在子集范围内设置gas_bestfit
+                        full_gas_bestfit[wave_mask] = pp.gas_bestfit
+                    
+                    # 设置pp的gas_bestfit为完整范围版本
+                    pp.full_gas_bestfit = full_gas_bestfit
+                else:
+                    pp.full_gas_bestfit = np.zeros_like(spectrum)
+                
+                # 设置pp的bestfit为完整范围版本
+                pp.full_bestfit = full_bestfit
+                
+            except Exception as e:
+                logging.warning(f"Combined fit failed for pixel ({i},{j}): {str(e)}")
+                
+                if config.fallback_to_simple_fit:
+                    logging.debug(f"  - Using fallback to stellar-only fit")
+                    # Fallback: just use stellar fit
+                    pp = pp_stars
+                    pp.full_bestfit = bestfit_stars
+                    pp.full_gas_bestfit = np.zeros_like(spectrum)
+                    
+                    # No gas template results
+                    pp.gas_bestfit = np.zeros_like(spectrum[wave_mask]) if wave_mask.any() else np.zeros_like(spectrum)
+                    if not hasattr(pp, 'gas_flux'):
+                        pp.gas_flux = np.zeros(len(gas_names))
+                    pp.gas_bestfit_templates = np.zeros((pp.gas_bestfit.shape[0], len(gas_names)))
+                    
+                    logging.info(f"Used fallback stellar-only fit for pixel ({i},{j})")
+                else:
+                    raise  # Re-raise the exception if we're not using fallback
         else:
-            start_stars = [vel_stars]
-            if moments[0] >= 2:
-                start_stars.append(sigma_stars)
-            start_stars.extend([0] * (moments[0] - len(start_stars)))
-            start.append(start_stars)
-        
-        # Gas component
-        if len(moments) > 1:
-            if moments[1] == 2:
-                start.append([vel_stars, 50])  # Use stellar velocity, 50 km/s dispersion
-            elif moments[1] == 1:
-                start.append([vel_stars])
-            else:
-                start_gas = [vel_stars]
-                if moments[1] >= 2:
-                    start_gas.append(50)
-                start_gas.extend([0] * (moments[1] - len(start_gas)))
-                start.append(start_gas)
-        
-        logging.debug(f"  - Start values: {start}")
-        
-        # Set up bounds
-        logging.debug(f"STEP: Setting up parameter bounds")
-        bounds = []
-        vel_range = [vel_stars - 100, vel_stars + 100]  # Velocity bounds
-        
-        # Stellar component bounds
-        if moments[0] == 2:
-            bounds.append([vel_range, [5, 300]])  # Minimum sigma = 5 km/s
-        elif moments[0] == 4:
-            bounds.append([vel_range, [5, 300], [-0.3, 0.3], [-0.3, 0.3]])
-        else:
-            bound_stars = [vel_range]
-            if moments[0] >= 2:
-                bound_stars.append([5, 300])  # Ensure minimum sigma is positive
-            bound_stars.extend([[-0.3, 0.3]] * (moments[0] - len(bound_stars)))
-            bounds.append(bound_stars)
-        
-        # Gas component bounds
-        if len(moments) > 1:
-            if moments[1] == 2:
-                bounds.append([vel_range, [5, 100]])  # Minimum sigma = 5 km/s
-            elif moments[1] == 1:
-                bounds.append([vel_range])
-            else:
-                bound_gas = [vel_range]
-                if moments[1] >= 2:
-                    bound_gas.append([5, 100])  # Ensure minimum sigma is positive
-                bound_gas.extend([[-0.3, 0.3]] * (moments[1] - len(bound_gas)))
-                bounds.append(bound_gas)
-        
-        logging.debug(f"  - Bounds: {bounds}")
-        
-        # Extra debug info before fitting
-        logging.debug(f"STEP: Final check before combined fit")
-        logging.debug(f"  - Templates shape: {stars_gas_templates.shape}")
-        logging.debug(f"  - Component: {component.shape}, first few values: {component[:5]}")
-        logging.debug(f"  - Moments: {moments}")
-        logging.debug(f"  - Start values compatibility: {len(start) == len(moments)}")
-        logging.debug(f"  - Bounds compatibility: {len(bounds) == len(moments)}")
-        
-        # Run complete fit with safety measures
-        logging.debug(f"STEP: Running combined stellar+gas fit")
-        pp = None  # Initialize pp to ensure it exists even if errors occur
-        
-        try:
-            pp = ppxf(stars_gas_templates, spectrum, noise, galaxy_data.velscale, start,
-                    plot=False, moments=moments, degree=config.degree, mdegree=config.mdegree, 
-                    component=component, gas_component=gas_component, gas_names=gas_names,
-                    lam=galaxy_data.lam_gal, lam_temp=sps.lam_temp, 
-                    bounds=bounds, mask=mask, quiet=True)
+            # 不使用两阶段拟合，只使用第一阶段结果
+            logging.debug(f"STEP: Using single-stage fit (two-stage disabled)")
+            pp = pp_stars
+            pp.full_bestfit = bestfit_stars
+            pp.full_gas_bestfit = np.zeros_like(spectrum)
             
-            # Check for negative velocity dispersion
-            if hasattr(pp, 'sol') and len(pp.sol) > 1 and isinstance(pp.sol[1], (int, float)) and pp.sol[1] < 0:
-                logging.warning(f"Negative velocity dispersion detected: {pp.sol[1]:.1f} km/s. Setting to 10 km/s.")
-                pp.sol[1] = 10.0  # Force to a small positive value
-                
-            logging.debug(f"  - Combined fit successful: v={to_scalar(pp.sol[0]):.1f}, σ={to_scalar(pp.sol[1]):.1f}, χ²={to_scalar(pp.chi2):.3f}")
-        except Exception as e:
-            logging.warning(f"Gas+stellar fit failed for pixel ({i},{j}): {str(e)}")
-            
-            if config.fallback_to_simple_fit:
-                logging.debug(f"  - Using fallback to stellar-only fit")
-                # Fallback: just use stellar fit
-                pp = pp_stars
-                
-                # Check if pp has valid solution
-                if not hasattr(pp, 'sol') or pp.sol is None:
-                    logging.warning(f"Fallback fit has no solution for pixel ({i},{j})")
-                    return i, j, None
-                
-                # Add required gas attributes to make later code work
-                pp.gas_bestfit = np.zeros_like(spectrum)
-                if not hasattr(pp, 'gas_flux'):
-                    pp.gas_flux = np.zeros(len(gas_names))
-                
-                # No gas template results
-                pp.gas_bestfit_templates = np.zeros((spectrum.shape[0], len(gas_names)))
-                logging.info(f"Used fallback stellar-only fit for pixel ({i},{j})")
-            else:
-                raise  # Re-raise the exception if we're not using fallback
+            # Add gas attributes manually 
+            pp.gas_bestfit = np.zeros_like(spectrum)
+            pp.gas_flux = np.zeros(len(gas_names)) if gas_names is not None else np.zeros(1)
+            pp.gas_bestfit_templates = np.zeros((spectrum.shape[0], 
+                                               len(gas_names) if gas_names is not None else 1))
         
         # Additional safety check after fitting
-        if pp is None or not hasattr(pp, 'bestfit') or pp.bestfit is None:
+        if pp is None or not hasattr(pp, 'full_bestfit') or pp.full_bestfit is None:
             logging.warning(f"Missing valid fit results for pixel ({i},{j})")
             return i, j, None
             
         # Calculate S/N
         logging.debug(f"STEP: Calculating S/N and residuals")
-        residuals = spectrum - pp.bestfit
+        residuals = spectrum - pp.full_bestfit
         rms = robust_sigma(residuals[mask], zero=1)  # Only use masked region
         signal = np.median(spectrum[mask])
         snr = signal / rms if rms > 0 else 0
         logging.debug(f"  - Signal: {signal:.3f}, RMS: {rms:.3f}, S/N: {snr:.1f}")
         
-        # Extract emission line fluxes and S/N
+        # 提取发射线信息
         logging.debug(f"STEP: Extracting emission line measurements")
         el_results = {}
-        for name in config.gas_names:
-            # Find matching gas names (allowing for prefixes in the template)
-            matches = [idx for idx, gname in enumerate(gas_names) if name in gname]
-            if matches:
-                idx = matches[0]  # Use the first match
-                
-                # Extract the flux
-                dlam = line_wave[idx] * galaxy_data.velscale / config.c
-                
-                # Safety check for gas_flux
-                if hasattr(pp, 'gas_flux') and pp.gas_flux is not None and idx < len(pp.gas_flux):
-                    flux = pp.gas_flux[idx] * dlam
-                else:
-                    flux = 0.0
-                
-                # Calculate A/N
-                an = 0  # Default to 0
-                if (hasattr(pp, 'gas_bestfit_templates') and 
-                    pp.gas_bestfit_templates is not None and 
-                    idx < pp.gas_bestfit_templates.shape[1]):
-                    peak = np.max(pp.gas_bestfit_templates[:, idx])
-                    an = peak / rms if rms > 0 else 0
-                
-                el_results[name] = {'flux': flux, 'an': an}
-                logging.debug(f"  - {name}: flux={flux:.3e}, A/N={an:.1f}")
         
-        # Calculate spectral indices
+        if config.compute_emission_lines:
+            # 检查是否有气体发射线结果
+            has_emission = False
+            if hasattr(pp, 'full_gas_bestfit') and pp.full_gas_bestfit is not None:
+                has_emission = np.any(np.abs(pp.full_gas_bestfit) > 1e-10)
+                
+            if has_emission:
+                logging.debug(f"  - Gas emission detected")
+                
+                for name in config.gas_names:
+                    # Find matching gas names (allowing for prefixes in the template)
+                    matches = [idx for idx, gname in enumerate(gas_names) if name in gname]
+                    if matches:
+                        idx = matches[0]  # Use the first match
+                        
+                        # Extract the flux
+                        dlam = line_wave[idx] * galaxy_data.velscale / config.c
+                        
+                        # Safety check for gas_flux
+                        if hasattr(pp, 'gas_flux') and pp.gas_flux is not None and idx < len(pp.gas_flux):
+                            flux = pp.gas_flux[idx] * dlam
+                        else:
+                            flux = 0.0
+                        
+                        # Calculate A/N
+                        an = 0  # Default to 0
+                        if (hasattr(pp, 'gas_bestfit_templates') and 
+                            pp.gas_bestfit_templates is not None and 
+                            idx < pp.gas_bestfit_templates.shape[1]):
+                            
+                            # 注意：gas_bestfit_templates可能只在子集波长范围内
+                            peak = np.max(pp.gas_bestfit_templates[:, idx])
+                            an = peak / rms if rms > 0 else 0
+                        
+                        el_results[name] = {'flux': flux, 'an': an}
+                        logging.debug(f"  - {name}: flux={flux:.3e}, A/N={an:.1f}")
+            else:
+                logging.debug(f"  - No significant gas emission detected")
+                
+                # 填充空结果
+                for name in config.gas_names:
+                    el_results[name] = {'flux': 0.0, 'an': 0.0}
+        
+        # 保存最优模板 - 与原始代码一致
+        optimal_template = optimal_stellar_template
+        
+        # 计算光谱指数
         logging.debug(f"STEP: Calculating spectral indices")
         indices = {}
         if config.compute_spectral_indices:
-            # Process spectrum to remove emission lines if available
-            if hasattr(pp, 'gas_bestfit') and pp.gas_bestfit is not None:
-                clean_spectrum = spectrum - pp.gas_bestfit
+            # 从最终拟合光谱中移除发射线来计算指数
+            if hasattr(pp, 'full_gas_bestfit') and pp.full_gas_bestfit is not None:
+                clean_spectrum = spectrum - pp.full_gas_bestfit
             else:
                 clean_spectrum = spectrum
             
             try:
-                # Extract template flux and ensure it's 1D
-                template_flux = best_template.flatten()
-                
-                # Create index calculator using the original approach
-                # Important: Don't resample the entire template - let the calculator handle it per window
+                # 创建指数计算器
                 calculator = LineIndexCalculator(
-                    galaxy_data.lam_gal, clean_spectrum,
-                    sps.lam_temp, template_flux,
+                    lam_gal, clean_spectrum,
+                    sps.lam_temp, Temp_Calu,
+                    em_wave=galaxy_data.lam_gal,
+                    em_flux_list=pp.full_gas_bestfit if hasattr(pp, 'full_gas_bestfit') else None,
                     velocity_correction=to_scalar(pp.sol[0]),
-                    good_wavelength_range=config.good_wavelength_range if config.use_template_for_indices else None)
+                    continuum_mode=config.continuum_mode)
                 
-                # Calculate requested indices
+                # 计算请求的光谱指数
                 for index_name in config.line_indices:
                     try:
                         indices[index_name] = calculator.calculate_index(index_name)
@@ -1489,22 +1738,26 @@ def fit_single_pixel(args):
                 for index_name in config.line_indices:
                     indices[index_name] = np.nan
         
-        # Generate plot if requested - BEFORE compiling results to catch any errors
+        # 生成诊断图
         if config.make_plots and (i * j) % config.plot_every_n == 0:
             try:
                 logging.debug(f"STEP: Generating diagnostic plot")
+                # 保存第一阶段和第二阶段的结果
+                pp.stage1_bestfit = bestfit_stars
+                pp.optimal_stellar_template = optimal_stellar_template
+                pp.full_bestfit = pp.full_bestfit
+                pp.full_gas_bestfit = pp.full_gas_bestfit
                 plot_pixel_fit(i, j, pp, galaxy_data, config)
                 logging.debug(f"  - Plot saved successfully")
             except Exception as e:
                 logging.warning(f"Failed to create plot for pixel ({i},{j}): {str(e)}")
                 import traceback
                 logging.debug(traceback.format_exc())
-                # Continue with result processing - don't let plot failure affect results
         
-        # Compose results - ensure all values are properly handled
+        # 汇总结果
         logging.debug(f"STEP: Compiling final results")
         
-        # Safely access pp attributes using to_scalar for numerical values
+        # 安全访问pp属性
         sol_0 = 0.0
         sol_1 = 0.0
         if hasattr(pp, 'sol') and pp.sol is not None:
@@ -1513,10 +1766,9 @@ def fit_single_pixel(args):
             if len(pp.sol) > 1:
                 sol_1 = to_scalar(pp.sol[1])
         
-        # Ensure we have all required arrays
-        bestfit = pp.bestfit if hasattr(pp, 'bestfit') and pp.bestfit is not None else np.zeros_like(spectrum)
-        gas_bestfit = pp.gas_bestfit if hasattr(pp, 'gas_bestfit') and pp.gas_bestfit is not None else np.zeros_like(spectrum)
-        opt_template = best_template.flatten() if best_template is not None else np.zeros_like(spectrum)
+        # 确保所有需要的数组都存在
+        bestfit = pp.full_bestfit if hasattr(pp, 'full_bestfit') else pp.bestfit
+        gas_bestfit = pp.full_gas_bestfit if hasattr(pp, 'full_gas_bestfit') else np.zeros_like(spectrum)
         
         results = {
             'success': True,
@@ -1525,12 +1777,13 @@ def fit_single_pixel(args):
             'bestfit': bestfit,
             'weights': pp.weights if hasattr(pp, 'weights') and pp.weights is not None else np.zeros(1),
             'gas_bestfit': gas_bestfit,
-            'optimal_template': opt_template,
+            'optimal_template': optimal_template,
+            'apoly': apoly,  # 保存apoly
             'rms': rms,
             'snr': snr,
             'el_results': el_results,
             'indices': indices,
-            'apoly': pp.apoly if hasattr(pp, 'apoly') and pp.apoly is not None else None,
+            'stage1_bestfit': bestfit_stars,  # 保存第一阶段结果
             'pp_obj': pp
         }
         
@@ -1713,196 +1966,180 @@ def process_results(galaxy_data, results, config):
 
 def plot_pixel_fit(i, j, pp, galaxy_data, config):
     """
-    Create diagnostic plot for a single pixel fit.
+    创建像素拟合的诊断图，显示两阶段拟合结果。
     
     Parameters
     ----------
     i, j : int
-        Pixel coordinates
+        像素坐标
     pp : ppxf object
-        pPXF fit result
+        pPXF拟合结果
     galaxy_data : IFUDataCube
-        Object containing the galaxy data
+        包含星系数据的对象
     config : P2PConfig
-        Configuration object
+        配置对象
     """
     try:
         logging.debug(f"===== PLOT GENERATION DEBUG FOR PIXEL ({i},{j}) =====")
         
-        # Create plot directory if it doesn't exist
+        # 创建绘图目录
         plot_dir = config.plot_dir / 'P2P_res'
         os.makedirs(plot_dir, exist_ok=True)
         
-        # Get data
+        # 获取数据
         k_index = i * galaxy_data.cube.shape[2] + j
         lam_gal = galaxy_data.lam_gal
         spectrum = galaxy_data.spectra[:, k_index]
         
-        # Check data shapes
+        # 检查数据形状
         logging.debug(f"STEP: Checking data shapes for plotting")
         logging.debug(f"  - lam_gal shape: {lam_gal.shape}")
         logging.debug(f"  - spectrum shape: {spectrum.shape}")
-        logging.debug(f"  - pp.bestfit shape: {pp.bestfit.shape if hasattr(pp, 'bestfit') else 'Not available'}")
         
-        if hasattr(pp, 'gas_bestfit'):
-            logging.debug(f"  - pp.gas_bestfit shape: {pp.gas_bestfit.shape}")
+        # 获取拟合结果
+        bestfit = pp.full_bestfit if hasattr(pp, 'full_bestfit') else pp.bestfit
+        stage1_bestfit = pp.stage1_bestfit if hasattr(pp, 'stage1_bestfit') else bestfit
         
-        if hasattr(pp, 'gas_bestfit_templates'):
-            logging.debug(f"  - pp.gas_bestfit_templates shape: {pp.gas_bestfit_templates.shape}")
+        # 获取气体发射线组分
+        gas_bestfit = pp.full_gas_bestfit if hasattr(pp, 'full_gas_bestfit') else np.zeros_like(spectrum)
         
-        # Define spectral index windows for visualization
-        index_windows = {
-            'Hbeta': {'blue': (4827.875, 4847.875), 'line': (4847.875, 4876.625), 'red': (4876.625, 4891.625)},
-            'Fe5015': {'blue': (4946.500, 4977.750), 'line': (4977.750, 5054.000), 'red': (5054.000, 5065.250)},
-            'Mgb': {'blue': (5142.625, 5161.375), 'line': (5160.125, 5192.625), 'red': (5191.375, 5206.375)}
+        # 设置限制在感兴趣区域的X轴范围
+        min_wave = 4800
+        max_wave = 5250
+        
+        # 创建三面板图
+        fig = plt.figure(figsize=(15, 10))
+        
+        # 使用GridSpec创建三个面板
+        gs = gridspec.GridSpec(3, 1, height_ratios=[1, 1, 1], hspace=0.3)
+        
+        # 第一个面板：原始数据和第一阶段拟合
+        ax1 = plt.subplot(gs[0])
+        # 第二个面板：最终拟合结果
+        ax2 = plt.subplot(gs[1])
+        # 第三个面板：发射线和残差
+        ax3 = plt.subplot(gs[2])
+        
+        # 第一个面板：原始数据和第一阶段拟合
+        ax1.plot(lam_gal, spectrum, c='k', lw=1, alpha=.8, 
+                label=f"{config.galaxy_name} pixel:[{i},{j}] - Original")
+        ax1.plot(lam_gal, stage1_bestfit, '-', c='r', alpha=.8, 
+                label='Stage 1: Stellar fit only')
+        
+        # 第二个面板：最终拟合结果
+        ax2.plot(lam_gal, spectrum, c='k', lw=1, alpha=.8, 
+                label='Original spectrum')
+        ax2.plot(lam_gal, bestfit, '-', c='r', alpha=.8, 
+                label='Stage 2: Full fit')
+        
+        # 绘制恒星成分（总拟合减去气体）
+        stellar_comp = bestfit - gas_bestfit
+        ax2.plot(lam_gal, stellar_comp, '-', c='g', alpha=.7, lw=0.7, 
+                label='Stellar component')
+        
+        # 第三个面板：只显示发射线和残差
+        # 计算残差
+        residuals = spectrum - bestfit
+        
+        # 绘制零线
+        ax3.axhline(0, color='k', lw=0.7, alpha=.5)
+        
+        # 绘制残差
+        ax3.plot(lam_gal, residuals, 'g-', lw=0.8, alpha=.7, 
+                label='Residuals (data - full fit)')
+        
+        # 绘制发射线
+        if np.any(gas_bestfit != 0):
+            ax3.plot(lam_gal, gas_bestfit, 'r-', lw=1.2, alpha=0.8,
+                  label='Gas component')
+        
+        # 定义并绘制感兴趣的光谱区域
+        spectral_regions = {
+            'Hbeta': (4847.875, 4876.625),
+            'Fe5015': (4977.750, 5054.000),
+            'Mgb': (5160.125, 5192.625),
+            '[OIII]': (4997, 5017)
         }
         
-        # Create figure with 3 panels - regular subplot layout for better compatibility
-        fig = plt.figure(figsize=(16, 12), dpi=config.dpi)
+        # 在所有面板上标记光谱区域
+        for name, (start, end) in spectral_regions.items():
+            color = 'orange' if 'OIII' in name else 'lightgray'
+            alpha = 0.3 if 'OIII' in name else 0.2
+            for ax in [ax1, ax2, ax3]:
+                ax.axvspan(start, end, alpha=alpha, color=color)
+                # 在底部添加标签
+                if ax == ax3:
+                    y_pos = ax3.get_ylim()[0] + 0.1 * (ax3.get_ylim()[1] - ax3.get_ylim()[0])
+                    ax.text((start + end)/2, y_pos, name, ha='center', va='bottom',
+                          bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
         
-        # Top panel: Original data and fit
-        ax1 = fig.add_subplot(3, 1, 1)
-        
-        # Middle panel: Residuals
-        ax2 = fig.add_subplot(3, 1, 2)
-        
-        # Bottom panel: Emission components
-        ax3 = fig.add_subplot(3, 1, 3)
-        
-        # Mark good wavelength range if provided
-        if hasattr(config, 'good_wavelength_range'):
-            good_min, good_max = config.good_wavelength_range
-            ax1.axvspan(good_min, good_max, color='lightgreen', alpha=0.1, label='Good Wavelength Range')
-            ax2.axvspan(good_min, good_max, color='lightgreen', alpha=0.1)
-            ax3.axvspan(good_min, good_max, color='lightgreen', alpha=0.1)
-        
-        # Ensure pp.bestfit exists - use spectrum if not
-        bestfit = pp.bestfit if hasattr(pp, 'bestfit') and pp.bestfit is not None else spectrum
-        
-        # Plot original spectrum and best fit
-        ax1.plot(lam_gal, spectrum, c='tab:blue', lw=1, alpha=.9, 
-                label=f"{config.galaxy_name}\npixel:[{i},{j}]")
-        ax1.plot(lam_gal, bestfit, '--', c='tab:red', alpha=.9)
-        
-        # Highlight spectral feature regions
-        for index_name in ['Hbeta', 'Fe5015', 'Mgb']:
-            if index_name in index_windows:
-                windows = index_windows[index_name]
-                
-                # Line region (central bandpass)
-                line_start, line_end = windows['line']
-                ax1.axvspan(line_start, line_end, color='tab:gray', alpha=.5, zorder=0)
-                ax2.axvspan(line_start, line_end, color='tab:gray', alpha=.5, zorder=0)
-                ax3.axvspan(line_start, line_end, color='tab:gray', alpha=.5, zorder=0)
-                
-                # Blue continuum region
-                blue_start, blue_end = windows['blue']
-                ax1.axvspan(blue_start, blue_end, color='tab:gray', alpha=.3, zorder=0)
-                ax2.axvspan(blue_start, blue_end, color='tab:gray', alpha=.3, zorder=0)
-                ax3.axvspan(blue_start, blue_end, color='tab:gray', alpha=.3, zorder=0)
-                
-                # Red continuum region
-                red_start, red_end = windows['red']
-                ax1.axvspan(red_start, red_end, color='tab:gray', alpha=.3, zorder=0)
-                ax2.axvspan(red_start, red_end, color='tab:gray', alpha=.3, zorder=0)
-                ax3.axvspan(red_start, red_end, color='tab:gray', alpha=.3, zorder=0)
-        
-        # Plot emission line components if available
-        if hasattr(pp, 'gas_bestfit_templates') and pp.gas_bestfit_templates is not None:
-            if pp.gas_bestfit_templates.shape[1] > 0:
-                ax1.plot(lam_gal, pp.gas_bestfit_templates[:, 0], color='tab:orange', zorder=1, alpha=.9)
-            
-            if pp.gas_bestfit_templates.shape[1] > 1:
-                ax1.plot(lam_gal, pp.gas_bestfit_templates[:, 1], color='tab:purple', zorder=1, alpha=.9)
-        
-        ax1.plot(lam_gal, bestfit, '-', lw=.7, c='tab:red')
-        
-        # Set up the residuals plot
-        ax2.plot(lam_gal, np.zeros(lam_gal.shape), '-', color='k', lw=.7, alpha=.9, zorder=0)
-        
-        # Calculate median and std of residuals
-        residuals = spectrum - bestfit
-        median_residual = np.median(residuals)
-        std_residual = np.std(residuals)
-        
-        ax2.plot(lam_gal, [median_residual] * lam_gal.shape[0], '--', 
-                color='tab:blue', lw=1, alpha=.9, zorder=1)
-        
-        # Plot residual range
-        upper_bound = median_residual + std_residual
-        lower_bound = median_residual - std_residual
-        ax2.fill_between([min(lam_gal), max(lam_gal)], [upper_bound, upper_bound], 
-                        [lower_bound, lower_bound], color='tab:gray', alpha=.2,
-                        label=f'Range: {median_residual:.3f}±{std_residual:.3f}', zorder=1)
-        
-        # Plot residuals
-        ax2.plot(lam_gal, residuals, '+', ms=2, mew=3, color='tab:green', alpha=.9, zorder=2)
-        
-        # Bottom panel: Raw residuals and emission components
-        gas_bestfit = pp.gas_bestfit if hasattr(pp, 'gas_bestfit') and pp.gas_bestfit is not None else np.zeros_like(spectrum)
-        stellar_bestfit = bestfit - gas_bestfit
-        ax3.plot(lam_gal, spectrum - stellar_bestfit, '+', ms=2, mew=3, 
-                color='tab:green', alpha=.9, zorder=2)
-        
-        # Plot emission components if available
-        if hasattr(pp, 'gas_bestfit_templates') and pp.gas_bestfit_templates is not None:
-            if pp.gas_bestfit_templates.shape[1] > 0:
-                ax3.plot(lam_gal, pp.gas_bestfit_templates[:, 0], 
-                      color='tab:orange', zorder=2, alpha=.9)
-            
-            if pp.gas_bestfit_templates.shape[1] > 1:
-                ax3.plot(lam_gal, pp.gas_bestfit_templates[:, 1], 
-                      color='tab:purple', zorder=2, alpha=.9)
-            
-            # Plot combined emission
-            if hasattr(pp, 'gas_bestfit') and pp.gas_bestfit is not None:
-                ax3.plot(lam_gal, pp.gas_bestfit, lw=.7, color='tab:red', zorder=2, alpha=.9)
-        
-        # Set up axis formatting
+        # 设置所有面板的属性
         for ax in [ax1, ax2, ax3]:
+            ax.set_xlim(min_wave, max_wave)
             ax.xaxis.set_minor_locator(AutoMinorLocator(5))
             ax.yaxis.set_minor_locator(AutoMinorLocator(5))
             ax.tick_params(axis='both', which='both', labelsize='x-small', 
                         right=True, top=True, direction='in')
-            ax.set_xlim(min(lam_gal), max(lam_gal))
             ax.grid(True, alpha=0.3)
+            ax.legend(loc='upper right', fontsize='small')
         
-        # Set y-axis limits
-        ax1.set_ylim(0, max(spectrum) * 1.1)
-        ax2.set_ylim(min(residuals) * 1.2, max(residuals) * 1.2)
+        # 设置Y轴范围
+        y_min = np.min(spectrum) * 0.9
+        y_max = np.max(spectrum) * 1.1
+        ax1.set_ylim(y_min, y_max)
+        ax2.set_ylim(y_min, y_max)
         
-        emission_residuals = spectrum - stellar_bestfit
-        ax3.set_ylim(min(emission_residuals) * 1.2, max(emission_residuals) * 1.2)
+        # 为第三个面板设置不同的Y轴范围 - 重点显示发射线和残差
+        if np.any(gas_bestfit != 0):
+            # 如果有发射线，用发射线的scale
+            gas_max = np.max(np.abs(gas_bestfit)) * 3
+            res_max = max(np.max(np.abs(residuals)), gas_max)
+        else:
+            # 否则用残差的scale
+            res_max = np.max(np.abs(residuals)) * 3
         
-        # Set labels
-        ax3.set_xlabel(r'Wavelength [$\AA$]', size=11)
+        ax3.set_ylim(-res_max, res_max)
+        
+        # 设置标签
+        ax3.set_xlabel(r'Rest-frame Wavelength [$\AA$]', size=11)
         ax1.set_ylabel('Flux', size=11)
-        ax2.set_ylabel('Residuals', size=11)
-        ax3.set_ylabel('Emission Components', size=11)
+        ax2.set_ylabel('Flux', size=11)
+        ax3.set_ylabel('Emission & Residuals', size=11)
         
-        # Add legends
-        ax1.legend()
-        ax2.legend()
-        
-        # Check formatting parameters and convert to scalar
-        logging.debug(f"STEP: Checking formatting parameters")
-        
-        # Use to_scalar helper function for safe conversion
+        # 添加标题信息
         velocity = to_scalar(pp.sol[0]) if hasattr(pp, 'sol') and pp.sol is not None and len(pp.sol) > 0 else 0.0
         sigma = to_scalar(pp.sol[1]) if hasattr(pp, 'sol') and pp.sol is not None and len(pp.sol) > 1 else 0.0
         chi2 = to_scalar(pp.chi2) if hasattr(pp, 'chi2') and pp.chi2 is not None else 0.0
         
-        logging.debug(f"  - After conversion: velocity={velocity}, sigma={sigma}, chi2={chi2}")
+        # 添加光谱指数信息
+        indices_text = ""
+        for name in ['Hbeta', 'Fe5015', 'Mgb']:
+            if hasattr(pp, 'indices') and pp.indices is not None and name in pp.indices:
+                index_value = pp.indices[name]
+                if not np.isnan(index_value):
+                    indices_text += f"{name}: {index_value:.4f} Å, "
         
-        # Add title with kinematic info using safe scalar values
-        ax1.set_title(f"Velocity: {velocity:.1f} km/s, σ: {sigma:.1f} km/s, χ²: {chi2:.3f}")
+        if indices_text:
+            indices_text = indices_text[:-2]  # 移除最后的逗号和空格
         
-        # Add more space between subplots and adjust layout
-        plt.subplots_adjust(hspace=0.3)
+        # 添加标题
+        fig.suptitle(f"Pixel ({i}, {j}) - Two-stage Spectral Fit\nv={velocity:.1f} km/s, σ={sigma:.1f} km/s, χ²={chi2:.3f}", 
+                    fontsize=14)
         
-        # Save the plot
+        if indices_text:
+            ax1.set_title(indices_text)
+        
+        # 调整布局
+        plt.tight_layout(rect=[0, 0, 1, 0.95])  # 为主标题留出空间
+        
+        # 保存图像
         plot_path = plot_dir / f"{config.galaxy_name}_pixel_{i}_{j}.pdf"
         plt.savefig(plot_path, format='pdf', bbox_inches='tight')
+        
+        # 也保存为PNG格式，更容易查看
+        plot_path_png = plot_dir / f"{config.galaxy_name}_pixel_{i}_{j}.png"
+        plt.savefig(plot_path_png, format='png', dpi=150, bbox_inches='tight')
+        
         plt.close(fig)
         
         logging.debug(f"Plot saved to {plot_path}")
@@ -2147,7 +2384,8 @@ def optimize_ppxf_params(config, problem_type=None):
         logging.info("Applying optimizations for gas fitting errors")
         config.fwhm_gas = 2.0  # Use wider lines for better stability
         config.fallback_to_simple_fit = True  # Fall back to stellar-only fit if gas fit fails
-    
+        config.use_two_stage_fit = True  # Enable two-stage fitting
+        
     elif problem_type == "format_error":
         # Fix for format string errors
         logging.info("Applying optimizations for formatting errors")
@@ -2183,6 +2421,10 @@ def test_single_pixel(config=None, i=0, j=0, debug_level=logging.DEBUG):
     original_level = logging.getLogger().level
     logging.getLogger().setLevel(debug_level)
     
+    # Store global results for plotting
+    global results
+    results = {}
+    
     try:
         # Set up configuration
         if config is None:
@@ -2216,6 +2458,8 @@ def test_single_pixel(config=None, i=0, j=0, debug_level=logging.DEBUG):
         sps, gas_templates, gas_names, line_wave = prepare_templates(config, galaxy_data.velscale)
         logging.info(f"Stellar templates shape: {sps.templates.shape}")
         logging.info(f"Gas templates shape: {gas_templates.shape}")
+        print("Emission lines included in gas templates:")
+        print(gas_names)
         
         # 3. Fit single pixel
         logging.info(f"Starting fit for pixel ({i},{j})...")
@@ -2242,14 +2486,16 @@ def test_single_pixel(config=None, i=0, j=0, debug_level=logging.DEBUG):
                 logging.info("Spectral indices results:")
                 for name, value in result['indices'].items():
                     # Check if index window is outside good wavelength range
-                    windows = LineIndexCalculator.define_line_windows(name)
+                    calc = LineIndexCalculator(None, None, None, None)
+                    windows = calc.define_line_windows(name)
                     if windows:
                         line_min = windows['blue'][0]
                         line_max = windows['red'][1]
                         outside_range = ""
-                        if (line_min < config.good_wavelength_range[0] or 
+                        if hasattr(config, 'good_wavelength_range') and (
+                            line_min < config.good_wavelength_range[0] or 
                             line_max > config.good_wavelength_range[1]):
-                            outside_range = " (partially outside good wavelength range - using template substitution)"
+                            outside_range = " (partially outside good wavelength range)"
                         logging.info(f"  - {name}: {value:.4f}{outside_range}")
                     else:
                         logging.info(f"  - {name}: {value:.4f}")
@@ -2259,6 +2505,38 @@ def test_single_pixel(config=None, i=0, j=0, debug_level=logging.DEBUG):
                 logging.info("Emission line results:")
                 for name, data in result['el_results'].items():
                     logging.info(f"  - {name}: flux={data['flux']:.4e}, S/N={data['an']:.2f}")
+            
+            # 创建光谱指数计算器用于测试和可视化
+            try:
+                logging.info("Testing spectral index calculator...")
+                k_index = i * galaxy_data.cube.shape[2] + j
+                spectrum = galaxy_data.spectra[:, k_index]
+                
+                # 处理发射线
+                clean_spectrum = spectrum
+                if hasattr(pp, 'full_gas_bestfit') and pp.full_gas_bestfit is not None:
+                    clean_spectrum = spectrum - pp.full_gas_bestfit
+                
+                # 获取最优模板
+                optimal_template = result['optimal_template']
+                
+                # 创建计算器
+                calculator = LineIndexCalculator(
+                    galaxy_data.lam_gal, clean_spectrum,
+                    sps.lam_temp, optimal_template,
+                    em_wave=galaxy_data.lam_gal,
+                    em_flux_list=pp.full_gas_bestfit if hasattr(pp, 'full_gas_bestfit') else None,
+                    velocity_correction=result['velocity'],
+                    continuum_mode=config.continuum_mode)
+                
+                # 测试绘图
+                calculator.plot_all_lines(mode='P2P', number=i*10000+j, 
+                                          save_path=str(config.plot_dir), 
+                                          show_index=True)
+                logging.info("Spectral index visualization complete.")
+            except Exception as e:
+                logging.error(f"Error testing spectral index calculator: {str(e)}")
+                logging.exception("Stack trace:")
             
             return result
         else:
@@ -2289,92 +2567,6 @@ def test_single_pixel(config=None, i=0, j=0, debug_level=logging.DEBUG):
     finally:
         # Restore original logging level
         logging.getLogger().setLevel(original_level)
-
-
-def debug_line_index_calculator(wave, flux, fit_wave, fit_flux, line_name="Hbeta", velocity=0, 
-                             good_wavelength_range=None):
-    """
-    Debug LineIndexCalculator functionality independently.
-    
-    Parameters
-    ----------
-    wave : array-like
-        Original spectrum wavelength array
-    flux : array-like
-        Original spectrum flux array
-    fit_wave : array-like
-        Fitted spectrum wavelength array
-    fit_flux : array-like
-        Fitted spectrum flux array
-    line_name : str
-        Absorption line name to calculate
-    velocity : float
-        Velocity correction in km/s
-    good_wavelength_range : list, optional
-        Good wavelength range [min, max] for template substitution
-        
-    Returns
-    -------
-    float
-        Absorption line index value
-    """
-    logging.info(f"=== TESTING LINE INDEX CALCULATOR FOR {line_name} ===")
-    logging.info(f"Input shapes - wave: {wave.shape}, flux: {flux.shape}")
-    logging.info(f"Template shapes - fit_wave: {fit_wave.shape}, fit_flux: {fit_flux.shape}")
-    
-    try:
-        # Check input arrays
-        if len(wave) != len(flux):
-            logging.error(f"Wavelength and flux length mismatch: wave={len(wave)}, flux={len(flux)}")
-            # Try to fix
-            min_len = min(len(wave), len(flux))
-            wave = wave[:min_len]
-            flux = flux[:min_len]
-            logging.info(f"Truncated to common length: {min_len}")
-        
-        if len(fit_wave) != len(fit_flux):
-            logging.error(f"Template wavelength and flux length mismatch: fit_wave={len(fit_wave)}, fit_flux={len(fit_flux)}")
-            # Try to fix
-            min_len = min(len(fit_wave), len(fit_flux))
-            fit_wave = fit_wave[:min_len]
-            fit_flux = fit_flux[:min_len]
-            logging.info(f"Truncated to common length: {min_len}")
-        
-        # Create calculator
-        calculator = LineIndexCalculator(
-            wave, flux, fit_wave, fit_flux, 
-            velocity_correction=velocity,
-            good_wavelength_range=good_wavelength_range
-        )
-        
-        # Get index windows
-        windows = calculator.define_line_windows(line_name)
-        
-        # Check if index is outside good wavelength range
-        if good_wavelength_range is not None:
-            line_min = windows['blue'][0]
-            line_max = windows['red'][1]
-            if line_min < good_wavelength_range[0] or line_max > good_wavelength_range[1]:
-                logging.info(f"Index {line_name} ({line_min:.2f}-{line_max:.2f}) partially outside good wavelength range "
-                           f"({good_wavelength_range[0]:.2f}-{good_wavelength_range[1]:.2f})")
-                logging.info(f"Template substitution will be used for sections outside good wavelength range")
-        
-        # Calculate index
-        index = calculator.calculate_index(line_name)
-        logging.info(f"Successfully calculated {line_name} index: {index:.6f}")
-        
-        # Visualize result
-        output_path = f"debug_{line_name}_index.png"
-        calculator.plot_line_fit(line_name, output_path)
-        logging.info(f"Diagnostic plot saved to {output_path}")
-        
-        return index
-        
-    except Exception as e:
-        logging.error(f"Error calculating {line_name} index: {str(e)}")
-        import traceback
-        logging.error(traceback.format_exc())
-        return None
 
 
 ### ------------------------------------------------- ###
@@ -2440,8 +2632,9 @@ def run_p2p_analysis(config=None, problem_fixes=None):
         
         # Check spectral index windows against good wavelength range
         if config.compute_spectral_indices and hasattr(config, 'good_wavelength_range'):
+            calc = LineIndexCalculator(None, None, None, None)
             for index_name in config.line_indices:
-                windows = LineIndexCalculator.define_line_windows(index_name)
+                windows = calc.define_line_windows(index_name)
                 if windows:
                     line_min = windows['blue'][0]  # Blue start
                     line_max = windows['red'][1]   # Red end
@@ -2450,8 +2643,8 @@ def run_p2p_analysis(config=None, problem_fixes=None):
                         logging.warning(f"Index {index_name} wavelength range ({line_min:.2f}-{line_max:.2f}) "
                                        f"partially outside good wavelength range "
                                        f"({config.good_wavelength_range[0]:.2f}-{config.good_wavelength_range[1]:.2f})")
-                        if config.use_template_for_indices:
-                            logging.info(f"Template substitution will be used for spectral index {index_name}")
+                        if config.continuum_mode == 'auto':
+                            logging.info(f"Using automatic continuum mode for spectral index {index_name}")
         
         # Prepare templates
         logging.info("Preparing stellar and gas templates...")
@@ -2513,8 +2706,21 @@ if __name__ == "__main__":
                       help="Column index of pixel to test")
     parser.add_argument("--debug", action="store_true",
                       help="Enable debug logging")
-    parser.add_argument("--no-template-substitution", action="store_true",
-                      help="Disable template substitution for spectral indices")
+    
+    # Add continuum mode selection
+    parser.add_argument("--continuum-mode", type=str, 
+                      choices=["auto", "fit", "original"],
+                      default="auto",
+                      help="Continuum calculation mode for spectral indices")
+    
+    # Add two-stage fitting option
+    parser.add_argument("--two-stage", action="store_true",
+                        default="--two-stage",
+                      help="Use two-stage fitting strategy (stellar first, then gas)")
+    
+    # Add global search option
+    parser.add_argument("--global-search", action="store_true",
+                      help="Use global search in second stage fitting")
     
     args = parser.parse_args()
     
@@ -2537,9 +2743,17 @@ if __name__ == "__main__":
         if args.fix:
             config = optimize_ppxf_params(config, args.fix)
         
-        # Handle template substitution flag
-        if args.no_template_substitution:
-            config.use_template_for_indices = False
+        # Set continuum mode
+        config.continuum_mode = args.continuum_mode
+        print(f"Using continuum mode: {config.continuum_mode}")
+        
+        # Set two-stage fitting mode
+        config.use_two_stage_fit = args.two_stage
+        print(f"Two-stage fitting: {'Enabled' if config.use_two_stage_fit else 'Disabled'}")
+        
+        # Set global search option
+        config.global_search = args.global_search
+        print(f"Global search: {'Enabled' if config.global_search else 'Disabled'}")
             
         # Run single pixel test
         result = test_single_pixel(config, args.pixel_i, args.pixel_j, 
@@ -2550,16 +2764,23 @@ if __name__ == "__main__":
         else:
             print(f"Single pixel test failed, check log file")
     else:
-        # Handle template substitution flag
-        if args.no_template_substitution and args.config:
+        # Handle configuration
+        if args.config:
             config = P2PConfig.load(args.config)
-            config.use_template_for_indices = False
-            run_p2p_analysis(config, args.fix)
-        elif args.no_template_substitution:
-            config = P2PConfig()
-            config.use_template_for_indices = False
-            run_p2p_analysis(config, args.fix)
-        elif args.config:
-            run_p2p_analysis(args.config, args.fix)
         else:
-            run_p2p_analysis(problem_fixes=args.fix)
+            config = P2PConfig()
+        
+        # Set continuum mode
+        config.continuum_mode = args.continuum_mode
+        print(f"Using continuum mode: {config.continuum_mode}")
+        
+        # Set two-stage fitting mode
+        config.use_two_stage_fit = args.two_stage
+        print(f"Two-stage fitting: {'Enabled' if config.use_two_stage_fit else 'Disabled'}")
+        
+        # Set global search option
+        config.global_search = args.global_search
+        print(f"Global search: {'Enabled' if config.global_search else 'Disabled'}")
+        
+        # Run analysis
+        run_p2p_analysis(config, args.fix)
