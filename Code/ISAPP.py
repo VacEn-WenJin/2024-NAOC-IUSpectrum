@@ -12,7 +12,7 @@ Features:
 - Customizable visualization
 - Single pixel testing capability
 
-Version 3.9.6    2025Mar09    Corrected stellar template calculation to match original code
+Version 3.9.7    2025Mar10    Corrected stellar template calculation to match original code
 """
 
 ### ------------------------------------------------- ###
@@ -140,7 +140,7 @@ class P2PConfig:
         
         # Visualization settings
         self.make_plots = True
-        self.plot_every_n = 500  # Only plot every n pixels
+        self.plot_every_n = 1  # Only plot every n pixels
         self.save_plots = True
         self.dpi = 150
         
@@ -306,6 +306,20 @@ def make_bins(wavs):
     
     return edges, widths
 
+def Apply_velocity_correction(wave, z):
+        """
+        应用速度修正到波长
+        
+        Parameters:
+        -----------
+        wave : array-like
+            原始波长数组
+            
+        Returns:
+        --------
+        array-like : 修正后的波长数组
+        """
+        return wave / (1 + (z))
 
 def spectres(new_wavs, spec_wavs, spec_fluxes, spec_errs=None, fill=None):
     """
@@ -811,7 +825,7 @@ class LineIndexCalculator:
             mode_title = f"{mode}{number}"
         else:
             mode_title = None
-
+        
         # 获取所有定义的谱线
         all_windows = {
             'Hbeta': self.define_line_windows('Hbeta'),
@@ -1171,7 +1185,14 @@ class IFUDataCube:
         velscale = np.min(config.c * np.diff(np.log(wave)))  # Preserve smallest velocity step
         lam_range_temp = [np.min(wave), np.max(wave)]
         spectra, ln_lam_gal, velscale = util.log_rebin(lam_range_temp, spectra, velscale=velscale)
-        
+        # logging.info(f"=== TS{ln_lam_gal} ===")
+        spectra = spectra[ np.where((np.exp(ln_lam_gal) > Apply_velocity_correction(config.good_wavelength_range[0],config.redshift))
+                                    & (np.exp(ln_lam_gal) < Apply_velocity_correction(config.good_wavelength_range[1],config.redshift))) ]
+        # variance = variance[ np.where((np.exp(ln_lam_gal) > config.good_wavelength_range[0])
+        #                             & (np.exp(ln_lam_gal) < config.good_wavelength_range[1])) ]
+        ln_lam_gal = ln_lam_gal[ np.where((np.exp(ln_lam_gal) > Apply_velocity_correction(config.good_wavelength_range[0],config.redshift))
+                                    & (np.exp(ln_lam_gal) < Apply_velocity_correction(config.good_wavelength_range[1],config.redshift))) ]
+        # logging.info(f"=== TS{spectra.shape} ===")
         # Store all the processed data
         self.spectra = spectra
         self.variance = variance
@@ -1190,7 +1211,8 @@ class IFUDataCube:
         self.velfield = np.full(self.cube.shape[1:3], np.nan)
         self.sigfield = np.full(self.cube.shape[1:3], np.nan)
         self.bestfit_field = np.full((spectra.shape[0], self.cube.shape[1], self.cube.shape[2]), np.nan)
-        self.optimal_templates = np.full((spectra.shape[0], self.cube.shape[1], self.cube.shape[2]), np.nan)
+        # self.optimal_templates = np.full((spectra.shape[0], self.cube.shape[1], self.cube.shape[2]), np.nan)
+        self.optimal_templates = np.full((93974, self.cube.shape[1], self.cube.shape[2]), np.nan)
         
         # Index maps
         self.index_maps = {}
@@ -1384,20 +1406,6 @@ def prepare_templates(config, velscale):
     
     return sps, gas_templates, gas_names, line_wave
 
-def Apply_velocity_correction(wave, z):
-        """
-        应用速度修正到波长
-        
-        Parameters:
-        -----------
-        wave : array-like
-            原始波长数组
-            
-        Returns:
-        --------
-        array-like : 修正后的波长数组
-        """
-        return wave / (1 + (z))
 
 def fit_single_pixel(args):
     """
@@ -1702,7 +1710,6 @@ def fit_single_pixel(args):
         
         # 保存最优模板 - 与原始代码一致
         optimal_template = optimal_stellar_template
-        
         # 计算光谱指数
         logging.debug(f"STEP: Calculating spectral indices")
         indices = {}
@@ -1718,11 +1725,10 @@ def fit_single_pixel(args):
                 calculator = LineIndexCalculator(
                     lam_gal, clean_spectrum,
                     sps.lam_temp, Temp_Calu,
-                    em_wave=galaxy_data.lam_gal,
+                    em_wave=lam_gal,
                     em_flux_list=pp.full_gas_bestfit if hasattr(pp, 'full_gas_bestfit') else None,
                     velocity_correction=to_scalar(pp.sol[0]),
                     continuum_mode=config.continuum_mode)
-                
                 # 计算请求的光谱指数
                 for index_name in config.line_indices:
                     try:
@@ -1731,6 +1737,7 @@ def fit_single_pixel(args):
                     except Exception as e:
                         logging.warning(f"Failed to calculate index {index_name}: {str(e)}")
                         indices[index_name] = np.nan
+                        
             except Exception as e:
                 logging.warning(f"Failed to initialize LineIndexCalculator: {str(e)}")
                 import traceback
@@ -1740,6 +1747,7 @@ def fit_single_pixel(args):
         
         # 生成诊断图
         if config.make_plots and (i * j) % config.plot_every_n == 0:
+            
             try:
                 logging.debug(f"STEP: Generating diagnostic plot")
                 # 保存第一阶段和第二阶段的结果
@@ -1896,7 +1904,7 @@ def process_results(galaxy_data, results, config):
             # Store kinematic measurements
             galaxy_data.velfield[i, j] = result['velocity']
             galaxy_data.sigfield[i, j] = result['sigma']
-            
+            # logging.info(f"=== TS{result['bestfit'].shape} ===")
             # Store best fit spectra
             galaxy_data.bestfit_field[:, i, j] = result['bestfit']
             galaxy_data.optimal_templates[:, i, j] = result['optimal_template']
@@ -2399,173 +2407,257 @@ def optimize_ppxf_params(config, problem_type=None):
 # Single Pixel Testing
 ### ------------------------------------------------- ###
 
-def test_single_pixel(config=None, i=0, j=0, debug_level=logging.DEBUG):
+def test_single_pixel(config=None, i=None, j=None, debug_level=logging.DEBUG):
     """
-    Test fitting for a single pixel, for debugging purposes.
+    对单个像素进行测试拟合，用于调试目的。
     
     Parameters
     ----------
     config : P2PConfig or str, optional
-        Configuration object or path to configuration file
+        配置对象或配置文件的路径
     i, j : int
-        Pixel coordinates (row, column)
+        像素坐标（行、列）。如果只提供i，则处理第i行的所有像素
     debug_level : int
-        Debug logging level
+        调试日志级别
         
     Returns
     -------
     dict
-        Fitting results
+        拟合结果
     """
-    # Set more detailed logging level
+    # 设置更详细的日志级别
     original_level = logging.getLogger().level
     logging.getLogger().setLevel(debug_level)
     
-    # Store global results for plotting
-    global results
-    results = {}
-    
     try:
-        # Set up configuration
+        # 初始化配置
         if config is None:
             config = P2PConfig()
         elif isinstance(config, str):
             config = P2PConfig.load(config)
         
-        # Prepare test environment
-        logging.info(f"=== STARTING SINGLE PIXEL TEST FOR PIXEL ({i},{j}) ===")
-        logging.info(f"Using config: {config.galaxy_name}")
-        
-        # In debug mode, enable extra safety
+        # 启用调试配置
         if debug_level == logging.DEBUG:
-            logging.info("Enabling safe mode for debugging")
             config.safe_mode = True
             config.fallback_to_simple_fit = True
             config.retry_with_degree_zero = True
+            config.plot_every_n = 1  # 确保每个像素都绘图
         
-        # Create necessary directories
+        # 创建必要的目录
         config.create_directories()
         
-        # 1. Load data
-        logging.info("Loading data...")
-        galaxy_data = IFUDataCube(config.get_data_path(), config.lam_range_temp, config.redshift, config)
-        logging.info(f"Data shape: {galaxy_data.cube.shape}")
-        logging.info(f"Wavelength range: [{galaxy_data.lam_gal[0]:.2f}, {galaxy_data.lam_gal[-1]:.2f}]")
-        logging.info(f"Good wavelength range: {config.good_wavelength_range}")
-        
-        # 2. Prepare templates
-        logging.info("Preparing templates...")
-        sps, gas_templates, gas_names, line_wave = prepare_templates(config, galaxy_data.velscale)
-        logging.info(f"Stellar templates shape: {sps.templates.shape}")
-        logging.info(f"Gas templates shape: {gas_templates.shape}")
-        print("Emission lines included in gas templates:")
-        print(gas_names)
-        
-        # 3. Fit single pixel
-        logging.info(f"Starting fit for pixel ({i},{j})...")
-        args = (i, j, galaxy_data, sps, gas_templates, gas_names, line_wave, config)
-        pixel_i, pixel_j, result = fit_single_pixel(args)
-        
-        # 4. If fit successful, generate diagnostic plot
-        if result is not None and result.get('success', False):
-            logging.info(f"Fit successful! Velocity: {result['velocity']:.1f} km/s, Sigma: {result['sigma']:.1f} km/s")
-            
-            # Get pPXF object for plotting
-            pp = result.get('pp_obj')
-            if pp is not None:
-                # Generate diagnostic plot
-                logging.info("Generating diagnostic plot...")
-                try:
-                    plot_pixel_fit(i, j, pp, galaxy_data, config)
-                    logging.info("Plot generated successfully")
-                except Exception as e:
-                    logging.error(f"Error generating plot: {str(e)}")
-            
-            # If spectral indices were calculated, display results
-            if config.compute_spectral_indices:
-                logging.info("Spectral indices results:")
-                for name, value in result['indices'].items():
-                    # Check if index window is outside good wavelength range
-                    calc = LineIndexCalculator(None, None, None, None)
-                    windows = calc.define_line_windows(name)
-                    if windows:
-                        line_min = windows['blue'][0]
-                        line_max = windows['red'][1]
-                        outside_range = ""
-                        if hasattr(config, 'good_wavelength_range') and (
-                            line_min < config.good_wavelength_range[0] or 
-                            line_max > config.good_wavelength_range[1]):
-                            outside_range = " (partially outside good wavelength range)"
-                        logging.info(f"  - {name}: {value:.4f}{outside_range}")
-                    else:
-                        logging.info(f"  - {name}: {value:.4f}")
-            
-            # If emission lines were calculated, display results
-            if config.compute_emission_lines:
-                logging.info("Emission line results:")
-                for name, data in result['el_results'].items():
-                    logging.info(f"  - {name}: flux={data['flux']:.4e}, S/N={data['an']:.2f}")
-            
-            # 创建光谱指数计算器用于测试和可视化
-            try:
-                logging.info("Testing spectral index calculator...")
-                k_index = i * galaxy_data.cube.shape[2] + j
-                spectrum = galaxy_data.spectra[:, k_index]
-                
-                # 处理发射线
-                clean_spectrum = spectrum
-                if hasattr(pp, 'full_gas_bestfit') and pp.full_gas_bestfit is not None:
-                    clean_spectrum = spectrum - pp.full_gas_bestfit
-                
-                # 获取最优模板
-                optimal_template = result['optimal_template']
-                
-                # 创建计算器
-                calculator = LineIndexCalculator(
-                    galaxy_data.lam_gal, clean_spectrum,
-                    sps.lam_temp, optimal_template,
-                    em_wave=galaxy_data.lam_gal,
-                    em_flux_list=pp.full_gas_bestfit if hasattr(pp, 'full_gas_bestfit') else None,
-                    velocity_correction=result['velocity'],
-                    continuum_mode=config.continuum_mode)
-                
-                # 测试绘图
-                calculator.plot_all_lines(mode='P2P', number=i*10000+j, 
-                                          save_path=str(config.plot_dir), 
-                                          show_index=True)
-                logging.info("Spectral index visualization complete.")
-            except Exception as e:
-                logging.error(f"Error testing spectral index calculator: {str(e)}")
-                logging.exception("Stack trace:")
-            
-            return result
+        # 显示测试信息
+        if i is not None and j is not None:
+            logging.info(f"=== 开始测试像素 ({i},{j}) ===")
+        elif i is not None:
+            logging.info(f"=== 开始测试第 {i} 行 ===")
         else:
-            logging.error(f"Fit failed for pixel ({i},{j})")
-            logging.info("Trying with even simpler settings...")
+            logging.info(f"=== 进入测试模式，将处理部分数据 ===")
             
-            # Try with ultra-simplified settings
-            config.degree = -1  # No additive polynomials 
-            config.moments = [2, 2]  # Just velocity and dispersion
-            config.fwhm_gas = 2.0  # Wider gas lines
-            
-            # Second attempt
-            pixel_i, pixel_j, result = fit_single_pixel(args)
-            
-            if result is not None and result.get('success', False):
-                logging.info("Second attempt successful with simplified settings")
-                return result
+        logging.info(f"使用配置: {config.galaxy_name}")
+        
+        # 1. 加载数据 - 与主流程相同
+        logging.info("加载数据...")
+        galaxy_data = IFUDataCube(config.get_data_path(), config.lam_range_temp, config.redshift, config)
+        logging.info(f"数据形状: {galaxy_data.cube.shape}")
+        logging.info(f"波长范围: [{galaxy_data.lam_gal[0]:.2f}, {galaxy_data.lam_gal[-1]:.2f}]")
+        logging.info(f"有效波长范围: {config.good_wavelength_range}")
+        
+        # 2. 准备模板 - 与主流程相同
+        logging.info("准备恒星和气体模板...")
+        sps, gas_templates, gas_names, line_wave = prepare_templates(config, galaxy_data.velscale)
+        logging.info(f"恒星模板形状: {sps.templates.shape}")
+        logging.info(f"气体模板形状: {gas_templates.shape}")
+        logging.info(f"气体发射线: {gas_names}")
+        
+        # 3. 确定要拟合的像素
+        if i is not None and j is not None:
+            # 测试单个像素
+            pixels_to_fit = [(i, j, galaxy_data, sps, gas_templates, gas_names, line_wave, config)]
+        elif i is not None:
+            # 测试一行
+            pixels_to_fit = [(i, j, galaxy_data, sps, gas_templates, gas_names, line_wave, config) 
+                            for j in range(galaxy_data.cube.shape[2])]
+        else:
+            # 默认行为：测试中心部分
+            ny, nx = galaxy_data.cube.shape[1:3]
+            i_center = ny // 2
+            pixels_to_fit = [(i_center, j, galaxy_data, sps, gas_templates, gas_names, line_wave, config) 
+                            for j in range(nx)]
+        
+        # 4. 运行像素拟合
+        logging.info(f"开始拟合 {len(pixels_to_fit)} 个像素...")
+        results = {}
+        
+        for pixel_args in tqdm(pixels_to_fit, desc="拟合像素"):
+            i, j, result = fit_single_pixel(pixel_args)
+            if result is not None:
+                results[(i, j)] = result
+                logging.info(f"像素 ({i},{j}) 拟合成功: v={result['velocity']:.1f} km/s, σ={result['sigma']:.1f} km/s")
+                
+                # 如果是单像素测试，显示详细结果
+                if len(pixels_to_fit) == 1:
+                    if config.compute_spectral_indices:
+                        logging.info("光谱指数结果:")
+                        for name, value in result['indices'].items():
+                            logging.info(f"  - {name}: {value:.4f} Å")
+                    
+                    if config.compute_emission_lines:
+                        logging.info("发射线结果:")
+                        for name, data in result['el_results'].items():
+                            logging.info(f"  - {name}: flux={data['flux']:.4e}, S/N={data['an']:.2f}")
             else:
-                logging.error("Failed even with simplified settings")
-                return None
+                logging.warning(f"像素 ({i},{j}) 拟合失败")
+        
+        # 5. 处理结果 - 与主流程类似，但只针对已拟合的像素
+        logging.info("处理并保存结果...")
+        
+        # 提取拟合成功的像素坐标
+        successful_pixels = list(results.keys())
+        if not successful_pixels:
+            logging.error("没有成功拟合的像素")
+            return None
+        
+        # 更新galaxy_data中的结果
+        for (i, j), result in results.items():
+            if result['success']:
+                # 保存运动学测量结果
+                galaxy_data.velfield[i, j] = result['velocity']
+                galaxy_data.sigfield[i, j] = result['sigma']
+                
+                # 保存最佳拟合谱
+                galaxy_data.bestfit_field[:, i, j] = result['bestfit']
+                galaxy_data.optimal_templates[:, i, j] = result['optimal_template']
+                
+                # 保存发射线结果
+                for name, data in result['el_results'].items():
+                    if name in galaxy_data.el_flux_maps:
+                        galaxy_data.el_flux_maps[name][i, j] = data['flux']
+                        galaxy_data.el_snr_maps[name][i, j] = data['an']
+                
+                # 保存光谱指数
+                for name, value in result['indices'].items():
+                    if name in galaxy_data.index_maps:
+                        galaxy_data.index_maps[name][i, j] = value
+        
+        # 6. 保存结果
+        test_output_dir = config.output_dir / 'test_results'
+        os.makedirs(test_output_dir, exist_ok=True)
+        
+        # 保存测试结果到CSV
+        df_data = []
+        for (i, j), result in results.items():
+            if not result['success']:
+                continue
+                
+            # 创建行数据
+            row = {
+                'i': i, 'j': j,
+                'velocity': result['velocity'], 
+                'sigma': result['sigma'],
+                'SNR': result['snr']
+            }
+            
+            # 添加发射线数据
+            for name, data in result['el_results'].items():
+                row[f'{name}_flux'] = data['flux']
+                row[f'{name}_SNR'] = data['an']
+            
+            # 添加光谱指数
+            for name, value in result['indices'].items():
+                row[f'{name}_index'] = value
+            
+            df_data.append(row)
+        
+        if df_data:
+            import pandas as pd
+            df = pd.DataFrame(df_data)
+            csv_path = test_output_dir / f"{config.galaxy_name}_test_results.csv"
+            df.to_csv(csv_path, index=False)
+            logging.info(f"测试结果保存到 {csv_path}")
+        
+        # 7. 绘制可视化结果 - 为单像素或单行绘制特殊图表
+        if config.make_plots:
+            logging.info("创建结果图...")
+            
+            # 仅针对单个像素生成视觉化
+            if len(pixels_to_fit) == 1 and results:
+                i, j = pixels_to_fit[0][0], pixels_to_fit[0][1]
+                if (i, j) in results:
+                    result = results[(i, j)]
+                    pp = result.get('pp_obj')
+                    
+                    # 如果有可用的pp对象，创建额外的可视化
+                    if pp is not None:
+                        try:
+                            # 获取必要的数据用于视觉化
+                            k_index = i * galaxy_data.cube.shape[2] + j
+                            clean_spectrum = galaxy_data.spectra[:, k_index].copy()
+                            if hasattr(pp, 'full_gas_bestfit') and pp.full_gas_bestfit is not None:
+                                clean_spectrum -= pp.full_gas_bestfit
+                            
+                            # 使用LineIndexCalculator创建视觉化
+                            wave_range = [(Apply_velocity_correction(config.good_wavelength_range[0], config.redshift)),
+                                          (Apply_velocity_correction(config.good_wavelength_range[1], config.redshift))]
+                            
+                            # 筛选波长范围内的数据
+                            lam_gal = galaxy_data.lam_gal
+                            wave_mask = (lam_gal >= wave_range[0]) & (lam_gal <= wave_range[1])
+                            filtered_lam = lam_gal[wave_mask]
+                            filtered_spectrum = clean_spectrum[wave_mask]
+                            
+                            # 创建与Temp_Calu相同的模板 - 与fit_single_pixel中相同
+                            optimal_template = result['optimal_template']
+                            Temp_Calu = optimal_template
+                            
+                            # 如果可能，添加多项式项
+                            if hasattr(pp, 'apoly') and pp.apoly is not None and hasattr(pp, 'weights'):
+                                try:
+                                    Apoly_Params = np.polyfit(filtered_lam, pp.apoly, 3)
+                                    Temp_Calu = (optimal_template * pp.weights[0]) + np.poly1d(Apoly_Params)(sps.lam_temp)
+                                except Exception as e:
+                                    logging.warning(f"无法计算带多项式的模板: {str(e)}")
+                            
+                            # 创建谱指数计算器
+                            calculator = LineIndexCalculator(
+                                filtered_lam, filtered_spectrum,
+                                sps.lam_temp, Temp_Calu,
+                                em_wave=filtered_lam,
+                                em_flux_list=pp.full_gas_bestfit[wave_mask] if hasattr(pp, 'full_gas_bestfit') else None,
+                                velocity_correction=0,  # 数据已经在静止参考系中
+                                continuum_mode=config.continuum_mode)
+                            
+                            # 绘制所有谱线
+                            calculator.plot_all_lines(mode='TEST', number=i*10000+j, 
+                                                      save_path=str(config.plot_dir), 
+                                                      show_index=True)
+                            
+                            # 为每个单独的谱线绘制详细视图
+                            for index_name in config.line_indices:
+                                output_path = config.plot_dir / f"TEST_{i}_{j}_{index_name}.png"
+                                calculator.plot_line_fit(index_name, output_path)
+                            
+                            logging.info("谱指数可视化完成")
+                        except Exception as e:
+                            logging.error(f"创建额外可视化时出错: {str(e)}")
+                            import traceback
+                            logging.debug(traceback.format_exc())
+        
+        # 返回结果字典（如果测试单个像素）或galaxy_data（如果测试多个像素）
+        if len(pixels_to_fit) == 1 and successful_pixels:
+            i, j = successful_pixels[0]
+            return results[(i, j)]
+        else:
+            return galaxy_data
             
     except Exception as e:
-        logging.error(f"Error during single pixel test: {str(e)}")
+        logging.error(f"测试过程中出错: {str(e)}")
         import traceback
         logging.error(traceback.format_exc())
         return None
     
     finally:
-        # Restore original logging level
+        # 恢复原始日志级别
         logging.getLogger().setLevel(original_level)
 
 
@@ -2573,36 +2665,42 @@ def test_single_pixel(config=None, i=0, j=0, debug_level=logging.DEBUG):
 # Main Driver Functions
 ### ------------------------------------------------- ###
 
-def run_p2p_analysis(config=None, problem_fixes=None):
+def run_p2p_analysis(config=None, problem_fixes=None, test_mode=False, test_row=None, test_col=None):
     """
-    Run the full P2P analysis pipeline.
+    运行完整的P2P分析流程。
     
     Parameters
     ----------
     config : P2PConfig or str, optional
-        Configuration object or path to configuration file
+        配置对象或配置文件的路径
     problem_fixes : str, optional
-        Specific problems to fix (mask_error, broadcast_error, etc.)
+        指定需要修复的问题(mask_error, broadcast_error等)
+    test_mode : bool, optional
+        是否运行测试模式，仅处理部分数据
+    test_row : int, optional
+        测试行索引。如果提供，仅处理此行的像素
+    test_col : int, optional
+        测试列索引。如果与test_row一起提供，仅处理单个像素
         
     Returns
     -------
     IFUDataCube
-        Object containing all processed data and results
+        包含所有处理数据和结果的对象
     """
-    # Set up configuration
+    # 设置配置
     if config is None:
         config = P2PConfig()
     elif isinstance(config, str):
         config = P2PConfig.load(config)
     
-    # Apply problem-specific optimizations if requested
+    # 应用问题特定优化（如果请求）
     if problem_fixes:
         config = optimize_ppxf_params(config, problem_fixes)
     
-    # Create output directories
+    # 创建输出目录
     config.create_directories()
     
-    # Set up logging
+    # 设置日志
     log_path = config.output_dir / f"{config.galaxy_name}_p2p_log.txt"
     logging.basicConfig(
         level=logging.INFO,
@@ -2613,69 +2711,91 @@ def run_p2p_analysis(config=None, problem_fixes=None):
         ]
     )
     
-    # Save configuration
+    # 保存配置
     config.save()
     
-    # Log start of analysis
-    logging.info(f"Starting P2P analysis for {config.galaxy_name}")
-    logging.info(f"Data file: {config.get_data_path()}")
-    logging.info(f"Configuration settings: stellar_moments={config.moments}, degree={config.degree}, "
+    # 记录分析开始信息
+    logging.info(f"开始P2P分析: {config.galaxy_name}")
+    logging.info(f"数据文件: {config.get_data_path()}")
+    logging.info(f"配置设置: stellar_moments={config.moments}, degree={config.degree}, "
                f"mdegree={config.mdegree}, fwhm_gas={config.fwhm_gas}, mask_width={config.mask_width}")
     if hasattr(config, 'good_wavelength_range'):
-        logging.info(f"Good wavelength range: [{config.good_wavelength_range[0]:.2f}, {config.good_wavelength_range[1]:.2f}]")
+        logging.info(f"有效波长范围: [{config.good_wavelength_range[0]:.2f}, {config.good_wavelength_range[1]:.2f}]")
+    
+    # 记录测试模式信息
+    if test_mode:
+        logging.info("运行测试模式 - 仅处理部分数据")
+        if test_row is not None and test_col is not None:
+            logging.info(f"测试单个像素 ({test_row}, {test_col})")
+        elif test_row is not None:
+            logging.info(f"测试第 {test_row} 行的所有像素")
+    
     start_time = time.time()
     
     try:
-        # Load and preprocess data
-        logging.info("Loading and preprocessing data...")
+        # 加载和预处理数据
+        logging.info("加载和预处理数据...")
         galaxy_data = IFUDataCube(config.get_data_path(), config.lam_range_temp, config.redshift, config)
         
-        # Check spectral index windows against good wavelength range
-        if config.compute_spectral_indices and hasattr(config, 'good_wavelength_range'):
-            calc = LineIndexCalculator(None, None, None, None)
-            for index_name in config.line_indices:
-                windows = calc.define_line_windows(index_name)
-                if windows:
-                    line_min = windows['blue'][0]  # Blue start
-                    line_max = windows['red'][1]   # Red end
-                    
-                    if line_min < config.good_wavelength_range[0] or line_max > config.good_wavelength_range[1]:
-                        logging.warning(f"Index {index_name} wavelength range ({line_min:.2f}-{line_max:.2f}) "
-                                       f"partially outside good wavelength range "
-                                       f"({config.good_wavelength_range[0]:.2f}-{config.good_wavelength_range[1]:.2f})")
-                        if config.continuum_mode == 'auto':
-                            logging.info(f"Using automatic continuum mode for spectral index {index_name}")
-        
-        # Prepare templates
-        logging.info("Preparing stellar and gas templates...")
+        # 准备模板
+        logging.info("准备恒星和气体模板...")
         sps, gas_templates, gas_names, line_wave = prepare_templates(config, galaxy_data.velscale)
         
-        # Run pixel fitting
-        logging.info("Starting pixel-by-pixel fitting...")
-        results = fit_pixel_grid(galaxy_data, sps, gas_templates, gas_names, line_wave, config)
+        # 运行像素拟合
+        logging.info("开始逐像素拟合...")
         
-        # Process results
-        logging.info("Processing and storing results...")
+        # 如果在测试模式下，仅处理指定的像素
+        if test_mode:
+            ny, nx = galaxy_data.cube.shape[1:3]
+            
+            if test_row is not None and test_col is not None:
+                # 测试单个像素
+                logging.info(f"测试模式: 仅拟合像素 ({test_row}, {test_col})")
+                pixels = [(test_row, test_col, galaxy_data, sps, gas_templates, gas_names, line_wave, config)]
+            elif test_row is not None:
+                # 测试一行像素
+                logging.info(f"测试模式: 仅拟合第 {test_row} 行")
+                pixels = [(test_row, j, galaxy_data, sps, gas_templates, gas_names, line_wave, config) 
+                         for j in range(nx)]
+            else:
+                # 默认测试：中心行
+                test_row = ny // 2
+                logging.info(f"测试模式: 仅拟合中心行 {test_row}")
+                pixels = [(test_row, j, galaxy_data, sps, gas_templates, gas_names, line_wave, config) 
+                         for j in range(nx)]
+                
+            # 设置单线程处理测试像素
+            results = {}
+            for pixel_args in tqdm(pixels, desc="拟合测试像素"):
+                i, j, result = fit_single_pixel(pixel_args)
+                if result is not None:
+                    results[(i, j)] = result
+        else:
+            # 正常运行：处理所有像素
+            results = fit_pixel_grid(galaxy_data, sps, gas_templates, gas_names, line_wave, config)
+        
+        # 处理结果
+        logging.info("处理并存储结果...")
         process_results(galaxy_data, results, config)
         
-        # Create summary plots
+        # 创建汇总图
         if config.make_plots:
-            logging.info("Creating summary plots...")
+            logging.info("创建汇总图...")
             create_summary_plots(galaxy_data, config)
         
-        # Save results to FITS files
-        logging.info("Saving maps to FITS files...")
+        # 保存结果到FITS文件
+        logging.info("保存图到FITS文件...")
         save_results_to_fits(galaxy_data, config)
         
-        # Log completion
+        # 记录完成信息
         end_time = time.time()
-        logging.info(f"P2P analysis completed in {end_time - start_time:.1f} seconds")
+        logging.info(f"P2P分析在 {end_time - start_time:.1f} 秒内完成")
         
         return galaxy_data
         
     except Exception as e:
-        logging.error(f"Error in P2P analysis: {str(e)}")
-        logging.exception("Stack trace:")
+        logging.error(f"P2P分析中出错: {str(e)}")
+        logging.exception("堆栈跟踪:")
         raise
 
 
@@ -2697,15 +2817,23 @@ if __name__ == "__main__":
                                "memory_error", "gas_fit_error", "format_error"],
                       help="Apply specific problem fixes")
     
-    # Add single pixel test parameters
-    parser.add_argument("--test-pixel", action="store_true",
-                      help="Run test on a single pixel")
-    parser.add_argument("--pixel-i", type=int, default=0,
-                      help="Row index of pixel to test")
-    parser.add_argument("--pixel-j", type=int, default=0,
-                      help="Column index of pixel to test")
+    # Add test mode parameters
+    parser.add_argument("--test-mode", action="store_true",
+                      help="Run in test mode (limited processing)")
+    parser.add_argument("--test-row", type=int, 
+                      help="Row index to test (if omitted, central row is used)")
+    parser.add_argument("--test-col", type=int,
+                      help="Column index to test (requires --test-row, tests single pixel)")
     parser.add_argument("--debug", action="store_true",
                       help="Enable debug logging")
+    
+    # 单像素测试模式 (legacy)
+    parser.add_argument("--test-pixel", action="store_true",
+                      help="Run test on a single pixel (legacy, use --test-mode instead)")
+    parser.add_argument("--pixel-i", type=int, default=0,
+                      help="Row index of pixel to test (legacy)")
+    parser.add_argument("--pixel-j", type=int, default=0,
+                      help="Column index of pixel to test (legacy)")
     
     # Add continuum mode selection
     parser.add_argument("--continuum-mode", type=str, 
@@ -2720,6 +2848,7 @@ if __name__ == "__main__":
     
     # Add global search option
     parser.add_argument("--global-search", action="store_true",
+                        default="--global-search",
                       help="Use global search in second stage fitting")
     
     args = parser.parse_args()
@@ -2736,6 +2865,7 @@ if __name__ == "__main__":
         config.save(args.config_output)
         print(f"Default configuration saved to {args.config_output}")
     elif args.test_pixel:
+        # 支持旧的测试方式
         # Load configuration
         config = P2PConfig.load(args.config) if args.config else P2PConfig()
         
@@ -2763,7 +2893,33 @@ if __name__ == "__main__":
             print(f"Single pixel test completed successfully, results saved")
         else:
             print(f"Single pixel test failed, check log file")
+    elif args.test_mode:
+        # 新的测试模式
+        # Handle configuration
+        if args.config:
+            config = P2PConfig.load(args.config)
+        else:
+            config = P2PConfig()
+        
+        # Apply problem fixes
+        if args.fix:
+            config = optimize_ppxf_params(config, args.fix)
+        
+        # 设置其他选项
+        config.continuum_mode = args.continuum_mode
+        config.use_two_stage_fit = args.two_stage
+        config.global_search = args.global_search
+        
+        print(f"Running in test mode")
+        print(f"Continuum mode: {config.continuum_mode}")
+        print(f"Two-stage fitting: {'Enabled' if config.use_two_stage_fit else 'Disabled'}")
+        print(f"Global search: {'Enabled' if config.global_search else 'Disabled'}")
+        
+        # 在测试模式下运行分析
+        run_p2p_analysis(config, args.fix, test_mode=True, 
+                        test_row=args.test_row, test_col=args.test_col)
     else:
+        # Normal full run
         # Handle configuration
         if args.config:
             config = P2PConfig.load(args.config)
