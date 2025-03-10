@@ -12,7 +12,7 @@ Features:
 - Customizable visualization
 - Single pixel testing capability
 
-Version 3.9.7    2025Mar10    Corrected stellar template calculation to match original code
+Version 3.9.8    2025Mar10    Corrected stellar template calculation to match original code
 """
 
 ### ------------------------------------------------- ###
@@ -136,13 +136,15 @@ class P2PConfig:
         
         # Computational settings
         self.n_threads = os.cpu_count() // 2  # Default to half available cores
-        self.max_memory_gb = 4  # Maximum memory usage in GB
+        self.max_memory_gb = 12  # Maximum memory usage in GB
         
         # Visualization settings
         self.make_plots = True
-        self.plot_every_n = 1  # Only plot every n pixels
+        self.plot_every_n = 300  # Only plot every n pixels
         self.save_plots = True
         self.dpi = 150
+
+        self.LICplot = False
         
         # Flags for what to compute
         self.compute_emission_lines = True
@@ -497,8 +499,8 @@ class LineIndexCalculator:
         
         # 处理发射线
         if em_wave is not None and em_flux_list is not None:
-            # self.em_wave = self._apply_velocity_correction(em_wave)
-            self.em_wave = em_wave
+            self.em_wave = self._apply_velocity_correction(em_wave)
+            # self.em_wave = em_wave
             self.em_flux_list = em_flux_list
             self._subtract_emission_lines()
     
@@ -1474,7 +1476,7 @@ def fit_single_pixel(args):
             pp_stars = ppxf(sps.templates, spectrum, noise, galaxy_data.velscale, 
                           [config.vel_s, config.vel_dis_s],
                           degree=3,  # 原始代码使用degree=3
-                          plot=True, mask=mask, lam=lam_gal, 
+                          plot=False, mask=mask, lam=lam_gal, 
                           lam_temp=sps.lam_temp, quiet=True)
             
             logging.debug(f"  - First stage fit successful: v={pp_stars.sol[0]:.1f}, σ={pp_stars.sol[1]:.1f}")
@@ -1729,6 +1731,8 @@ def fit_single_pixel(args):
                     em_flux_list=pp.full_gas_bestfit if hasattr(pp, 'full_gas_bestfit') else None,
                     velocity_correction=to_scalar(pp.sol[0]),
                     continuum_mode=config.continuum_mode)
+                if config.LICplot == True:
+                        calculator.plot_all_lines()
                 # 计算请求的光谱指数
                 for index_name in config.line_indices:
                     try:
@@ -1737,7 +1741,6 @@ def fit_single_pixel(args):
                     except Exception as e:
                         logging.warning(f"Failed to calculate index {index_name}: {str(e)}")
                         indices[index_name] = np.nan
-                        
             except Exception as e:
                 logging.warning(f"Failed to initialize LineIndexCalculator: {str(e)}")
                 import traceback
