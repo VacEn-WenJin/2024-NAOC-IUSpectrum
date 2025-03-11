@@ -33,6 +33,8 @@ from typing import Union, List, Tuple
 
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use('agg')
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
@@ -40,6 +42,8 @@ from matplotlib.ticker import (MultipleLocator, FormatStrFormatter, AutoMinorLoc
 from scipy import interpolate, integrate
 from scipy.optimize import curve_fit
 from tqdm import tqdm
+
+from contextlib import redirect_stdout, redirect_stderr
 
 from astropy.io import fits
 from astropy.table import Table, vstack
@@ -1566,7 +1570,8 @@ def fit_single_pixel(args):
             
             try:
                 # 执行第二阶段拟合 - 与原始代码一致
-                pp = ppxf(stars_gas_templates, galaxy_subset, noise_subset, galaxy_data.velscale, start,
+                with open(os.devnull, 'w') as devnull, redirect_stdout(devnull), redirect_stderr(devnull):
+                    pp = ppxf(stars_gas_templates, galaxy_subset, noise_subset, galaxy_data.velscale, start,
                         plot=False, moments=moments, degree=3, mdegree=-1, 
                         component=component, gas_component=gas_component, gas_names=gas_names,
                         lam=lam_gal[wave_mask], lam_temp=sps.lam_temp, 
