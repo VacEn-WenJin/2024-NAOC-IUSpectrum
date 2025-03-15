@@ -1,0 +1,31 @@
+2025-03-12 16:30:14 - INFO - Starting ISAP v4.2.0 analysis - Log saved to: output\logs\NGC1234_20250312_163014.log
+2025-03-12 16:30:14 - INFO - Configuration parameters:
+Galaxy: NGC1234 (z=0.0)
+Data Directory: data
+Output Directory: output
+Template: MILES (internal)
+Parallel Mode: grouped
+Threads: 10
+Compute Emission Lines: True
+Compute Spectral Indices: True
+Use Two-Stage Fit: True
+2025-03-12 16:30:14 - INFO - ===== Starting Pixel-by-Pixel Analysis (parallel mode=grouped) =====
+2025-03-12 16:30:14 - INFO - Loading data...
+2025-03-12 16:30:14 - ERROR - Error in P2P analysis: Could not find FITS file matching NGC1234
+2025-03-12 16:30:14 - ERROR - Stack trace:
+Traceback (most recent call last):
+  File "isap.py", line 1774, in run_p2p_analysis
+    galaxy_data = IFUDataCube(config.get_data_path(), config.lam_range_temp, config.redshift, config)
+  File "isap.py", line 291, in get_data_path
+    raise FileNotFoundError(f"Could not find FITS file matching {self.galaxy_name}")
+FileNotFoundError: Could not find FITS file matching NGC1234
+2025-03-12 16:30:14 - ERROR - Error during execution: Could not find FITS file matching NGC1234
+2025-03-12 16:30:14 - ERROR - Stack trace:
+Traceback (most recent call last):
+  File "isap.py", line 5225, in main
+    galaxy_data, p2p_velfield, p2p_sigfield = run_p2p_analysis(config)
+  File "isap.py", line 1774, in run_p2p_analysis
+    galaxy_data = IFUDataCube(config.get_data_path(), config.lam_range_temp, config.redshift, config)
+  File "isap.py", line 291, in get_data_path
+    raise FileNotFoundError(f"Could not find FITS file matching {self.galaxy_name}")
+FileNotFoundError: Could not find FITS file matching NGC1234

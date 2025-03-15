@@ -1,0 +1,31 @@
+2025-03-12 19:34:58 - INFO - Starting ISAP v4.2.0 analysis - Log saved to: output\logs\VCC1588_20250312_193458.log
+2025-03-12 19:34:58 - INFO - Configuration parameters:
+Galaxy: VCC1588 (z=0.0)
+Data Directory: data
+Output Directory: output
+Template: MILES (internal)
+Parallel Mode: grouped
+Threads: 10
+Compute Emission Lines: True
+Compute Spectral Indices: True
+Use Two-Stage Fit: True
+2025-03-12 19:34:58 - INFO - ===== Starting Pixel-by-Pixel Analysis (parallel mode=grouped) =====
+2025-03-12 19:34:58 - INFO - Loading data...
+2025-03-12 19:34:58 - ERROR - Error in P2P analysis: Could not find FITS file matching VCC1588
+2025-03-12 19:34:58 - ERROR - Stack trace:
+Traceback (most recent call last):
+  File "isap.py", line 1765, in run_p2p_analysis
+    galaxy_data = IFUDataCube(config.get_data_path(), config.lam_range_temp, config.redshift, config)
+  File "isap.py", line 303, in get_data_path
+    raise FileNotFoundError(f"Could not find FITS file matching {self.galaxy_name}")
+FileNotFoundError: Could not find FITS file matching VCC1588
+2025-03-12 19:34:58 - ERROR - Error during execution: Could not find FITS file matching VCC1588
+2025-03-12 19:34:58 - ERROR - Stack trace:
+Traceback (most recent call last):
+  File "isap.py", line 5201, in main
+    galaxy_data, p2p_velfield, p2p_sigfield = run_p2p_analysis(config)
+  File "isap.py", line 1765, in run_p2p_analysis
+    galaxy_data = IFUDataCube(config.get_data_path(), config.lam_range_temp, config.redshift, config)
+  File "isap.py", line 303, in get_data_path
+    raise FileNotFoundError(f"Could not find FITS file matching {self.galaxy_name}")
+FileNotFoundError: Could not find FITS file matching VCC1588

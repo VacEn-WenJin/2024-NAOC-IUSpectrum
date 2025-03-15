@@ -1,0 +1,31 @@
+2025-03-12 16:04:34 - INFO - Starting ISAP v4.2.0 analysis - Log saved to: output\logs\NGC1234_20250312_160434.log
+2025-03-12 16:04:34 - INFO - Configuration parameters:
+Galaxy: NGC1234 (z=0.0)
+Data Directory: data
+Output Directory: output
+Template: MILES (internal)
+Parallel Mode: grouped
+Threads: 10
+Compute Emission Lines: True
+Compute Spectral Indices: True
+Use Two-Stage Fit: True
+2025-03-12 16:04:34 - INFO - ===== Starting Voronoi Binning Analysis (SNR=20.0, parallel mode=grouped) =====
+2025-03-12 16:04:34 - INFO - Loading data...
+2025-03-12 16:04:34 - ERROR - Error in VNB analysis: Could not find FITS file matching NGC1234
+2025-03-12 16:04:34 - ERROR - Stack trace:
+Traceback (most recent call last):
+  File "isap.py", line 4290, in run_vnb_analysis
+    galaxy_data = IFUDataCube(config.get_data_path(), config.lam_range_temp, config.redshift, config)
+  File "isap.py", line 293, in get_data_path
+    raise FileNotFoundError(f"Could not find FITS file matching {self.galaxy_name}")
+FileNotFoundError: Could not find FITS file matching NGC1234
+2025-03-12 16:04:34 - ERROR - Error during execution: Could not find FITS file matching NGC1234
+2025-03-12 16:04:34 - ERROR - Stack trace:
+Traceback (most recent call last):
+  File "isap.py", line 4696, in main
+    run_vnb_analysis(config, target_snr=args.target_snr)
+  File "isap.py", line 4290, in run_vnb_analysis
+    galaxy_data = IFUDataCube(config.get_data_path(), config.lam_range_temp, config.redshift, config)
+  File "isap.py", line 293, in get_data_path
+    raise FileNotFoundError(f"Could not find FITS file matching {self.galaxy_name}")
+FileNotFoundError: Could not find FITS file matching NGC1234
