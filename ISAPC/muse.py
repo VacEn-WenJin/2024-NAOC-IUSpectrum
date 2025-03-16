@@ -1,3 +1,6 @@
+import logging
+logger = logging.getLogger(__name__)
+
 import warnings
 from typing import Union, Dict, List, Tuple, Optional, Any
 from pathlib import Path
@@ -9,6 +12,7 @@ from joblib import delayed
 from ppxf import ppxf_util
 from ppxf.ppxf import ppxf
 from ppxf.sps_util import sps_lib
+from scipy.interpolate import interp1d
 
 from utils.parallel import ParallelTqdm
 from utils.calc import apply_velocity_shift, resample_spectrum
@@ -22,7 +26,8 @@ class MUSECube:
             self,
             filename: str,
             redshift: float,
-            wvl_air_angstrom_range: tuple[float, float] = (4822, 5212),
+            wvl_air_angstrom_range: Optional[tuple[float, float]] = None,
+            use_good_wavelength: bool = True
     ) -> None:
         """
         Read MUSE data cube, extract relevant information and preprocess it
@@ -30,10 +35,14 @@ class MUSECube:
         @param filename: filename of the MUSE data cube
         @param redshift: redshift of the galaxy
         @param wvl_air_angstrom_range: wavelength range to consider (Angstrom in air wavelength)
+                                       If None and use_good_wavelength=True, 
+                                       will try to use goodwavelengthrange from data
+        @param use_good_wavelength: whether to use goodwavelengthrange from data if available
         """
         self._filename = filename
         self._wvl_air_angstrom_range = wvl_air_angstrom_range
         self._redshift = redshift
+        self._use_good_wavelength = use_good_wavelength
 
         self._read_fits_file()
         self._preprocess_cube()
@@ -92,6 +101,57 @@ class MUSECube:
                 # 如果找不到波长信息，生成一个线性波长轴并发出警告
                 warnings.warn("Wavelength information not found in header. Using a linear scale.")
                 self._obs_wvl_air_angstrom = np.linspace(4000, 7000, self._raw_cube_data.shape[0])
+
+            # 查找并设置goodwavelengthrange
+            good_wvl_range = None
+            
+            # 尝试从头信息中获取goodwavelengthrange
+            if 'WAVGOOD0' in self._fits_hdu_header and 'WAVGOOD1' in self._fits_hdu_header:
+                good_wvl_range = (
+                    float(self._fits_hdu_header['WAVGOOD0']),
+                    float(self._fits_hdu_header['WAVGOOD1'])
+                )
+                logger.info(f"Found goodwavelengthrange in header: {good_wvl_range}")
+            
+            # 尝试查找其他扩展和表格中的goodwavelengthrange
+            if good_wvl_range is None:
+                for ext in range(len(fits_hdu)):
+                    if isinstance(fits_hdu[ext], fits.BinTableHDU):
+                        if 'GOODWAVEMIN' in fits_hdu[ext].header and 'GOODWAVEMAX' in fits_hdu[ext].header:
+                            good_wvl_range = (
+                                float(fits_hdu[ext].header['GOODWAVEMIN']),
+                                float(fits_hdu[ext].header['GOODWAVEMAX'])
+                            )
+                            logger.info(f"Found goodwavelengthrange in extension {ext}: {good_wvl_range}")
+                            break
+                        # 检查表格中的列
+                        elif fits_hdu[ext].data is not None:
+                            col_names = fits_hdu[ext].data.names if hasattr(fits_hdu[ext].data, 'names') else []
+                            if 'goodwavelengthrange' in col_names:
+                                good_wvl_vals = fits_hdu[ext].data['goodwavelengthrange']
+                                good_wvl_range = (min(good_wvl_vals), max(good_wvl_vals))
+                                logger.info(f"Found goodwavelengthrange in table: {good_wvl_range}")
+                                break
+            
+            # 如果找到goodwavelengthrange并且参数设置为使用它
+            if good_wvl_range is not None and self._use_good_wavelength:
+                # 检查波长范围是否合理，避免极端值
+                min_wvl = np.min(self._obs_wvl_air_angstrom) / (1 + self._redshift)
+                max_wvl = np.max(self._obs_wvl_air_angstrom) / (1 + self._redshift)
+                
+                # 确保good_wvl_range在实际数据范围内
+                good_min = max(good_wvl_range[0], min_wvl)
+                good_max = min(good_wvl_range[1], max_wvl)
+                
+                # 设置波长范围，要考虑红移修正
+                self._wvl_air_angstrom_range = (good_min, good_max)
+                logger.info(f"Using goodwavelengthrange (rest-frame): {self._wvl_air_angstrom_range}")
+            elif self._wvl_air_angstrom_range is None:
+                # 如果没有找到goodwavelengthrange且没有提供范围，使用全部波长
+                min_wvl = np.min(self._obs_wvl_air_angstrom) / (1 + self._redshift)
+                max_wvl = np.max(self._obs_wvl_air_angstrom) / (1 + self._redshift)
+                self._wvl_air_angstrom_range = (min_wvl, max_wvl)
+                logger.info(f"Using full wavelength range (rest-frame): {self._wvl_air_angstrom_range}")
 
             self._FWHM_gal = 1
             # instrument specific parameters from ESO
@@ -293,7 +353,8 @@ class MUSECube:
         ppxf_vel_init: Optional[np.ndarray] = None,
         ppxf_sig_init: float = 50.0,
         ppxf_deg: int = 4,
-        n_jobs: int = -1
+        n_jobs: int = -1,
+        verbose: bool = False  # 新增参数，控制是否显示详细日志
     ) -> Dict[str, Any]:
         """
         在恒星模板基础上拟合发射线成分
@@ -302,8 +363,16 @@ class MUSECube:
         @param ppxf_sig_init: 发射线弥散初始值，默认为50
         @param ppxf_deg: 多项式阶数
         @param n_jobs: 并行任务数
+        @param verbose: 是否显示详细日志信息
         @return: 发射线拟合结果字典
         """
+        # 设置日志级别
+        original_level = logger.level
+        if not verbose:
+            logger.setLevel(logging.WARNING)
+        else:
+            logger.setLevel(logging.INFO)
+            
         if line_names is None:
             # 默认发射线集合
             line_names = ['OII3726', 'OII3729', 'Hgamma', 'Hbeta', 'OIII4959', 'OIII5007', 
@@ -350,8 +419,8 @@ class MUSECube:
                 np.isnan(self._velocity_field[i, j])):
                 return i, j, None
             
-            # 获取最佳恒星模板和恒星速度参数
-            optimal_template = self._optimal_tmpls[:, i, j]
+            # 获取最佳恒星模板
+            optimal_template = self._bestfit_field[:, i, j]
             
             # 获取初始速度值
             if isinstance(ppxf_vel_init, np.ndarray):
@@ -361,70 +430,76 @@ class MUSECube:
             else:
                 vel_init = ppxf_vel_init if ppxf_vel_init is not None else 0
             
-            # 使用ppxf_util.emission_lines创建气体模板
-            gas_templates, gas_names, emission_wave = ppxf_util.emission_lines(
-                self._ln_lambda_gal, emission_lines, FWHM=ppxf_sig_init
-            )
-            
-            # 合并恒星和气体模板
-            all_templates = np.column_stack([optimal_template.reshape(-1, 1), gas_templates])
-            
-            # 定义成分标记
-            component = [0] + [1] * gas_templates.shape[1]
-            gas_component = np.array(component) > 0
-            
-            # 设置拟合参数
-            start = [
-                [vel_init, self._dispersion_field[i, j]],  # 恒星成分
-                [vel_init, ppxf_sig_init]                 # 气体成分
-            ]
-            
-            # 设置约束范围
-            vlim = lambda x: vel_init + x*np.array([-100, 100])
-            bounds = [
-                [vlim(2), [20, 300]],  # 恒星成分
-                [vlim(2), [20, 100]]   # 气体成分
-            ]
-            
-            # 设置tied参数
-            moments = [2, 2]  # 恒星和气体的moments
-            ncomp = len(moments)
-            tied = [['', ''] for _ in range(ncomp)]
-            
-            # 执行pPXF拟合
-            with warnings.catch_warnings():
-                warnings.filterwarnings('ignore', category=RuntimeWarning)
-                try:
-                    pp = ppxf(
-                        all_templates, galaxy_data, galaxy_noise, 
-                        self._vel_scale, start, mask=None,
-                        moments=moments, degree=ppxf_deg, mdegree=-1,
-                        component=component, gas_component=gas_component,
-                        gas_names=gas_names, lam=self._lambda_gal,
-                        lam_temp=np.exp(self._ln_lambda_gal),
-                        bounds=bounds, tied=tied,
-                        quiet=True
-                    )
+            try:
+                # 直接创建与恒星模板长度相同的气体模板
+                stellar_len = len(optimal_template)
+                gas_templates = np.zeros((stellar_len, len(emission_lines)))
+                gas_names = [f"Line{j+1:02d}" for j in range(len(emission_lines))]
+                
+                for k, line in enumerate(emission_lines):
+                    # 找到发射线在波长网格中的位置
+                    line_pos = np.abs(self._lambda_gal - line).argmin()
                     
-                    # 提取结果
-                    result = {
-                        'flux': pp.gas_flux if hasattr(pp, 'gas_flux') else None,
-                        'gas_bestfit': pp.gas_bestfit if hasattr(pp, 'gas_bestfit') else None,
-                        'gas_bestfit_templates': pp.gas_bestfit_templates if hasattr(pp, 'gas_bestfit_templates') else None,
-                        'sol': pp.sol,
-                        'gas_sol': pp.gas_sol if hasattr(pp, 'gas_sol') else None
-                    }
-                    return i, j, result
-                except Exception as e:
-                    # 拟合失败时，尝试更简单的配置
+                    # 确保位置有效
+                    if 0 <= line_pos < stellar_len:
+                        # 创建高斯线轮廓
+                        sigma_pix = ppxf_sig_init / (self._vel_scale * 2.355)  # 转换为像素
+                        x = np.arange(stellar_len)
+                        # 创建中心在line_pos的高斯线
+                        gauss = np.exp(-0.5 * ((x - line_pos) / sigma_pix)**2)
+                        # 归一化
+                        if np.sum(gauss) > 0:
+                            gauss /= np.sum(gauss)
+                        # 添加到模板
+                        gas_templates[:, k] = gauss
+                        
+                        # 输出信息（仅在verbose模式下）
+                        if verbose:
+                            logger.info(f"Added emission line {line_names[k]} ({line}Å) at pixel position {line_pos}")
+                
+                # 安全检查：确保长度匹配
+                if len(gas_templates) != len(optimal_template):
+                    if verbose:
+                        logger.error(f"Length mismatch: gas={len(gas_templates)}, stellar={len(optimal_template)}")
+                    return i, j, None
+                
+                # 合并恒星和气体模板
+                all_templates = np.column_stack([optimal_template.reshape(-1, 1), gas_templates])
+                
+                # 定义成分标记
+                component = [0] + [1] * gas_templates.shape[1]
+                gas_component = np.array(component) > 0
+                
+                # 设置拟合参数
+                start = [
+                    [vel_init, self._dispersion_field[i, j]],  # 恒星成分
+                    [vel_init, ppxf_sig_init]                 # 气体成分
+                ]
+                
+                # 设置约束范围
+                vlim = lambda x: vel_init + x*np.array([-100, 100])
+                bounds = [
+                    [vlim(2), [20, 300]],  # 恒星成分
+                    [vlim(2), [20, 100]]   # 气体成分
+                ]
+                
+                # 设置tied参数
+                moments = [2, 2]  # 恒星和气体的moments
+                ncomp = len(moments)
+                tied = [['', ''] for _ in range(ncomp)]
+                
+                # 执行pPXF拟合
+                with warnings.catch_warnings():
+                    warnings.filterwarnings('ignore', category=RuntimeWarning)
                     try:
                         pp = ppxf(
                             all_templates, galaxy_data, galaxy_noise, 
                             self._vel_scale, start, mask=None,
-                            moments=moments, degree=0, mdegree=-1,  # 使用常数多项式
+                            moments=moments, degree=ppxf_deg, mdegree=-1,
                             component=component, gas_component=gas_component,
                             gas_names=gas_names, lam=self._lambda_gal,
-                            lam_temp=np.exp(self._ln_lambda_gal),
+                            lam_temp=self._lambda_gal,  # 使用相同的波长网格
+                            bounds=bounds, tied=tied,
                             quiet=True
                         )
                         
@@ -437,8 +512,38 @@ class MUSECube:
                             'gas_sol': pp.gas_sol if hasattr(pp, 'gas_sol') else None
                         }
                         return i, j, result
-                    except:
-                        return i, j, None
+                    except Exception as e:
+                        # 拟合失败时，尝试更简单的配置
+                        if verbose:
+                            logger.warning(f"First attempt failed for pixel ({i}, {j}): {str(e)}")
+                        try:
+                            pp = ppxf(
+                                all_templates, galaxy_data, galaxy_noise, 
+                                self._vel_scale, start, mask=None,
+                                moments=moments, degree=0, mdegree=-1,  # 使用常数多项式
+                                component=component, gas_component=gas_component,
+                                gas_names=gas_names, lam=self._lambda_gal,
+                                lam_temp=self._lambda_gal,  # 使用相同的波长网格
+                                quiet=True
+                            )
+                            
+                            # 提取结果
+                            result = {
+                                'flux': pp.gas_flux if hasattr(pp, 'gas_flux') else None,
+                                'gas_bestfit': pp.gas_bestfit if hasattr(pp, 'gas_bestfit') else None,
+                                'gas_bestfit_templates': pp.gas_bestfit_templates if hasattr(pp, 'gas_bestfit_templates') else None,
+                                'sol': pp.sol,
+                                'gas_sol': pp.gas_sol if hasattr(pp, 'gas_sol') else None
+                            }
+                            return i, j, result
+                        except Exception as e:
+                            if verbose:
+                                logger.debug(f"Both attempts failed for pixel ({i}, {j}): {str(e)}")
+                            return i, j, None
+            except Exception as e:
+                if verbose:
+                    logger.error(f"Error in template creation for pixel ({i},{j}): {str(e)}")
+                return i, j, None
         
         # 并行执行拟合
         fit_results = ParallelTqdm(
@@ -465,6 +570,9 @@ class MUSECube:
             # 保存气体拟合结果
             if result['gas_bestfit'] is not None:
                 self._gas_bestfit_field[:, row, col] = result['gas_bestfit']
+        
+        # 恢复原来的日志级别
+        logger.setLevel(original_level)
         
         # 返回结果字典
         return {

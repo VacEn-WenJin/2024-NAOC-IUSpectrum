@@ -1,5 +1,6 @@
 """
 ISAPC - IFU Spectrum Analysis Pipeline Cluster
+V2.0.1
 主程序和命令行接口
 """
 import os
@@ -44,8 +45,10 @@ def setup_parser():
     parser.add_argument('--template', default=None, help='恒星模板文件路径')
     
     # 波长设置
-    parser.add_argument('--wvl-range', type=float, nargs=2, default=[4822, 5212],
-                      help='要分析的波长范围(Å)')
+    parser.add_argument('--wvl-range', type=float, nargs=2, default=None,
+                      help='要分析的波长范围(Å)，不指定则使用数据中的goodwavelengthrange')
+    parser.add_argument('--no-good-wavelength', action='store_true', 
+                      help='不使用数据中的goodwavelengthrange')
     
     # 分析模式
     parser.add_argument('--mode', choices=['P2P', 'VNB', 'RDB', 'ALL'], default='P2P',
@@ -702,9 +705,11 @@ def main():
         cube = MUSECube(
             filename=args.filename,
             redshift=args.redshift,
-            wvl_air_angstrom_range=tuple(args.wvl_range)
+            wvl_air_angstrom_range=tuple(args.wvl_range) if args.wvl_range is not None else None,
+            use_good_wavelength=not args.no_good_wavelength
         )
         logger.info(f"数据加载完成，用时 {time.time() - start_time:.1f} 秒")
+        logger.info(f"使用波长范围: {cube._wvl_air_angstrom_range}")
     except Exception as e:
         logger.error(f"数据加载失败: {str(e)}")
         return 1

@@ -1,0 +1,60 @@
+2025-03-16 17:25:08 - INFO - ISAPC 分析开始，目标: data/MUSE/VCC1588_stack.fits
+2025-03-16 17:25:08 - INFO - 参数: 红移=0.0042, 波长范围=None, 模式=P2P
+2025-03-16 17:25:09 - INFO - 数据加载完成，用时 0.4 秒
+2025-03-16 17:25:09 - INFO - 使用波长范围: (4851.12, 5228.5)
+2025-03-16 17:25:09 - INFO - 自动选择模板: templates\spectra_emiles_9.0.npz
+2025-03-16 17:25:09 - INFO - 开始像素级分析...
+2025-03-16 17:26:31 - INFO - 恒星成分拟合完成，用时 82.1 秒
+2025-03-16 17:26:32 - ERROR - 分析过程中出错: emission_lines() got an unexpected keyword argument 'FWHM'
+2025-03-16 17:26:32 - ERROR - joblib.externals.loky.process_executor._RemoteTraceback: 
+"""
+Traceback (most recent call last):
+  File "C:\ProgramData\Anaconda3\envs\Ast_py_311\Lib\site-packages\joblib\externals\loky\process_executor.py", line 463, in _process_worker
+    r = call_item()
+        ^^^^^^^^^^^
+  File "C:\ProgramData\Anaconda3\envs\Ast_py_311\Lib\site-packages\joblib\externals\loky\process_executor.py", line 291, in __call__
+    return self.fn(*self.args, **self.kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\ProgramData\Anaconda3\envs\Ast_py_311\Lib\site-packages\joblib\parallel.py", line 598, in __call__
+    return [func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\ProgramData\Anaconda3\envs\Ast_py_311\Lib\site-packages\joblib\parallel.py", line 598, in <listcomp>
+    return [func(*args, **kwargs)
+            ^^^^^^^^^^^^^^^^^^^^^
+  File "E:\ProGram\Dr.Zheng\2024NAOC-IUS\Wkp\2024-NAOC-IUSpectrum\ISAPC\muse.py", line 424, in fit_spaxel_emission
+    gas_templates, gas_names, emission_wave = ppxf_util.emission_lines(
+                                              ^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: emission_lines() got an unexpected keyword argument 'FWHM'
+"""
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "E:\ProGram\Dr.Zheng\2024NAOC-IUS\Wkp\2024-NAOC-IUSpectrum\ISAPC\main.py", line 740, in main
+    p2p_results = run_p2p_analysis(args, cube)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\ProGram\Dr.Zheng\2024NAOC-IUS\Wkp\2024-NAOC-IUSpectrum\ISAPC\main.py", line 102, in run_p2p_analysis
+    emission_result = cube.fit_emission_lines(n_jobs=args.n_jobs)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\ProGram\Dr.Zheng\2024NAOC-IUS\Wkp\2024-NAOC-IUSpectrum\ISAPC\muse.py", line 503, in fit_emission_lines
+    fit_results = ParallelTqdm(
+                  ^^^^^^^^^^^^^
+  File "E:\ProGram\Dr.Zheng\2024NAOC-IUS\Wkp\2024-NAOC-IUSpectrum\ISAPC\utils\parallel.py", line 72, in __call__
+    return super().__call__(iterable)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\ProgramData\Anaconda3\envs\Ast_py_311\Lib\site-packages\joblib\parallel.py", line 2007, in __call__
+    return output if self.return_generator else list(output)
+                                                ^^^^^^^^^^^^
+  File "C:\ProgramData\Anaconda3\envs\Ast_py_311\Lib\site-packages\joblib\parallel.py", line 1650, in _get_outputs
+    yield from self._retrieve()
+  File "C:\ProgramData\Anaconda3\envs\Ast_py_311\Lib\site-packages\joblib\parallel.py", line 1754, in _retrieve
+    self._raise_error_fast()
+  File "C:\ProgramData\Anaconda3\envs\Ast_py_311\Lib\site-packages\joblib\parallel.py", line 1789, in _raise_error_fast
+    error_job.get_result(self.timeout)
+  File "C:\ProgramData\Anaconda3\envs\Ast_py_311\Lib\site-packages\joblib\parallel.py", line 745, in get_result
+    return self._return_or_raise()
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\ProgramData\Anaconda3\envs\Ast_py_311\Lib\site-packages\joblib\parallel.py", line 763, in _return_or_raise
+    raise self._result
+TypeError: emission_lines() got an unexpected keyword argument 'FWHM'
+
