@@ -52,6 +52,9 @@ class LineIndexCalculator:
             'fit': Always use fitted spectrum
             'original': Use original spectrum when possible (warn when insufficient)
         """
+
+        self.Test_Mode = True # test 1 pixel.
+
         self.c = 299792.458  # Speed of light in km/s
         self.velocity = velocity_correction
         self.continuum_mode = continuum_mode

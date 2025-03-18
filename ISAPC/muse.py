@@ -473,7 +473,7 @@ class MUSECube:
         ppxf_sig_init: float = 50.0,
         ppxf_deg: int = 4,
         n_jobs: int = -1,
-        verbose: bool = False
+        verbose: bool = True
     ) -> Dict[str, Any]:
         """
         Fit emission line components based on stellar template.
@@ -528,22 +528,27 @@ class MUSECube:
             gas_templates, gas_names, line_wave = emission_lines(
                 self._sps.ln_lam_temp, lam_range_gal, self._FWHM_gal
             )
+
+            ngas_comp = 1   # I use three gas kinematic components
+            gas_templates = np.tile(gas_templates, ngas_comp)
+            gas_names = np.asarray([a + f"_({p+1})" for p in range(ngas_comp) for a in gas_names])
+            line_wave = np.tile(line_wave, ngas_comp)
             
-            if line_names is not None:
-                # If specific lines requested, filter to those lines
-                valid_indices = []
-                for i, name in enumerate(gas_names):
-                    if any(requested in name for requested in line_names):
-                        valid_indices.append(i)
+            # if line_names is not None:
+            #     # If specific lines requested, filter to those lines
+            #     valid_indices = []
+            #     for i, name in enumerate(gas_names):
+            #         if any(requested in name for requested in line_names):
+            #             valid_indices.append(i)
                 
-                if valid_indices:
-                    gas_templates = gas_templates[:, valid_indices]
-                    gas_names = [gas_names[i] for i in valid_indices]
-                    line_wave = [line_wave[i] for i in valid_indices]
+            #     if valid_indices:
+            #         gas_templates = gas_templates[:, valid_indices]
+            #         gas_names = [gas_names[i] for i in valid_indices]
+            #         line_wave = [line_wave[i] for i in valid_indices]
             
-            # Store emission line wavelengths for reference
-            self._emission_wavelength = dict(zip(gas_names, line_wave))
-            logger.info(f"Using emission lines: {', '.join(gas_names)}")
+            # # Store emission line wavelengths for reference
+            # self._emission_wavelength = dict(zip(gas_names, line_wave))
+            # logger.info(f"Using emission lines: {', '.join(gas_names)}")
             
             # Now use gas templates to fit each spaxel
             n_gas_comp = 1  # Use one gas kinematic component
@@ -555,18 +560,18 @@ class MUSECube:
             #     line_wave = np.tile(line_wave, n_gas_comp)
             
             # Initialize emission line storage
-            unique_names = set()
-            for name in gas_names:
-                if '_(' in name:  # Handle component-specific names
-                    base_name = name.split('_(')[0]
-                else:
-                    base_name = name
-                unique_names.add(base_name)
+            # unique_names = set()
+            # for name in gas_names:
+            #     if '_(' in name:  # Handle component-specific names
+            #         base_name = name.split('_(')[0]
+            #     else:
+            #         base_name = name
+            #     unique_names.add(base_name)
                 
-            for name in unique_names:
-                self._emission_flux[name] = np.full((self._n_y, self._n_x), np.nan)
-                self._emission_vel[name] = np.full((self._n_y, self._n_x), np.nan)
-                self._emission_sig[name] = np.full((self._n_y, self._n_x), np.nan)
+            # for name in unique_names:
+            #     self._emission_flux[name] = np.full((self._n_y, self._n_x), np.nan)
+            #     self._emission_vel[name] = np.full((self._n_y, self._n_x), np.nan)
+            #     self._emission_sig[name] = np.full((self._n_y, self._n_x), np.nan)
             
             # Store ppxf results for each spaxel
             self._ppxf_gas_results = []
@@ -601,69 +606,88 @@ class MUSECube:
                         vel_init = 0
                 else:
                     vel_init = ppxf_vel_init if ppxf_vel_init is not None else 0
-                
                 try:
                     # Define component markers
-                    gas_component = np.ones(gas_templates.shape[1], dtype=bool)
+                    # gas_component = np.ones(gas_templates.shape[1], dtype=bool)
                     
                     # Set fitting parameters
-                    if n_gas_comp == 1:
-                        start = [
-                            [vel_init, ppxf_sig_init]  # Gas component
-                        ]
+                    # if n_gas_comp == 1:
+                    #     # start = [
+                    #     #     [vel_init, ppxf_sig_init]  # Gas component
+                    #     # ]
+
+                    #     start = [[self._velocity_field[i,j],self._dispersion_field[i,j]],
+                    #                 [self._velocity_field[i,j],self._dispersion_field[i,j]]]
+                    #     if(i==0 and j==0):
+                    #         print(start)
+                    #     # Set constraint bounds
+                    #     vlim = lambda x: vel_init + x*np.array([-300, 300])
+                    #     bounds = [
+                    #         [vlim(1), [10, 200]]  # Gas bounds
+                    #     ]
                         
-                        # Set constraint bounds
-                        vlim = lambda x: vel_init + x*np.array([-300, 300])
-                        bounds = [
-                            [vlim(1), [10, 200]]  # Gas bounds
-                        ]
+                    #     # Set moments for gas
+                    #     moments = [2]  # 2 moments for gas
+                    # else:
+                    #     # For multi-component gas, adapt as needed
+                    #     start = [self._velocity_field[np.unravel_index(idx, (self._n_y, self._n_x))],
+                    #             self._dispersion_field[self._velocity_field[np.unravel_index(idx, (self._n_y, self._n_x))]]]
                         
-                        # Set moments for gas
-                        moments = [2]  # 2 moments for gas
-                    else:
-                        # For multi-component gas, adapt as needed
-                        start = []
+                    #     # for k in range(n_gas_comp):
+                    #     #     # Offset each gas component velocity slightly
+                    #     #     offset = (k - n_gas_comp/2) * 50  # Spread components by 50 km/s
+                    #     #     start.append([vel_init + offset, ppxf_sig_init])
                         
-                        for k in range(n_gas_comp):
-                            # Offset each gas component velocity slightly
-                            offset = (k - n_gas_comp/2) * 50  # Spread components by 50 km/s
-                            start.append([vel_init + offset, ppxf_sig_init])
-                        
-                        # Set moments accordingly
-                        moments = [2] * n_gas_comp
+                    #     # Set moments accordingly
+                    #     moments = [2] * n_gas_comp
+
+                    component = [0] + [1]*2
+                    gas_component=np.array(component) > 0
+                    moments = [-2, 2, 2]
+                    ncomp = len(moments)
+                    tied = [['', ''] for _ in range(ncomp)]
+
+                    start = [[self._velocity_field[i,j],self._dispersion_field[i,j]],
+                                [self._velocity_field[i,j],self._dispersion_field[i,j]],
+                                [self._velocity_field[i,j],self._dispersion_field[i,j]]]
+                    # start = [[0, 50],
+                    # [0, 200]]
+
+                    vlim = lambda x: self._velocity_field[i,j] + x*np.array([-100, 100])
+                    bounds = [[vlim(2), [0, 300]],
+                            [vlim(2), [0, 100]]]
                     
-                    n_comp = len(moments)
-                    tied = [['', ''] for _ in range(n_comp)]
-                    
+                    # n_comp = len(moments)
+                    # tied = [['', ''] for _ in range(n_comp)]
                     # Create mask to exclude potential bad data points
-                    mask = None
-                    if np.any(~np.isfinite(galaxy_data)) or np.any(~np.isfinite(galaxy_noise)):
-                        mask = ~np.isfinite(galaxy_data) | ~np.isfinite(galaxy_noise) | (galaxy_noise <= 0)
+                    # mask = None
+                    # if np.any(~np.isfinite(galaxy_data)) or np.any(~np.isfinite(galaxy_noise)):
+                    #     mask = ~np.isfinite(galaxy_data) | ~np.isfinite(galaxy_noise) | (galaxy_noise <= 0)
                         
-                        # Make a copy of data/noise with masked values replaced
-                        galaxy_data = galaxy_data.copy()
-                        galaxy_noise = galaxy_noise.copy()
-                        galaxy_data[mask] = 0
-                        galaxy_noise[mask] = 1e10  # Very high noise = near zero weight
+                    #     # Make a copy of data/noise with masked values replaced
+                    #     galaxy_data = galaxy_data.copy()
+                    #     galaxy_noise = galaxy_noise.copy()
+                    #     galaxy_data[mask] = 0
+                    #     galaxy_noise[mask] = 1e10  # Very high noise = near zero weight
                     
-                    # Calculate stellar template component
-                    # Recalculate stellar template using already fitted velocity field
-                    velocity_shift = self._velocity_field[i, j]
-                    dispersion = self._dispersion_field[i, j]
+                    # # Calculate stellar template component
+                    # # Recalculate stellar template using already fitted velocity field
+                    # velocity_shift = self._velocity_field[i, j]
+                    # dispersion = self._dispersion_field[i, j]
                     
-                    # Rebuild stellar model using optimal_template and polynomial
-                    poly_coeffs = None
-                    for row, col, poly_coeff in self._poly_coeffs:
-                        if row == i and col == j:
-                            poly_coeffs = poly_coeff
-                            break
+                    # # Rebuild stellar model using optimal_template and polynomial
+                    # poly_coeffs = None
+                    # for row, col, poly_coeff in self._poly_coeffs:
+                    #     if row == i and col == j:
+                    #         poly_coeffs = poly_coeff
+                    #         break
                             
-                    if poly_coeffs is None:
-                        # Skip this pixel if polynomial coefficients not found
-                        return i, j, None
+                    # if poly_coeffs is None:
+                    #     # Skip this pixel if polynomial coefficients not found
+                    #     return i, j, None
                         
-                    # Recalculate polynomial component
-                    poly_values = np.polyval(poly_coeffs, self._lambda_gal)
+                    # # Recalculate polynomial component
+                    # poly_values = np.polyval(poly_coeffs, self._lambda_gal)
                     sps = sps_lib(
                         filename=template_filename,
                         velscale=self._vel_scale,
@@ -674,24 +698,27 @@ class MUSECube:
                     sps.templates = sps.templates.reshape(sps.templates.shape[0], -1)
                     # Subtract original observed data to get residual with the stellar model applied with velocity shift
                     # This residual will only contain emission line components
-                    residual = galaxy_data - (self._bestfit_field[:, i, j] - poly_values)
                     stars_gas_templates = np.column_stack([optimal_template, gas_templates])
                     # Use ppxf to directly fit emission lines
                     with warnings.catch_warnings():
-                        warnings.filterwarnings('ignore', category=RuntimeWarning)
+                        # warnings.filterwarnings('ignore', category=RuntimeWarning)
                         try:
+                            galaxy_data = self._spectra[:, idx]
+                            # print(len(self._lambda_gal))
+                            # print(len(galaxy_data))
+                            print('IN')
                             pp = ppxf(
-                                stars_gas_templates, residual, galaxy_noise, 
-                                self._vel_scale, start, mask=mask,
+                                stars_gas_templates, galaxy_data, galaxy_noise, 
+                                self._vel_scale, start,
                                 moments=moments, degree=ppxf_deg,
                                 gas_component=gas_component, 
                                 gas_names=gas_names, lam=self._lambda_gal,
-                                lam_temp=sps.lam_gal,  # Use galaxy wavelength grid for gas templates
+                                lam_temp=sps.lam_temp,  # Use galaxy wavelength grid for gas templates
                                 bounds=bounds if 'bounds' in locals() else None,
                                 tied=tied,
                                 quiet=True
                             )
-                            
+                            print('OT')
                             # Extract results
                             # Stellar model already obtained from self._bestfit_field[:, i, j]
                             # Gas model from pp.bestfit
@@ -700,7 +727,8 @@ class MUSECube:
                             # Calculate total best-fit model
                             total_bestfit = self._bestfit_field[:, i, j] + gas_bestfit
                             apoly_se_2 = np.polyfit(self._lambda_gal, pp.apoly, 3)
-                            NEL_cal_tmp = (stars_gas_templates[:,0] * pp.weights[0]) + np.poly1d(apoly_se_2)(self._lambda_gal)
+                            NEL_cal_tmp = (stars_gas_templates[:,0] * pp.weights[0]) + np.poly1d(apoly_se_2)(sps.lam_temp)
+                            print('[TS-E]')
                             # Get emission line flux and gas kinematics from pp
                             result = {
                                 'flux': pp.gas_flux if hasattr(pp, 'gas_flux') else None,
