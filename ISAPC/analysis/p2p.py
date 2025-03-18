@@ -53,6 +53,7 @@ def run_p2p_analysis(args, cube):
     if not args.no_emission:
         start_time = time.time()
         emission_result = cube.fit_emission_lines(
+            template_filename=args.template,
             ppxf_vel_init=velocity_field,  # Use stellar velocity field as initial guess
             ppxf_sig_init=args.sigma_init,
             ppxf_deg=2,  # Simpler polynomial for emission lines

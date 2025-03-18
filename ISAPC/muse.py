@@ -467,6 +467,7 @@ class MUSECube:
 
     def fit_emission_lines(
         self,
+        template_filename: str,
         line_names: Optional[List[str]] = None,
         ppxf_vel_init: Optional[np.ndarray] = None,
         ppxf_sig_init: float = 50.0,
@@ -548,10 +549,10 @@ class MUSECube:
             n_gas_comp = 1  # Use one gas kinematic component
             
             # Prepare gas templates (multi-component if needed)
-            if n_gas_comp > 1:
-                gas_templates = np.tile(gas_templates, n_gas_comp)
-                gas_names = np.asarray([f"{a}_({p+1})" for p in range(n_gas_comp) for a in gas_names])
-                line_wave = np.tile(line_wave, n_gas_comp)
+            # if n_gas_comp > 1:
+            #     gas_templates = np.tile(gas_templates, n_gas_comp)
+            #     gas_names = np.asarray([f"{a}_({p+1})" for p in range(n_gas_comp) for a in gas_names])
+            #     line_wave = np.tile(line_wave, n_gas_comp)
             
             # Initialize emission line storage
             unique_names = set()
@@ -663,22 +664,29 @@ class MUSECube:
                         
                     # Recalculate polynomial component
                     poly_values = np.polyval(poly_coeffs, self._lambda_gal)
-                    
+                    sps = sps_lib(
+                        filename=template_filename,
+                        velscale=self._vel_scale,
+                        fwhm_gal=None,
+                        norm_range=self._wvl_air_angstrom_range
+                    )
+                    self._sps = sps  # Store SPS object for later reference
+                    sps.templates = sps.templates.reshape(sps.templates.shape[0], -1)
                     # Subtract original observed data to get residual with the stellar model applied with velocity shift
                     # This residual will only contain emission line components
                     residual = galaxy_data - (self._bestfit_field[:, i, j] - poly_values)
-                    
+                    stars_gas_templates = np.column_stack([optimal_template, gas_templates])
                     # Use ppxf to directly fit emission lines
                     with warnings.catch_warnings():
                         warnings.filterwarnings('ignore', category=RuntimeWarning)
                         try:
                             pp = ppxf(
-                                gas_templates, residual, galaxy_noise, 
+                                stars_gas_templates, residual, galaxy_noise, 
                                 self._vel_scale, start, mask=mask,
                                 moments=moments, degree=ppxf_deg,
                                 gas_component=gas_component, 
                                 gas_names=gas_names, lam=self._lambda_gal,
-                                lam_temp=self._lambda_gal,  # Use galaxy wavelength grid for gas templates
+                                lam_temp=sps.lam_gal,  # Use galaxy wavelength grid for gas templates
                                 bounds=bounds if 'bounds' in locals() else None,
                                 tied=tied,
                                 quiet=True
@@ -691,7 +699,8 @@ class MUSECube:
                             
                             # Calculate total best-fit model
                             total_bestfit = self._bestfit_field[:, i, j] + gas_bestfit
-                            
+                            apoly_se_2 = np.polyfit(self._lambda_gal, pp.apoly, 3)
+                            NEL_cal_tmp = (stars_gas_templates[:,0] * pp.weights[0]) + np.poly1d(apoly_se_2)(self._lambda_gal)
                             # Get emission line flux and gas kinematics from pp
                             result = {
                                 'flux': pp.gas_flux if hasattr(pp, 'gas_flux') else None,
@@ -700,6 +709,7 @@ class MUSECube:
                                 'total_bestfit': total_bestfit,
                                 'gas_sol': pp.sol if hasattr(pp, 'sol') else None,
                                 'weights': pp.weights if hasattr(pp, 'weights') else None,
+                                'NEL_cal_tmp':NEL_cal_tmp,
                             }
                             return i, j, result
                         except Exception as e:
@@ -729,6 +739,9 @@ class MUSECube:
                 # Save gas fitting result 
                 if 'gas_bestfit' in result and result['gas_bestfit'] is not None:
                     self._gas_bestfit_field[:, row, col] = result['gas_bestfit']
+
+                if 'NEL_cal_tmp' in result and result['NEL_cal_tmp'] is not None:
+                    self._optimal_tmpls = result['NEL_cal_tmp'] 
                 
                 # Save emission line flux and velocity information
                 if 'flux' in result and result['flux'] is not None:
@@ -756,7 +769,8 @@ class MUSECube:
                 'emission_vel': self._emission_vel,
                 'emission_sig': self._emission_sig,
                 'gas_bestfit_field': self._gas_bestfit_field,
-                'emission_wavelength': self._emission_wavelength
+                'emission_wavelength': self._emission_wavelength,
+                'optimal_tmpls':self._optimal_tmpls,
             }
         
         except Exception as e:
