@@ -61,6 +61,8 @@ def run_p2p_analysis(args, cube):
         )
         logger.info(f"Emission line fitting completed in {time.time() - start_time:.1f} seconds")
     
+
+
     # Calculate spectral indices
     indices_result = None
     if not args.no_indices:
@@ -91,10 +93,10 @@ def run_p2p_analysis(args, cube):
     
     # Create results dictionary
     p2p_results = {
-        'velocity_field': velocity_field,
-        'dispersion_field': dispersion_field,
+        'velocity_field': emission_result['velocity_field'],
+        'dispersion_field': emission_result['dispersion_field'],
         'bestfit_field': bestfit_field,
-        'optimal_tmpls': optimal_tmpls,
+        'optimal_tmpls': emission_result['optimal_tmpls'],
         'kinematics': {**rotation_result, **kinematics_result}
     }
     

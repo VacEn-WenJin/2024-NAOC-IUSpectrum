@@ -710,6 +710,7 @@ class MUSECube:
                                 'gas_sol': pp.sol if hasattr(pp, 'sol') else None,
                                 'weights': pp.weights if hasattr(pp, 'weights') else None,
                                 'NEL_cal_tmp':NEL_cal_tmp,
+                                'sol':pp.sol,
                             }
                             return i, j, result
                         except Exception as e:
@@ -742,6 +743,10 @@ class MUSECube:
 
                 if 'NEL_cal_tmp' in result and result['NEL_cal_tmp'] is not None:
                     self._optimal_tmpls = result['NEL_cal_tmp'] 
+
+                if 'sol' in result and result['sol'] is not None:
+                    self._velocity_field[row, col] = result['sol'][0]
+                    self._dispersion_field[row, col] = result['sol'][1]
                 
                 # Save emission line flux and velocity information
                 if 'flux' in result and result['flux'] is not None:
@@ -771,6 +776,8 @@ class MUSECube:
                 'gas_bestfit_field': self._gas_bestfit_field,
                 'emission_wavelength': self._emission_wavelength,
                 'optimal_tmpls':self._optimal_tmpls,
+                'velocity_field':self._velocity_field,
+                'dispersion_field':self._dispersion_field,
             }
         
         except Exception as e:
