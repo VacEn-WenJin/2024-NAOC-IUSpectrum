@@ -1,110 +1,131 @@
 """
-谱指数计算工具
-基于原LineIndexCalculator设计 用于计算吸收线指数和可视化结果
+Spectral indices calculation module
+Includes Lick indices, D4000, etc.
 """
-import os
+import logging
 import numpy as np
-from pathlib import Path
 import matplotlib.pyplot as plt
 from matplotlib.ticker import AutoMinorLocator
+import warnings
+import os
 from scipy import interpolate
-from typing import Dict, List, Optional, Tuple, Union, Any
+from scipy.interpolate import interp1d
 
-from utils.calc import resample_spectrum
+# Import spectres from utils
+from utils.calc import spectres
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 
 class LineIndexCalculator:
-    """吸收线指数计算器"""
-    
-    def __init__(
-        self, 
-        wave: np.ndarray, 
-        flux: np.ndarray, 
-        fit_wave: np.ndarray, 
-        fit_flux: np.ndarray, 
-        em_wave: Optional[np.ndarray] = None, 
-        em_flux_list: Optional[np.ndarray] = None, 
-        velocity_correction: float = 0, 
-        error: Optional[np.ndarray] = None, 
-        continuum_mode: str = 'auto'
-    ):
+    def __init__(self, wave, flux, fit_wave, fit_flux, em_wave=None, em_flux_list=None, 
+                 velocity_correction=0, error=None, continuum_mode='auto'):
         """
-        初始化吸收线指数计算器
+        Initialize the absorption line index calculator
         
         Parameters:
         -----------
         wave : array-like
-            原始光谱的波长数组
+            Wavelength array of the original spectrum
         flux : array-like
-            原始光谱的流量数组
+            Flux array of the original spectrum
         fit_wave : array-like
-            拟合光谱的波长数组，用于计算连续谱
+            Wavelength array of the fitted spectrum, used for continuum calculation
         fit_flux : array-like
-            拟合光谱的流量数组，用于计算连续谱
+            Flux array of the fitted spectrum, used for continuum calculation
         em_wave : array-like, optional
-            发射线的波长数组
+            Wavelength array for emission lines
         em_flux_list : array-like, optional
-            合并后的发射线光谱
+            Combined emission line spectrum
         velocity_correction : float, optional
-            速度修正值 单位为km/s 默认为0
+            Velocity correction value in km/s, default is 0
         error : array-like, optional
-            误差数组
+            Error array
         continuum_mode : str, optional
-            连续谱计算模式
-            'auto': 仅在原始谱数据不足时使用拟合谱
-            'fit': 始终使用拟合谱
-            'original': 尽可能使用原始谱（数据不足时报警）
+            Continuum calculation mode
+            'auto': Use fitted spectrum only when original data is insufficient
+            'fit': Always use fitted spectrum
+            'original': Use original spectrum when possible (warn when insufficient)
         """
-        self.c = 299792.458  # 光速，单位为km/s
+        self.c = 299792.458  # Speed of light in km/s
         self.velocity = velocity_correction
         self.continuum_mode = continuum_mode
         
-        # 进行速度修正
+        # Create copies and ensure finite values
         self.wave = self._apply_velocity_correction(wave)
-        self.flux = flux.copy()  # 创建副本以避免修改原始数据
-
+        self.flux = np.array(flux, copy=True)
+        
+        # Replace any NaN or Inf values with zeros
+        if np.any(~np.isfinite(self.flux)):
+            self.flux[~np.isfinite(self.flux)] = 0
+            warnings.warn("Non-finite values in flux array replaced with zeros")
+        
         self.fit_wave = fit_wave
         self.fit_flux = fit_flux
+        
+        # Handle NaNs in fitted flux
+        if np.any(~np.isfinite(self.fit_flux)):
+            self.fit_flux = np.array(self.fit_flux, copy=True)
+            self.fit_flux[~np.isfinite(self.fit_flux)] = 0
+            warnings.warn("Non-finite values in fitted flux array replaced with zeros")
+        
         self.error = error if error is not None else np.ones_like(flux)
         
-        # 处理发射线
+        # Process emission lines
         if em_wave is not None and em_flux_list is not None:
             self.em_wave = self._apply_velocity_correction(em_wave)
             self.em_flux_list = em_flux_list
+            
+            # Handle NaNs in emission line flux
+            if np.any(~np.isfinite(self.em_flux_list)):
+                self.em_flux_list = np.array(self.em_flux_list, copy=True)
+                self.em_flux_list[~np.isfinite(self.em_flux_list)] = 0
+                warnings.warn("Non-finite values in emission flux array replaced with zeros")
+                
             self._subtract_emission_lines()
-        else:
-            self.em_wave = None
-            self.em_flux_list = None
     
     def _subtract_emission_lines(self):
         """
-        从原始光谱中减去发射线
-        输入的em_flux_list已经是合并后的结果
+        Subtract emission lines from the original spectrum
+        The input em_flux_list is already a combined result
         """
-        # 将发射线光谱重采样到原始光谱的波长网格上
-        em_flux_resampled = resample_spectrum(self.wave, self.em_wave, self.em_flux_list)
-        
-        # 从原始光谱中减去发射线
-        self.flux -= em_flux_resampled
+        # Resample emission line spectrum to the original wavelength grid
+        try:
+            em_flux_resampled = spectres(self.wave, self.em_wave, self.em_flux_list)
+            
+            # Verify the result is valid before subtraction
+            if np.any(~np.isfinite(em_flux_resampled)):
+                warnings.warn("Non-finite values in resampled emission flux, replacing with zeros")
+                em_flux_resampled[~np.isfinite(em_flux_resampled)] = 0
+                
+            # Subtract emission lines from the original spectrum
+            self.flux -= em_flux_resampled
+        except Exception as e:
+            warnings.warn(f"Error subtracting emission lines: {str(e)}. Continuing without emission line subtraction.")
     
     def _apply_velocity_correction(self, wave):
         """
-        应用速度修正到波长
+        Apply velocity correction to the wavelength
         
         Parameters:
         -----------
         wave : array-like
-            原始波长数组
+            Original wavelength array
             
         Returns:
         --------
-        array-like : 修正后的波长数组
+        array-like : Corrected wavelength array
         """
         return wave / (1 + (self.velocity/self.c))
 
     def _check_data_coverage(self, wave_range):
         """
-        检查原始数据是否完整覆盖给定波长范围
+        Check if the original data completely covers the given wavelength range
         
         Parameters:
         -----------
@@ -113,22 +134,22 @@ class LineIndexCalculator:
             
         Returns:
         --------
-        bool : 是否完整覆盖
+        bool : Whether the range is fully covered
         """
         return (wave_range[0] >= np.min(self.wave)) and (wave_range[1] <= np.max(self.wave))
         
     def define_line_windows(self, line_name):
         """
-        定义吸收线和连续谱窗口
+        Define absorption line and continuum windows
         
         Parameters:
         -----------
         line_name : str
-            吸收线名称
+            Absorption line name
             
         Returns:
         --------
-        dict : 包含蓝端、中心和红端窗口的字典
+        dict : Dictionary with blue, line, and red windows
         """
         windows = {
             'Hbeta': {
@@ -147,318 +168,318 @@ class LineIndexCalculator:
                 'red': (5054.000, 5065.250)
             },
             'Fe5270': {
-                'blue': (5233.150, 5248.150),
-                'line': (5245.650, 5285.650),
-                'red': (5285.650, 5318.150)
+                'blue': (5233.2, 5248.2),
+                'line': (5245.7, 5285.7),
+                'red': (5285.7, 5318.2)
             },
             'Fe5335': {
-                'blue': (5304.625, 5315.875),
-                'line': (5312.125, 5352.125),
-                'red': (5353.375, 5363.375)
-            },
-            'D4000': {
-                'blue': (3750.000, 3950.000),
-                'line': None,
-                'red': (4050.000, 4250.000)
-            },
-            'Halpha': {
-                'blue': (6510.000, 6540.000),
-                'line': (6554.000, 6568.000),
-                'red': (6575.000, 6585.000)
-            },
+                'blue': (5304.6, 5315.9),
+                'line': (5312.1, 5352.1),
+                'red': (5353.4, 5363.4)
+            }
         }
         return windows.get(line_name)
 
     def calculate_pseudo_continuum(self, wave_range, flux_range, region_type):
         """
-        计算伪连续谱
+        Calculate pseudo-continuum
         
         Parameters:
         -----------
         wave_range : tuple or array-like
-            波长范围
+            Wavelength range
         flux_range : array-like or None
-            对应的流量值（如果使用拟合谱则不需要）
+            Corresponding flux values (not needed if using fitted spectrum)
         region_type : str
-            区域类型('blue' 或 'red')
+            Region type ('blue' or 'red')
             
         Returns:
         --------
-        float : 伪连续谱值
+        float : Pseudo-continuum value
         """
         if self.continuum_mode == 'fit':
-            # 使用拟合谱
-            mask = (self.fit_wave >= wave_range[0]) & (self.fit_wave <= wave_range[1])
-            if not np.any(mask):
-                return np.nan
-            return np.median(self.fit_flux[mask])
+            # Use fitted spectrum
+            try:
+                mask = (self.fit_wave >= wave_range[0]) & (self.fit_wave <= wave_range[1])
+                if np.any(mask):
+                    return np.nanmedian(self.fit_flux[mask])
+                else:
+                    warnings.warn(f"No fitted data points in {region_type} continuum range")
+                    return 0
+            except Exception as e:
+                warnings.warn(f"Error calculating continuum from fitted spectrum: {str(e)}")
+                return 0
         
         elif self.continuum_mode == 'auto':
-            # 检查原始数据覆盖
+            # Check original data coverage
             if self._check_data_coverage(wave_range):
                 mask = (self.wave >= wave_range[0]) & (self.wave <= wave_range[1])
-                if not np.any(mask):
-                    return np.nan
-                return np.median(self.flux[mask])
+                if np.any(mask):
+                    return np.nanmedian(self.flux[mask])
+                else:
+                    warnings.warn(f"No data points in {region_type} continuum range")
+                    return 0
             else:
-                # 数据不足时使用拟合谱
+                # Use fitted spectrum when data is insufficient
                 mask = (self.fit_wave >= wave_range[0]) & (self.fit_wave <= wave_range[1])
-                if not np.any(mask):
-                    return np.nan
-                return np.median(self.fit_flux[mask])
+                if np.any(mask):
+                    return np.nanmedian(self.fit_flux[mask])
+                else:
+                    warnings.warn(f"No fitted data points in {region_type} continuum range")
+                    return 0
         
         else:  # 'original'
             if not self._check_data_coverage(wave_range):
-                raise ValueError(f"原始数据不足以覆盖{region_type}端连续谱区域")
+                warnings.warn(f"Original data insufficient to cover {region_type} continuum region, returning 0")
+                return 0
             mask = (self.wave >= wave_range[0]) & (self.wave <= wave_range[1])
-            if not np.any(mask):
-                return np.nan
-            return np.median(self.flux[mask])
+            if np.any(mask):
+                return np.nanmedian(self.flux[mask])
+            else:
+                warnings.warn(f"No data points in {region_type} continuum range")
+                return 0
 
     def calculate_index(self, line_name, return_error=False):
         """
-        计算吸收线指数
+        Calculate absorption line index
         
         Parameters:
         -----------
         line_name : str
-            吸收线名称 ('Hbeta', 'Mgb', 等)
+            Absorption line name ('Hbeta', 'Mgb', 'Fe5015', etc.)
         return_error : bool
-            是否返回误差
+            Whether to return error
             
         Returns:
         --------
-        float : 吸收线指数值
-        float : 误差值（如果return_error=True）
+        float : Absorption line index value
+        float : Error value (if return_error=True)
         """
-        # D4000特殊处理
-        if line_name == 'D4000':
-            windows = self.define_line_windows(line_name)
-            if windows is None:
-                raise ValueError(f"未知的吸收线: {line_name}")
-                
-            # 计算蓝侧平均流量
-            blue_mask = (self.wave >= windows['blue'][0]) & (self.wave <= windows['blue'][1])
-            if not np.any(blue_mask):
-                return np.nan if not return_error else (np.nan, np.nan)
-            blue_flux = np.mean(self.flux[blue_mask])
-            
-            # 计算红侧平均流量
-            red_mask = (self.wave >= windows['red'][0]) & (self.wave <= windows['red'][1])
-            if not np.any(red_mask):
-                return np.nan if not return_error else (np.nan, np.nan)
-            red_flux = np.mean(self.flux[red_mask])
-            
-            # 计算D4000指数
-            d4000 = red_flux / blue_flux
-            
-            if return_error:
-                # 计算误差（简化近似）
-                blue_err = np.mean(self.error[blue_mask])
-                red_err = np.mean(self.error[red_mask])
-                rel_err = np.sqrt((blue_err/blue_flux)**2 + (red_err/red_flux)**2)
-                error = d4000 * rel_err
-                return d4000, error
-            return d4000
-        
-        # 获取窗口定义
+        # Get window definition
         windows = self.define_line_windows(line_name)
         if windows is None:
-            raise ValueError(f"未知的吸收线: {line_name}")
-
-        # 获取线心区域数据
-        line_mask = (self.wave >= windows['line'][0]) & (self.wave <= windows['line'][1])
-        line_wave = self.wave[line_mask]
-        line_flux = self.flux[line_mask]
-        line_err = self.error[line_mask]
-
-        # 检查数据点数
-        if len(line_flux) < 3:
+            warnings.warn(f"Unknown absorption line: {line_name}")
             return np.nan if not return_error else (np.nan, np.nan)
 
-        # 计算连续谱
-        blue_cont = self.calculate_pseudo_continuum(windows['blue'], None, 'blue')
-        red_cont = self.calculate_pseudo_continuum(windows['red'], None, 'red')
-        
-        if np.isnan(blue_cont) or np.isnan(red_cont):
-            return np.nan if not return_error else (np.nan, np.nan)
-        
-        wave_cont = np.array([
-            np.mean(windows['blue']), 
-            np.mean(windows['red'])
-        ])
-        flux_cont = np.array([blue_cont, red_cont])
-        
-        # 线性插值得到连续谱
-        f_interp = interpolate.interp1d(wave_cont, flux_cont)
-        cont_at_line = f_interp(line_wave)
+        # Get line region data
+        try:
+            line_mask = (self.wave >= windows['line'][0]) & (self.wave <= windows['line'][1])
+            line_wave = self.wave[line_mask]
+            line_flux = self.flux[line_mask]
+            line_err = self.error[line_mask]
 
-        # 计算积分
-        index = np.trapz((1.0 - line_flux/cont_at_line), line_wave)
-        
-        if return_error:
-            # 计算误差
-            error = np.sqrt(np.trapz((line_err/cont_at_line)**2, line_wave))
-            return index, error
-        
-        return index
+            # Check data points
+            if len(line_flux) < 3:
+                warnings.warn(f"Insufficient data points for {line_name} line region")
+                return np.nan if not return_error else (np.nan, np.nan)
 
-    def calculate_all_indices(self, return_errors=False):
-        """
-        计算所有定义的吸收线指数
-        
-        Parameters:
-        -----------
-        return_errors : bool
-            是否返回误差
+            # Calculate continuum
+            blue_cont = self.calculate_pseudo_continuum(windows['blue'], None, 'blue')
+            red_cont = self.calculate_pseudo_continuum(windows['red'], None, 'red')
             
+            # Check for valid continuum values
+            if blue_cont <= 0 or red_cont <= 0 or not np.isfinite(blue_cont) or not np.isfinite(red_cont):
+                warnings.warn(f"Invalid continuum values for {line_name}: blue={blue_cont}, red={red_cont}")
+                return np.nan if not return_error else (np.nan, np.nan)
+            
+            wave_cont = np.array([
+                np.mean(windows['blue']), 
+                np.mean(windows['red'])
+            ])
+            flux_cont = np.array([blue_cont, red_cont])
+            
+            # Linear interpolation for continuum
+            f_interp = interpolate.interp1d(wave_cont, flux_cont)
+            cont_at_line = f_interp(line_wave)
+
+            # Check for division by zero
+            if np.any(cont_at_line <= 0):
+                warnings.warn(f"Zero or negative continuum values at line wavelengths for {line_name}")
+                return np.nan if not return_error else (np.nan, np.nan)
+
+            # Calculate integral
+            index = np.trapz((1.0 - line_flux/cont_at_line), line_wave)
+            
+            if return_error:
+                # Calculate error
+                error = np.sqrt(np.trapz((line_err/cont_at_line)**2, line_wave))
+                return index, error
+            
+            return index
+        except Exception as e:
+            warnings.warn(f"Error calculating {line_name} index: {str(e)}")
+            return np.nan if not return_error else (np.nan, np.nan)
+    
+    def calculate_all_indices(self):
+        """
+        Calculate all defined spectral indices
+        
         Returns:
         --------
-        dict : 包含所有吸收线指数的字典
+        dict : Dictionary of index values
         """
-        # 获取所有定义的吸收线
-        all_windows = {
-            'Hbeta': self.define_line_windows('Hbeta'),
-            'Mgb': self.define_line_windows('Mgb'),
-            'Fe5015': self.define_line_windows('Fe5015'),
-            'Fe5270': self.define_line_windows('Fe5270'),
-            'Fe5335': self.define_line_windows('Fe5335'),
-            'D4000': self.define_line_windows('D4000'),
-            'Halpha': self.define_line_windows('Halpha')
-        }
-        
-        # 计算所有吸收线指数
-        indices = {}
-        for line_name in all_windows:
+        result = {}
+        for line_name in ['Hbeta', 'Mgb', 'Fe5015', 'Fe5270', 'Fe5335']:
             try:
-                if return_errors:
-                    index, error = self.calculate_index(line_name, return_error=True)
-                    indices[line_name] = {'value': index, 'error': error}
-                else:
-                    index = self.calculate_index(line_name)
-                    indices[line_name] = index
+                index = self.calculate_index(line_name)
+                if not np.isnan(index):
+                    result[line_name] = index
             except Exception as e:
-                if return_errors:
-                    indices[line_name] = {'value': np.nan, 'error': np.nan}
-                else:
-                    indices[line_name] = np.nan
+                logger.debug(f"Error calculating {line_name}: {str(e)}")
         
-        return indices
+        return result
 
     def plot_all_lines(self, mode=None, number=None, save_path=None, show_index=False):
         """
-        绘制包含所有谱线的完整图谱
+        Plot all spectral lines in a complete figure
         
         Parameters:
         -----------
         mode : str, optional
-            图像的模式，必须是'P2P'、'VNB'或'RDB'之一
+            Figure mode, must be one of 'P2P', 'VNB', 'RNB', or 'MUSE'
         number : int, optional
-            图像的编号，必须是整数
+            Figure number, must be an integer
         save_path : str, optional
-            图像保存的路径。如果提供，图像将被保存到该路径下
+            Path to save the figure. If provided, the figure will be saved there
         show_index : bool, optional
-            是否显示谱指数参数，默认为False
+            Whether to show index parameters, default is False
+            
+        Returns:
+        --------
+        fig, axes : Figure and Axes objects for further customization
         """
-        # 验证mode和number参数
+        # Validate mode and number parameters
         if mode is not None and number is not None:
-            valid_modes = ['P2P', 'VNB', 'RDB']
+            valid_modes = ['P2P', 'VNB', 'RNB', 'MUSE']
             if mode not in valid_modes:
-                raise ValueError(f"Mode must be one of {valid_modes}")
+                warnings.warn(f"Mode must be one of {valid_modes}, got {mode}")
+                mode = None
             if not isinstance(number, int):
-                raise ValueError("Number must be an integer")
-            mode_title = f"{mode}{number}"
+                warnings.warn(f"Number must be an integer, got {type(number)}")
+                number = 0
+            mode_title = f"{mode}{number}" if mode is not None else None
         else:
             mode_title = None
 
-        # 获取所有定义的谱线
-        all_windows = {
-            'Hbeta': self.define_line_windows('Hbeta'),
-            'Mgb': self.define_line_windows('Mgb'),
-            'Fe5015': self.define_line_windows('Fe5015')
-        }
+        # Get all defined spectral lines
+        all_windows = {name: self.define_line_windows(name) 
+                      for name in ['Hbeta', 'Mgb', 'Fe5015', 'Fe5270', 'Fe5335']
+                      if self.define_line_windows(name) is not None}
         
-        # 设置固定的X轴范围
+        # Set fixed X-axis range
         min_wave = 4800
         max_wave = 5250
         
-        # 创建图形和整体标题
+        # Create figure and overall title
         fig = plt.figure(figsize=(15, 12))
         if mode_title:
             fig.suptitle(mode_title, fontsize=16, y=0.95)
         
-        # 创建子图，调整高度比例以适应整体标题
+        # Create subplots, adjust height ratios to accommodate overall title
         gs = fig.add_gridspec(2, 1, height_ratios=[1, 1], hspace=0.2)
         ax1 = fig.add_subplot(gs[0])
         ax2 = fig.add_subplot(gs[1])
         
-        # 设置统一的颜色方案
+        # Set unified color scheme
         colors = {
             'blue': 'tab:blue',
             'line': 'tab:green',
             'red': 'tab:red',
-            'orig_cont': 'tab:orange',   # 原始光谱连续谱颜色（橙色）
-            'fit_cont': 'tab:green',     # 拟合光谱连续谱颜色（绿色）
-            'inactive_cont': 'gray'      # 未使用的连续谱颜色
+            'orig_cont': 'tab:orange',   # Original spectrum continuum color (orange)
+            'fit_cont': 'tab:green',     # Fitted spectrum continuum color (green)
+            'inactive_cont': 'gray'      # Inactive continuum color
         }
         
-        # 第一个面板：原始数据对比
+        # First panel: Original data comparison
         wave_mask = (self.wave >= min_wave) & (self.wave <= max_wave)
         fit_mask = (self.fit_wave >= min_wave) & (self.fit_wave <= max_wave)
         
-        # 计算y轴范围
-        if hasattr(self, 'em_flux_list') and self.em_flux_list is not None:
-            em_mask = (self.em_wave >= min_wave) & (self.em_wave <= max_wave)
-            flux_range = np.concatenate([self.flux[wave_mask], 
-                                      self.flux[wave_mask] + self.em_flux_list[em_mask] 
-                                       if np.any(em_mask) else []])
+        # Calculate y-axis range with improved error handling
+        if hasattr(self, 'em_flux_list'):
+            try:
+                em_flux_resampled = spectres(self.wave, self.em_wave, self.em_flux_list)
+                flux_range = self.flux[wave_mask] + em_flux_resampled[wave_mask]
+            except Exception as e:
+                flux_range = self.flux[wave_mask]
+                warnings.warn(f"Error resampling emission flux: {str(e)}")
         else:
             flux_range = self.flux[wave_mask]
-        
         fit_range = self.fit_flux[fit_mask]
         
-        y_min = min(np.nanmin(flux_range), np.nanmin(fit_range)) * 0.9
-        y_max = max(np.nanmax(flux_range), np.nanmax(fit_range)) * 1.1
+        # Ensure we have valid flux values
+        valid_flux = flux_range[np.isfinite(flux_range)]
+        valid_fit = fit_range[np.isfinite(fit_range)]
         
-        # 绘制光谱
-        if hasattr(self, 'em_flux_list') and self.em_flux_list is not None:
-            em_mask = (self.em_wave >= min_wave) & (self.em_wave <= max_wave)
-            if np.any(em_mask):
-                # 计算原始光谱（包含发射线）
-                orig_with_em = self.flux.copy()
-                em_flux_resampled = resample_spectrum(self.wave, self.em_wave, self.em_flux_list)
-                orig_with_em += em_flux_resampled
-                
-                ax1.plot(self.wave[wave_mask], orig_with_em[wave_mask], color='tab:blue', 
-                        label='Original Spectrum', alpha=0.8)
-                ax1.plot(self.em_wave[em_mask], self.em_flux_list[em_mask], color='tab:orange', 
-                        label='Emission Lines', alpha=0.8)
+        if len(valid_flux) > 0 and len(valid_fit) > 0:
+            y_min = min(np.nanmin(valid_flux), np.nanmin(valid_fit)) * 0.9
+            y_max = max(np.nanmax(valid_flux), np.nanmax(valid_fit)) * 1.1
         else:
-            ax1.plot(self.wave[wave_mask], self.flux[wave_mask], color='tab:blue', 
+            # Default y-axis range if valid data cannot be determined
+            y_min = -1
+            y_max = 1
+            warnings.warn("Could not determine valid flux range for plotting. Using default range.")
+        
+        # Ensure y_min and y_max are valid (not NaN or Inf)
+        if not np.isfinite(y_min) or not np.isfinite(y_max) or y_min >= y_max:
+            y_min = -1
+            y_max = 1
+            warnings.warn("Invalid y-axis limits detected. Using default range.")
+        
+        # Plot spectra
+        if hasattr(self, 'em_flux_list'):
+            try:
+                em_flux_resampled = spectres(self.wave, self.em_wave, self.em_flux_list)
+                if not np.all(np.isfinite(em_flux_resampled)):
+                    em_flux_resampled = np.zeros_like(self.wave)
+                ax1.plot(self.wave, self.flux + em_flux_resampled, color='tab:blue', 
+                        label='Original Spectrum', alpha=0.8)
+                ax1.plot(self.wave, em_flux_resampled, color='tab:orange', 
+                        label='Emission Lines', alpha=0.8)
+            except Exception as e:
+                ax1.plot(self.wave, self.flux, color='tab:blue', 
+                        label='Original Spectrum', alpha=0.8)
+                warnings.warn(f"Error plotting emission components: {str(e)}")
+        else:
+            ax1.plot(self.wave, self.flux, color='tab:blue', 
                     label='Original Spectrum', alpha=0.8)
-            
-        ax1.plot(self.fit_wave[fit_mask], self.fit_flux[fit_mask], color='tab:red', 
+        ax1.plot(self.fit_wave, self.fit_flux, color='tab:red', 
                 label='Template Fit', alpha=0.8)
         
-        # 为第二个面板计算y轴范围
+        # Calculate y-axis range for second panel with error handling
         processed_flux = self.flux[wave_mask]
         fit_flux_range = self.fit_flux[fit_mask]
-        y_min_processed = min(np.nanmin(processed_flux), np.nanmin(fit_flux_range)) * 0.9
-        y_max_processed = max(np.nanmax(processed_flux), np.nanmax(fit_flux_range)) * 1.1
         
-        # 第二个面板：处理后的光谱
-        ax2.plot(self.wave[wave_mask], self.flux[wave_mask], color='tab:blue', 
+        # Ensure valid data for plot limits
+        valid_proc = processed_flux[np.isfinite(processed_flux)]
+        valid_fit = fit_flux_range[np.isfinite(fit_flux_range)]
+        
+        if len(valid_proc) > 0 and len(valid_fit) > 0:
+            y_min_processed = min(np.nanmin(valid_proc), np.nanmin(valid_fit)) * 0.9
+            y_max_processed = max(np.nanmax(valid_proc), np.nanmax(valid_fit)) * 1.1
+        else:
+            y_min_processed = -1
+            y_max_processed = 1
+            warnings.warn("Could not determine valid flux range for processed panel. Using default range.")
+        
+        # Ensure valid limits
+        if not np.isfinite(y_min_processed) or not np.isfinite(y_max_processed) or y_min_processed >= y_max_processed:
+            y_min_processed = -1
+            y_max_processed = 1
+            warnings.warn("Invalid y-axis limits for processed panel. Using default range.")
+        
+        # Second panel: Processed spectrum
+        ax2.plot(self.wave, self.flux, color='tab:blue', 
                 label='Processed Spectrum', alpha=0.8)
-        ax2.plot(self.fit_wave[fit_mask], self.fit_flux[fit_mask], '--', color='tab:red',
+        ax2.plot(self.fit_wave, self.fit_flux, '--', color='tab:red',
                 label='Template Fit', alpha=0.8)
         
-        # 在两个面板中标记所有谱线区域
+        # Mark all spectral line regions in both panels
         for line_name, windows in all_windows.items():
             for panel in [ax1, ax2]:
-                # 标记蓝端、线心和红端区域
-                alpha = 0.2  # 恢复原来的透明度
-                # 只在图例中显示一次每种区域类型
-                if line_name == 'Hbeta':  # 第一个谱线用于图例
+                # Mark blue, line, and red regions
+                alpha = 0.2  # Transparency
+                # Only include in legend once for each region type
+                if line_name == list(all_windows.keys())[0]:  # First spectral line for legend
                     panel.axvspan(windows['blue'][0], windows['blue'][1], 
                                 alpha=alpha, color=colors['blue'], label='Blue window')
                     panel.axvspan(windows['line'][0], windows['line'][1], 
@@ -473,176 +494,177 @@ class LineIndexCalculator:
                     panel.axvspan(windows['red'][0], windows['red'][1], 
                                 alpha=alpha, color=colors['red'])
                 
-                # 添加文字标注到底部
+                # Add text annotation at the bottom
                 if panel == ax1:
                     y_text = y_min + 0.05 * (y_max - y_min)
                 else:
                     y_text = y_min_processed + 0.05 * (y_max_processed - y_min_processed)
                 
-                # 基础标签
+                # Basic label
                 panel.text(np.mean(windows['line']), y_text, line_name,
                         horizontalalignment='center', verticalalignment='top',
                         bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
                 
-                # 在第二个面板添加连续谱点
+                # Add continuum points in second panel
                 if panel == ax2:
-                    # 计算连续谱点
+                    # Calculate continuum points
                     blue_cont_orig = None
                     red_cont_orig = None
                     blue_cont_fit = None
                     red_cont_fit = None
                     
-                    # 检查是否可以使用原始光谱
-                    if self._check_data_coverage(windows['blue']):
-                        mask = (self.wave >= windows['blue'][0]) & (self.wave <= windows['blue'][1])
-                        if np.any(mask):
-                            blue_cont_orig = np.median(self.flux[mask])
-                    if self._check_data_coverage(windows['red']):
-                        mask = (self.wave >= windows['red'][0]) & (self.wave <= windows['red'][1])
-                        if np.any(mask):
-                            red_cont_orig = np.median(self.flux[mask])
+                    # Check if original spectrum can be used
+                    try:
+                        if self._check_data_coverage(windows['blue']):
+                            mask = (self.wave >= windows['blue'][0]) & (self.wave <= windows['blue'][1])
+                            if np.any(mask):
+                                blue_cont_orig = np.nanmedian(self.flux[mask])
+                        if self._check_data_coverage(windows['red']):
+                            mask = (self.wave >= windows['red'][0]) & (self.wave <= windows['red'][1])
+                            if np.any(mask):
+                                red_cont_orig = np.nanmedian(self.flux[mask])
+                    except Exception as e:
+                        warnings.warn(f"Error calculating original continuum: {str(e)}")
                     
-                    # 计算拟合光谱的连续谱点
-                    mask_blue = (self.fit_wave >= windows['blue'][0]) & (self.fit_wave <= windows['blue'][1])
-                    mask_red = (self.fit_wave >= windows['red'][0]) & (self.fit_wave <= windows['red'][1])
-                    if np.any(mask_blue):
-                        blue_cont_fit = np.median(self.fit_flux[mask_blue])
-                    if np.any(mask_red):
-                        red_cont_fit = np.median(self.fit_flux[mask_red])
+                    # Calculate fitted spectrum continuum points
+                    try:
+                        mask_blue = (self.fit_wave >= windows['blue'][0]) & (self.fit_wave <= windows['blue'][1])
+                        mask_red = (self.fit_wave >= windows['red'][0]) & (self.fit_wave <= windows['red'][1])
+                        if np.any(mask_blue):
+                            blue_cont_fit = np.nanmedian(self.fit_flux[mask_blue])
+                        if np.any(mask_red):
+                            red_cont_fit = np.nanmedian(self.fit_flux[mask_red])
+                    except Exception as e:
+                        warnings.warn(f"Error calculating fitted continuum: {str(e)}")
                     
-                    if blue_cont_fit is not None and red_cont_fit is not None:
-                        wave_cont = np.array([
-                            np.mean(windows['blue']), 
-                            np.mean(windows['red'])
-                        ])
+                    # Skip if we don't have valid continuum points
+                    if blue_cont_fit is None or red_cont_fit is None or not np.isfinite(blue_cont_fit) or not np.isfinite(red_cont_fit):
+                        continue
+                    
+                    wave_cont = np.array([
+                        np.mean(windows['blue']), 
+                        np.mean(windows['red'])
+                    ])
 
-                        # 根据计算模式决定哪个是活动的连续谱
-                        is_orig_active = (self.continuum_mode == 'original' or 
-                                        (self.continuum_mode == 'auto' and 
-                                        blue_cont_orig is not None and 
-                                        red_cont_orig is not None))
-                        
-                        # 绘制原始光谱连续谱点和线（如果存在）
-                        if blue_cont_orig is not None and red_cont_orig is not None:
-                            flux_cont_orig = np.array([blue_cont_orig, red_cont_orig])
-                            if not is_orig_active:
-                                # 非活动状态
-                                panel.plot(wave_cont, flux_cont_orig, '*', color=colors['inactive_cont'], 
-                                        markersize=10, alpha=0.5,
-                                        label='Original spectrum continuum (inactive)' if line_name == 'Hbeta' else '')
-                                panel.plot(wave_cont, flux_cont_orig, '--', color=colors['inactive_cont'], 
-                                        alpha=0.5)
-                            else:
-                                # 活动状态
-                                panel.plot(wave_cont, flux_cont_orig, '*', color=colors['orig_cont'], 
-                                        markersize=10, alpha=0.8,
-                                        label='Original spectrum continuum (orange)' if line_name == 'Hbeta' else '')
-                                panel.plot(wave_cont, flux_cont_orig, '--', color=colors['orig_cont'], 
-                                        alpha=0.8)
+                    # Determine which continuum is active based on calculation mode
+                    is_orig_active = (self.continuum_mode == 'original' or 
+                                    (self.continuum_mode == 'auto' and 
+                                    blue_cont_orig is not None and red_cont_orig is not None and
+                                    np.isfinite(blue_cont_orig) and np.isfinite(red_cont_orig)))
+                    
+                    # Plot original spectrum continuum points and line (if available)
+                    if blue_cont_orig is not None and red_cont_orig is not None and np.isfinite(blue_cont_orig) and np.isfinite(red_cont_orig):
+                        flux_cont_orig = np.array([blue_cont_orig, red_cont_orig])
+                        if not is_orig_active:
+                            # Inactive state
+                            panel.plot(wave_cont, flux_cont_orig, '*', color=colors['inactive_cont'], 
+                                    markersize=10, alpha=0.5,
+                                    label='Original spectrum continuum (inactive)' if line_name == list(all_windows.keys())[0] else '')
+                            panel.plot(wave_cont, flux_cont_orig, '--', color=colors['inactive_cont'], 
+                                    alpha=0.5)
+                        else:
+                            # Active state
+                            panel.plot(wave_cont, flux_cont_orig, '*', color=colors['orig_cont'], 
+                                    markersize=10, alpha=0.8,
+                                    label='Original spectrum continuum (orange)' if line_name == list(all_windows.keys())[0] else '')
+                            panel.plot(wave_cont, flux_cont_orig, '--', color=colors['orig_cont'], 
+                                    alpha=0.8)
 
-                        # 绘制拟合光谱连续谱点和线
+                    # Plot fitted spectrum continuum points and line
+                    if blue_cont_fit is not None and red_cont_fit is not None and np.isfinite(blue_cont_fit) and np.isfinite(red_cont_fit):
                         flux_cont_fit = np.array([blue_cont_fit, red_cont_fit])
                         if is_orig_active:
-                            # 非活动状态
+                            # Inactive state
                             panel.plot(wave_cont, flux_cont_fit, '*', color=colors['inactive_cont'], 
                                     markersize=10, alpha=0.5,
-                                    label='Template continuum (inactive)' if line_name == 'Hbeta' else '')
+                                    label='Template continuum (inactive)' if line_name == list(all_windows.keys())[0] else '')
                             panel.plot(wave_cont, flux_cont_fit, '--', color=colors['inactive_cont'], 
                                     alpha=0.5)
                         else:
-                            # 活动状态
+                            # Active state
                             panel.plot(wave_cont, flux_cont_fit, '*', color=colors['fit_cont'], 
                                     markersize=10, alpha=0.8,
-                                    label='Template continuum (green)' if line_name == 'Hbeta' else '')
+                                    label='Template continuum (green)' if line_name == list(all_windows.keys())[0] else '')
                             panel.plot(wave_cont, flux_cont_fit, '--', color=colors['fit_cont'], 
                                     alpha=0.8)
 
-                        # 添加原始谱计算的连续谱到图例
-                        if line_name == 'Hbeta':
-                            dummy_line = plt.Line2D([], [], color=colors['orig_cont'], linestyle='--', 
-                                                marker='*', markersize=10, alpha=0.8,
-                                                label='Original spectrum continuum (orange)')
-                            dummy_line2 = plt.Line2D([], [], color=colors['fit_cont'], linestyle='--', 
-                                                marker='*', markersize=10, alpha=0.8,
-                                                label='Template continuum (green)')
-                            panel.legend(handles=panel.get_legend_handles_labels()[0] + [dummy_line, dummy_line2],
-                                      labels=panel.get_legend_handles_labels()[1] + ['Original spectrum continuum (orange)', 
-                                                                                   'Template continuum (green)'])
-
-                        # 如果需要显示谱指数参数
-                        if show_index:
+                    # Show index parameters if requested
+                    if show_index:
+                        try:
+                            # Save current continuum_mode
+                            original_mode = self.continuum_mode
+                            
+                            # Calculate index using original spectrum
+                            self.continuum_mode = 'original'
                             try:
-                                # 保存当前的continuum_mode
-                                original_mode = self.continuum_mode
-                                
-                                # 计算原始光谱的指数值
-                                self.continuum_mode = 'original'
-                                try:
-                                    orig_index = self.calculate_index(line_name)
-                                    if np.isnan(orig_index):
-                                        orig_index = None
-                                except ValueError:
+                                orig_index = self.calculate_index(line_name)
+                                if np.isnan(orig_index):
                                     orig_index = None
-                                
-                                # 计算拟合光谱的指数值
-                                self.continuum_mode = 'fit'
+                            except Exception:
+                                orig_index = None
+                            
+                            # Calculate index using fitted spectrum
+                            self.continuum_mode = 'fit'
+                            try:
                                 fit_index = self.calculate_index(line_name)
                                 if np.isnan(fit_index):
                                     fit_index = None
-                                
-                                # 恢复原始的continuum_mode
-                                self.continuum_mode = original_mode
-                                
-                                # 计算文本位置
-                                base_y_text = y_text + 0.05 * (y_max_processed - y_min_processed)
-                                
-                                # 构建显示文本
-                                if orig_index is not None and fit_index is not None:
-                                    # 分别显示两个值
-                                    y_offset = 0.1 * (y_max_processed - y_min_processed)
-                                    
-                                    # 显示原始光谱的值（上面）
-                                    panel.text(np.mean(windows['line']), 
-                                            base_y_text + y_offset,
-                                            f"{orig_index:.3f}", 
-                                            color=colors['orig_cont'], 
-                                            horizontalalignment='center',
-                                            verticalalignment='bottom', 
-                                            fontsize='x-small',
-                                            bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
-                                    
-                                    # 显示拟合光谱的值（下面）
-                                    panel.text(np.mean(windows['line']), 
-                                            base_y_text + y_offset/2,
-                                            f"{fit_index:.3f}", 
-                                            color=colors['fit_cont'], 
-                                            horizontalalignment='center',
-                                            verticalalignment='bottom', 
-                                            fontsize='x-small',
-                                            bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
-                                    
-                                elif fit_index is not None:
-                                    # 只显示拟合光谱的值
-                                    fit_text = f"{fit_index:.3f}"
-                                    panel.text(np.mean(windows['line']), 
-                                            base_y_text + 0.02 * (y_max_processed - y_min_processed),
-                                            fit_text, 
-                                            color=colors['fit_cont'], 
-                                            horizontalalignment='center',
-                                            verticalalignment='bottom', 
-                                            fontsize='x-small',
-                                            bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
+                            except Exception:
+                                fit_index = None
                             
-                            except Exception as e:
-                                print(f"Error calculating index for {line_name}: {e}")
+                            # Restore original continuum_mode
+                            self.continuum_mode = original_mode
+                            
+                            # Calculate text position
+                            base_y_text = y_text + 0.05 * (y_max_processed - y_min_processed)
+                            
+                            # Build display text
+                            if orig_index is not None and fit_index is not None:
+                                # Show both values separately
+                                y_offset = 0.1 * (y_max_processed - y_min_processed)
+                                
+                                # Show original spectrum value (top)
+                                panel.text(np.mean(windows['line']), 
+                                        base_y_text + y_offset,
+                                        f"{orig_index:.3f}", 
+                                        color=colors['orig_cont'], 
+                                        horizontalalignment='center',
+                                        verticalalignment='bottom', 
+                                        fontsize='x-small',
+                                        bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
+                                
+                                # Show fitted spectrum value (bottom)
+                                panel.text(np.mean(windows['line']), 
+                                        base_y_text + y_offset/2,
+                                        f"{fit_index:.3f}", 
+                                        color=colors['fit_cont'], 
+                                        horizontalalignment='center',
+                                        verticalalignment='bottom', 
+                                        fontsize='x-small',
+                                        bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
+                                
+                            elif fit_index is not None:
+                                # Only show fitted spectrum value
+                                fit_text = f"{fit_index:.3f}"
+                                panel.text(np.mean(windows['line']), 
+                                        base_y_text + 0.02 * (y_max_processed - y_min_processed),
+                                        fit_text, 
+                                        color=colors['fit_cont'], 
+                                        horizontalalignment='center',
+                                        verticalalignment='bottom', 
+                                        fontsize='x-small',
+                                        bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
+                        
+                        except Exception as e:
+                            warnings.warn(f"Error calculating index for {line_name}: {e}")
         
-        # 设置两个面板的属性
+        # Set panel properties
         ax1.set_xlim(min_wave, max_wave)
         ax1.set_ylim(y_min, y_max)
         ax2.set_xlim(min_wave, max_wave)
         ax2.set_ylim(y_min_processed, y_max_processed)
         
-        # 设置两个面板的共同属性
+        # Set common properties for both panels
         for ax in [ax1, ax2]:
             ax.xaxis.set_minor_locator(AutoMinorLocator(5))
             ax.yaxis.set_minor_locator(AutoMinorLocator(5))
@@ -656,208 +678,95 @@ class LineIndexCalculator:
         ax1.set_title(f'Original Data Comparison (v={self.velocity:.1f} km/s)')
         ax2.set_title('Processed Spectrum with Continuum Fits')
         
-        # 调整布局
-        if mode_title:
-            plt.subplots_adjust(top=0.9, bottom=0.1, left=0.1, right=0.9, hspace=0.3)
-        else:
-            plt.subplots_adjust(top=0.95, bottom=0.1, left=0.1, right=0.9, hspace=0.3)
+        # Adjust layout
+        plt.tight_layout()
         
-        # 如果提供了保存路径，保存图像
+        # Save figure if path provided
         if save_path and mode_title:
-            # 确保save_path存在
+            # Ensure save_path exists
             if not os.path.exists(save_path):
                 os.makedirs(save_path)
             
-            # 构建完整的文件路径
+            # Build complete file path
             filepath = os.path.join(save_path, f"{mode_title}.pdf")
             
-            # 保存图像
-            plt.savefig(filepath, format='pdf', bbox_inches='tight')
-            print(f"Figure saved as: {filepath}")
+            try:
+                # Save figure
+                plt.savefig(filepath, format='pdf', bbox_inches='tight')
+                print(f"Figure saved as: {filepath}")
+            except Exception as e:
+                warnings.warn(f"Error saving figure: {str(e)}")
         
         return fig, [ax1, ax2]
 
 
-class WeightParser:
-    """解析拟合权重得到物理参数的类"""
-    
-    def __init__(self, template_path: Union[str, Path]) -> None:
-        """初始化 加载SSP模板
-        
-        Args:
-            template_path: SSP模板.npz文件路径
-        """
-        # 加载模板数据
-        data = np.load(template_path, allow_pickle=True)
-        self.ages = data['ages']      # 年龄数组 (25,)
-        self.metals = data['metals']  # 金属丰度数组 (6,)
-        
-        # 验证模板维度
-        if len(self.ages) != 25 or len(self.metals) != 6:
-            raise ValueError(
-                f"Invalid template dimensions: "
-                f"ages={len(self.ages)}, metals={len(self.metals)}"
-            )
-        
-        # 构建参数网格
-        age_grid, metal_grid = np.meshgrid(self.ages, self.metals, indexing='ij')
-        # age_grid shape: (25, 6), 每行相同的age值
-        # metal_grid shape: (25, 6), 每列相同的metal值
-        
-        # 将网格reshape为与模板相同的方式
-        self.age_vector = age_grid.reshape(-1)    # (150,)
-        self.metal_vector = metal_grid.reshape(-1)  # (150,)
-        
-        # 计算年龄的对数值
-        self.log_age_vector = np.log10(self.age_vector)
-    
-    def parse_weights(self, weights: Union[List[float], np.ndarray]) -> Tuple[float, float]:
-        """解析权重获取平均log(Age)和[M/H]
-        
-        Args:
-            weights: 拟合权重 (150,)
-            
-        Returns:
-            tuple: (mean_log_age, mean_metallicity)
-        """
-        # 验证权重长度
-        weights = np.array(weights)
-        if len(weights) != len(self.age_vector):
-            raise ValueError(f"Weights must have length {len(self.age_vector)}, got {len(weights)}")
-        
-        # 计算总权重
-        total_weight = np.sum(weights)
-        if total_weight <= 0:
-            raise ValueError("Total weight must be positive")
-        
-        # 直接用向量计算加权平均
-        mean_log_age = np.sum(self.log_age_vector * weights) / total_weight
-        mean_metallicity = np.sum(self.metal_vector * weights) / total_weight
-        
-        return mean_log_age, mean_metallicity
-    
-    def get_physical_params(self, weights: Union[List[float], np.ndarray]) -> dict:
-        """获取权重对应的所有物理参数"""
-        log_age, metal = self.parse_weights(weights)
-        
-        return {
-            'log_age': log_age,
-            'age': 10**log_age,
-            'metallicity': metal
-        }
-
-
-def calculate_indices_cube(
-    wavelength: np.ndarray,
-    cube: np.ndarray,
-    template_wave: np.ndarray,
-    template_cube: np.ndarray,
-    em_wave: Optional[np.ndarray] = None,
-    em_cube: Optional[np.ndarray] = None,
-    velocity_field: Optional[np.ndarray] = None,
-    indices: Optional[List[str]] = None,
-    continuum_mode: str = 'auto',
-    n_jobs: int = -1
-) -> Dict[str, np.ndarray]:
+def calculate_lick_indices(wave, flux, index_definitions=None, indices_list=None):
     """
-    计算数据立方体的谱指数
+    Calculate Lick indices for a single spectrum
     
     Parameters:
     -----------
-    wavelength: 波长数组
-    cube: 3D数据立方体 (波长, y, x)
-    template_wave: 模板波长数组
-    template_cube: 3D模板数据立方体 (波长, y, x)
-    em_wave: 发射线波长数组，可选
-    em_cube: 3D发射线数据立方体 (波长, y, x)，可选
-    velocity_field: 速度场 (y, x)，可选，用于速度修正
-    indices: 要计算的指数列表，默认计算所有
-    continuum_mode: 连续谱计算模式，'auto', 'fit', or 'original'
-    n_jobs: 并行任务数
-    
+    wave : ndarray
+        Wavelength array
+    flux : ndarray
+        Flux array
+    index_definitions : dict, optional
+        Index definition dictionary
+    indices_list : list of str, optional
+        List of indices to calculate
+        
     Returns:
     --------
-    谱指数字典，每个指数为2D数组
+    dict : Dictionary of index values
     """
-    from joblib import delayed
-    from utils.parallel import ParallelTqdm
-    
-    # 创建空索引计算器获取默认指数定义
-    dummy_calc = LineIndexCalculator(
-        wavelength, np.ones_like(wavelength),
-        template_wave, np.ones_like(template_wave)
+    # Create LineIndexCalculator
+    calculator = LineIndexCalculator(
+        wave=wave, 
+        flux=flux, 
+        fit_wave=wave, 
+        fit_flux=flux, 
+        continuum_mode='original'
     )
     
-    if indices is None:
-        # 获取所有定义的指数
-        test_windows = {
-            'Hbeta': dummy_calc.define_line_windows('Hbeta'),
-            'Mgb': dummy_calc.define_line_windows('Mgb'),
-            'Fe5015': dummy_calc.define_line_windows('Fe5015'),
-            'Fe5270': dummy_calc.define_line_windows('Fe5270'),
-            'Fe5335': dummy_calc.define_line_windows('Fe5335'),
-            'D4000': dummy_calc.define_line_windows('D4000'),
-            'Halpha': dummy_calc.define_line_windows('Halpha')
-        }
-        indices = [name for name, window in test_windows.items() if window is not None]
+    # Calculate all indices
+    return calculator.calculate_all_indices()
+
+
+def calculate_D4000(wave, flux):
+    """
+    Calculate 4000 Å break strength
     
-    # 获取数据立方体尺寸
-    nz, ny, nx = cube.shape
-    
-    # 初始化结果
-    results = {name: np.full((ny, nx), np.nan) for name in indices}
-    
-    # 定义单像素计算函数
-    def calculate_pixel(y, x):
-        if np.count_nonzero(~np.isnan(cube[:, y, x])) < 10:
-            return y, x, None
+    Parameters:
+    -----------
+    wave : ndarray
+        Wavelength array
+    flux : ndarray
+        Flux array
         
-        try:
-            # 获取当前像素的速度修正值
-            vel_corr = 0.0
-            if velocity_field is not None:
-                vel_corr = velocity_field[y, x]
-                if np.isnan(vel_corr):
-                    vel_corr = 0.0
-            
-            # 获取当前像素的发射线数据
-            em_flux = None
-            if em_wave is not None and em_cube is not None:
-                em_flux = em_cube[:, y, x]
-            
-            # 创建指数计算器
-            calculator = LineIndexCalculator(
-                wavelength, cube[:, y, x],
-                template_wave, template_cube[:, y, x],
-                em_wave=em_wave, em_flux_list=em_flux,
-                velocity_correction=vel_corr,
-                continuum_mode=continuum_mode
-            )
-            
-            # 计算所有指数
-            indices_values = {}
-            for index_name in indices:
-                try:
-                    indices_values[index_name] = calculator.calculate_index(index_name)
-                except Exception:
-                    indices_values[index_name] = np.nan
-                    
-            return y, x, indices_values
-        except Exception as e:
-            print(f"Error at pixel ({y}, {x}): {e}")
-            return y, x, None
+    Returns:
+    --------
+    float : D4000 value
+    """
+    # Define blue and red regions
+    blue_band = (3750.0, 3950.0)
+    red_band = (4050.0, 4250.0)
     
-    # 并行计算所有像素
-    parallel_results = ParallelTqdm(
-        n_jobs=n_jobs, desc="Computing spectral indices", total_tasks=ny*nx
-    )(delayed(calculate_pixel)(y, x) 
-      for y in range(ny) for x in range(nx))
-    
-    # 收集结果
-    for res in parallel_results:
-        y, x, values = res
-        if values is not None:
-            for name, value in values.items():
-                results[name][y, x] = value
-    
-    return results
+    # Find wavelength indices
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        
+        blue_idx = np.where((wave >= blue_band[0]) & (wave <= blue_band[1]))[0]
+        red_idx = np.where((wave >= red_band[0]) & (wave <= red_band[1]))[0]
+        
+        if len(blue_idx) == 0 or len(red_idx) == 0:
+            return np.nan
+        
+        # Calculate mean flux in blue and red regions
+        blue_flux = np.nanmean(flux[blue_idx])
+        red_flux = np.nanmean(flux[red_idx])
+        
+        # Calculate D4000 as ratio of red to blue flux
+        if blue_flux <= 0 or not np.isfinite(blue_flux) or not np.isfinite(red_flux):
+            return np.nan
+        
+        return red_flux / blue_flux
