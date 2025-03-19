@@ -5,6 +5,8 @@ Core data processing module for ISAPC
 import logging
 logger = logging.getLogger(__name__)
 
+
+import time
 import warnings
 import os
 from typing import Union, Dict, List, Tuple, Optional, Any
@@ -473,7 +475,7 @@ class MUSECube:
         ppxf_sig_init: float = 50.0,
         ppxf_deg: int = 8,
         n_jobs: int = -1,
-        verbose: bool = False
+        verbose: bool = True
     ) -> Dict[str, Any]:
         """
         Fit emission line components based on stellar template.
@@ -625,21 +627,33 @@ class MUSECube:
                         [vlim(2), [20, 300]],  # Stellar bounds
                         [vlim(2), [20, 100]]   # Gas bounds
                     ]
-                    # Call ppxf with appropriate parameters
+                    
+                    # Call ppxf with appropriate parameters and warning suppression
                     try:
-                        pp = ppxf(
-                            stars_gas_templates, galaxy_data, galaxy_noise, 
-                            self._vel_scale, start,
-                            moments=moments, degree=ppxf_deg, mdegree=-1,
-                            component=component, 
-                            gas_component=gas_component, 
-                            gas_names=gas_names, 
-                            lam=self._lambda_gal,
-                            lam_temp=sps.lam_temp,
-                            tied=tied,
-                            bounds=bounds,
-                            quiet=True
-                        )
+                        # Suppress warnings for division operations
+                        with warnings.catch_warnings():
+                            warnings.filterwarnings('ignore', category=RuntimeWarning, 
+                                                message='invalid value encountered in scalar divide')
+                            warnings.filterwarnings('ignore', category=RuntimeWarning, 
+                                                message='divide by zero encountered')
+                            
+                            # Ensure noise values are not zero to prevent division issues
+                            galaxy_noise = np.maximum(galaxy_noise, 1e-10)
+                            
+                            pp = ppxf(
+                                stars_gas_templates, galaxy_data, galaxy_noise, 
+                                self._vel_scale, start,
+                                moments=moments, degree=ppxf_deg, mdegree=-1,
+                                component=component, 
+                                gas_component=gas_component, 
+                                gas_names=gas_names, 
+                                lam=self._lambda_gal,
+                                lam_temp=sps.lam_temp,
+                                tied=tied,
+                                bounds=bounds,
+                                quiet=True
+                            )
+                            
                         # Extract results
                         # Calculate best-fit models for stellar and gas components
                         bestfit = pp.bestfit if hasattr(pp, 'bestfit') else np.zeros_like(galaxy_data)
@@ -658,16 +672,17 @@ class MUSECube:
                         
                         # Calculate stellar component (total - gas)
                         stellar_bestfit = bestfit - gas_bestfit
+                        
                         # Extract polynomial coefficients
                         if hasattr(pp, 'apoly'):
                             apoly = pp.apoly
+                        
+                        # Properly calculate optimal template with polynomial
                         apoly_se_2 = np.polyfit(self._lambda_gal, pp.apoly, 3)
                         NEL_cal_tmp = (stars_gas_templates[:,0] * pp.weights[0]) + np.poly1d(apoly_se_2)(sps.lam_temp)
-                        # Calculate stellar template + polynomial
-                        # NEL_cal_tmp = optimal_template.copy()  # Use optimal template as is
-                        # Process kinematics
+                        
                         # Get stellar and gas kinematic solutions
-                        stellar_sol = pp.sol if hasattr(pp, 'sol') else [vel_init, self._dispersion_field[i, j]]
+                        stellar_sol = [pp.sol[0][0],pp.sol[0][1]] if hasattr(pp, 'sol') else [vel_init, self._dispersion_field[i, j]]
                         
                         # Get gas kinematics
                         gas_sol = None
@@ -676,7 +691,8 @@ class MUSECube:
                         else:
                             # Try to extract from sol
                             if hasattr(pp, 'sol') and hasattr(pp, 'ncomp') and pp.ncomp > 1:
-                                gas_sol = pp.sol[1]  # Take the second component's solution
+                                gas_sol = [pp.sol[1][0],pp.sol[1][1]]  # Take the second component's solution
+                        
                         # Store results
                         result = {
                             'flux': pp.gas_flux if hasattr(pp, 'gas_flux') else None,
@@ -698,8 +714,7 @@ class MUSECube:
                 except Exception as e:
                     if verbose and idx % 100 == 0:  # Reduce log clutter
                         logger.warning(f"Error in emission line fitting for pixel ({i},{j}): {str(e)}")
-                    return i, j, None
-            
+                    return i, j, None            
             # Run fits in parallel
             fit_results = ParallelTqdm(
                 n_jobs=n_jobs, desc='Fitting emission lines', total_tasks=n_spaxel
@@ -723,15 +738,12 @@ class MUSECube:
                 # print(result['NEL_cal_tmp'].shape)
                 # print(self._optimal_tmpls.shape)
                 # Update optimal template if needed
-                print('AAAAAAA')
                 if 'NEL_cal_tmp' in result and result['NEL_cal_tmp'] is not None:
                     self._optimal_tmpls[:, row, col] = result['NEL_cal_tmp']
-                print('BBBBBBB')
                 # Update kinematics if needed
-                print(result['sol'][0].shape)
                 if 'sol' in result and result['sol'] is not None:
-                    self._velocity_field[row, col] = result['sol'][0][0]
-                    self._dispersion_field[row, col] = result['sol'][0][1]
+                    self._velocity_field[row, col] = result['sol'][0]
+                    self._dispersion_field[row, col] = result['sol'][1]
                 
                 # Save emission line flux and velocity information
                 if 'flux' in result and result['flux'] is not None:
@@ -751,7 +763,6 @@ class MUSECube:
             
             # Restore original log level
             logger.setLevel(original_level)
-            print('AAA')
             # Return result dictionary
             return {
                 'emission_flux': self._emission_flux,
@@ -787,7 +798,7 @@ class MUSECube:
             Number of parallel jobs
         verbose : bool, default=False
             Whether to display detailed information
-            
+                
         Returns
         -------
         dict
@@ -826,16 +837,6 @@ class MUSECube:
                     'band': (5160.125, 5192.625),
                     'red': (5191.375, 5206.375)
                 },
-                'Fe5270': {
-                    'blue': (5233.2, 5248.2),
-                    'band': (5245.7, 5285.7),
-                    'red': (5285.7, 5318.2)
-                },
-                'Fe5335': {
-                    'blue': (5304.6, 5315.9),
-                    'band': (5312.1, 5352.1),
-                    'red': (5353.4, 5363.4)
-                },
                 'Fe5015': {
                     'blue': (4946.500, 4977.750),
                     'band': (4977.750, 5054.000),
@@ -867,7 +868,7 @@ class MUSECube:
             
             # Check if we have emission line fitting results
             has_emission_lines = (self._gas_bestfit_field is not None and 
-                              np.any(~np.isnan(self._gas_bestfit_field)))
+                            np.any(~np.isnan(self._gas_bestfit_field)))
             
             # Store calculators for later plotting if needed
             self._index_calculators = {}
@@ -875,20 +876,22 @@ class MUSECube:
             n_wvl, n_spaxel = self._spectra.shape
             
             def calculate_index(idx):
-                """Calculate spectral indices for a single spaxel"""
+                """
+                Calculate spectral indices for a single spaxel
+                Optimized for better multiprocessing performance
+                """
                 i, j = np.unravel_index(idx, (self._n_y, self._n_x))
                 
-                # Skip if first-time fitting failed
+                # Skip if first-time fitting failed - quick early return
                 if np.isnan(self._velocity_field[i, j]):
                     return i, j, {index_name: np.nan for index_name in indices_list}
                 
-                # Get observed spectrum
+                # Get all data at once to minimize Python-level operations
                 observed_spectrum = self._spectra[:, idx]
-                
-                # Get optimal template on original wavelength grid - IMPORTANT
                 optimal_template = self._optimal_tmpls[:, i, j]
+                velocity = self._velocity_field[i, j]
                 
-                # Get gas model if available
+                # Get gas model if available - only once
                 gas_model = None
                 if has_emission_lines:
                     gas_model = self._gas_bestfit_field[:, i, j]
@@ -896,47 +899,60 @@ class MUSECube:
                     if not np.any(np.isfinite(gas_model)) or np.all(gas_model == 0):
                         gas_model = None
                 
-                # Create LineIndexCalculator with emission line info if available
-                try:
-                    calculator = LineIndexCalculator(
-                        wave=self._lambda_gal,           # Observation wavelength grid
-                        flux=observed_spectrum,          # Observed spectrum
-                        fit_wave=self._sps.lam_temp,     # Template wavelength grid
-                        fit_flux=optimal_template,       # Template spectrum
-                        em_wave=self._lambda_gal if gas_model is not None else None,  # Emission line wavelength grid
-                        em_flux_list=gas_model,    # Emission line spectrum
-                        velocity_correction=self._velocity_field[i, j],            # Velocity correction
-                        continuum_mode='auto'            # Auto select continuum mode
-                    )
-                except Exception as e:
-                    logger.debug(f"Error creating LineIndexCalculator at ({i},{j}): {str(e)}")
-                    return i, j, {index_name: np.nan for index_name in indices_list}
-                
-                # Calculate indices
-                indices_values = {}
-                for index_name in indices_list:
-                    try:
-                        index_value = calculator.calculate_index(index_name)
-                        indices_values[index_name] = index_value
-                    except Exception as e:
-                        logger.debug(f"Error calculating index {index_name} at ({i},{j}): {str(e)}")
-                        indices_values[index_name] = np.nan
-                
-                # Store calculator for this position if it's central
-                central_i, central_j = self._n_y // 2, self._n_x // 2
-                if i == central_i and j == central_j:
-                    self._index_calculators['central'] = calculator
-                
-                # Also store some sample positions for later plotting
-                if (i % (self._n_y // 4) == 0 and j % (self._n_x // 4) == 0):
-                    key = f"sample_{i}_{j}"
-                    self._index_calculators[key] = calculator
+                # Create LineIndexCalculator with warning suppression
+                with warnings.catch_warnings():
+                    warnings.filterwarnings('ignore', category=RuntimeWarning, 
+                                        message='invalid value encountered in')
+                    warnings.filterwarnings('ignore', category=RuntimeWarning, 
+                                        message='divide by zero')
                     
-                return i, j, indices_values
+                    try:
+                        calculator = LineIndexCalculator(
+                            wave=self._lambda_gal,           # Observation wavelength grid
+                            flux=observed_spectrum,          # Observed spectrum
+                            fit_wave=self._sps.lam_temp,     # Template wavelength grid
+                            fit_flux=optimal_template,       # Template spectrum
+                            em_wave=self._lambda_gal if gas_model is not None else None,  # Emission line wavelength grid
+                            em_flux_list=gas_model,    # Emission line spectrum
+                            velocity_correction=velocity,    # Velocity correction
+                            continuum_mode='auto'            # Auto select continuum mode
+                        )
+                    except Exception as e:
+                        logger.debug(f"Error creating LineIndexCalculator at ({i},{j}): {str(e)}")
+                        return i, j, {index_name: np.nan for index_name in indices_list}
+                    
+                    # Calculate all indices at once to minimize function calls
+                    indices_values = {}
+                    for index_name in indices_list:
+                        try:
+                            index_value = calculator.calculate_index(index_name)
+                            indices_values[index_name] = index_value
+                        except Exception as e:
+                            indices_values[index_name] = np.nan
+                    
+                    # Only store calculator for specific positions (central and some samples)
+                    # to reduce memory usage
+                    central_i, central_j = self._n_y // 2, self._n_x // 2
+                    if i == central_i and j == central_j:
+                        self._index_calculators['central'] = calculator
+                    elif (i % (self._n_y // 4) == 0 and j % (self._n_x // 4) == 0):
+                        key = f"sample_{i}_{j}"
+                        self._index_calculators[key] = calculator
+                    
+                    return i, j, indices_values
             
-            # Run calculations in parallel
+            # Calculate optimal chunk size for better parallelization
+            # This reduces thread management overhead
+            chunksize = max(1, n_spaxel // (4 * max(1, n_jobs if n_jobs > 0 else os.cpu_count())))
+            
+            logger.info(f"Using chunk size {chunksize} for spectral indices calculation")
+            
+            # Run calculations in parallel with optimized backend and chunk size
             index_results = ParallelTqdm(
-                n_jobs=n_jobs, desc='Calculating spectral indices', total_tasks=n_spaxel
+                n_jobs=n_jobs, 
+                desc='Calculating spectral indices', 
+                total_tasks=n_spaxel,
+                backend='threading'  # 'threading' often works better for I/O bound tasks
             )(delayed(calculate_index)(idx) for idx in range(n_spaxel))
             
             # Process results
@@ -958,6 +974,7 @@ class MUSECube:
             logger.error(f"Error calculating spectral indices: {str(e)}")
             logger.setLevel(original_level)
             return {}
+        
 
     def plot_spectral_indices(self, spaxel_position=None, mode="MUSE", number=0, save_path=None):
         """

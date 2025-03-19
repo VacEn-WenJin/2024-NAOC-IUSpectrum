@@ -21,10 +21,39 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# 添加警告消息控制
+SHOW_WARNINGS = False
+
+def set_warnings(show=True):
+    """
+    控制是否显示警告消息
+    
+    Parameters:
+    -----------
+    show : bool
+        如果为True，显示警告；如果为False，抑制警告
+    """
+    global SHOW_WARNINGS
+    SHOW_WARNINGS = show
+
+def warn(message, category=UserWarning):
+    """
+    根据全局设置发出警告
+    
+    Parameters:
+    -----------
+    message : str
+        警告消息
+    category : Warning, optional
+        警告类别，默认为UserWarning
+    """
+    if SHOW_WARNINGS:
+        warnings.warn(message, category)
+
 
 class LineIndexCalculator:
     def __init__(self, wave, flux, fit_wave, fit_flux, em_wave=None, em_flux_list=None, 
-                 velocity_correction=0, error=None, continuum_mode='auto'):
+                 velocity_correction=0, error=None, continuum_mode='auto', show_warnings=True):
         """
         Initialize the absorption line index calculator
         
@@ -51,9 +80,12 @@ class LineIndexCalculator:
             'auto': Use fitted spectrum only when original data is insufficient
             'fit': Always use fitted spectrum
             'original': Use original spectrum when possible (warn when insufficient)
+        show_warnings : bool, optional
+            Whether to show warnings from this calculator instance
         """
 
         self.Test_Mode = True # test 1 pixel.
+        self.show_warnings = show_warnings
 
         self.c = 299792.458  # Speed of light in km/s
         self.velocity = velocity_correction
@@ -66,7 +98,7 @@ class LineIndexCalculator:
         # Replace any NaN or Inf values with zeros
         if np.any(~np.isfinite(self.flux)):
             self.flux[~np.isfinite(self.flux)] = 0
-            warnings.warn("Non-finite values in flux array replaced with zeros")
+            self._warn("Non-finite values in flux array replaced with zeros")
         
         self.fit_wave = fit_wave
         self.fit_flux = fit_flux
@@ -75,7 +107,7 @@ class LineIndexCalculator:
         if np.any(~np.isfinite(self.fit_flux)):
             self.fit_flux = np.array(self.fit_flux, copy=True)
             self.fit_flux[~np.isfinite(self.fit_flux)] = 0
-            warnings.warn("Non-finite values in fitted flux array replaced with zeros")
+            self._warn("Non-finite values in fitted flux array replaced with zeros")
         
         self.error = error if error is not None else np.ones_like(flux)
         
@@ -88,9 +120,14 @@ class LineIndexCalculator:
             if np.any(~np.isfinite(self.em_flux_list)):
                 self.em_flux_list = np.array(self.em_flux_list, copy=True)
                 self.em_flux_list[~np.isfinite(self.em_flux_list)] = 0
-                warnings.warn("Non-finite values in emission flux array replaced with zeros")
+                self._warn("Non-finite values in emission flux array replaced with zeros")
                 
             self._subtract_emission_lines()
+    
+    def _warn(self, message, category=UserWarning):
+        """根据实例设置发出警告"""
+        if self.show_warnings and SHOW_WARNINGS:
+            warnings.warn(message, category)
     
     def _subtract_emission_lines(self):
         """
@@ -103,13 +140,13 @@ class LineIndexCalculator:
             
             # Verify the result is valid before subtraction
             if np.any(~np.isfinite(em_flux_resampled)):
-                warnings.warn("Non-finite values in resampled emission flux, replacing with zeros")
+                self._warn("Non-finite values in resampled emission flux, replacing with zeros")
                 em_flux_resampled[~np.isfinite(em_flux_resampled)] = 0
                 
             # Subtract emission lines from the original spectrum
             self.flux -= em_flux_resampled
         except Exception as e:
-            warnings.warn(f"Error subtracting emission lines: {str(e)}. Continuing without emission line subtraction.")
+            self._warn(f"Error subtracting emission lines: {str(e)}. Continuing without emission line subtraction.")
     
     def _apply_velocity_correction(self, wave):
         """
@@ -207,10 +244,10 @@ class LineIndexCalculator:
                 if np.any(mask):
                     return np.nanmedian(self.fit_flux[mask])
                 else:
-                    warnings.warn(f"No fitted data points in {region_type} continuum range")
+                    self._warn(f"No fitted data points in {region_type} continuum range")
                     return 0
             except Exception as e:
-                warnings.warn(f"Error calculating continuum from fitted spectrum: {str(e)}")
+                self._warn(f"Error calculating continuum from fitted spectrum: {str(e)}")
                 return 0
         
         elif self.continuum_mode == 'auto':
@@ -220,7 +257,7 @@ class LineIndexCalculator:
                 if np.any(mask):
                     return np.nanmedian(self.flux[mask])
                 else:
-                    warnings.warn(f"No data points in {region_type} continuum range")
+                    self._warn(f"No data points in {region_type} continuum range")
                     return 0
             else:
                 # Use fitted spectrum when data is insufficient
@@ -228,18 +265,18 @@ class LineIndexCalculator:
                 if np.any(mask):
                     return np.nanmedian(self.fit_flux[mask])
                 else:
-                    warnings.warn(f"No fitted data points in {region_type} continuum range")
+                    self._warn(f"No fitted data points in {region_type} continuum range")
                     return 0
         
         else:  # 'original'
             if not self._check_data_coverage(wave_range):
-                warnings.warn(f"Original data insufficient to cover {region_type} continuum region, returning 0")
+                self._warn(f"Original data insufficient to cover {region_type} continuum region, returning 0")
                 return 0
             mask = (self.wave >= wave_range[0]) & (self.wave <= wave_range[1])
             if np.any(mask):
                 return np.nanmedian(self.flux[mask])
             else:
-                warnings.warn(f"No data points in {region_type} continuum range")
+                self._warn(f"No data points in {region_type} continuum range")
                 return 0
 
     def calculate_index(self, line_name, return_error=False):
@@ -261,7 +298,7 @@ class LineIndexCalculator:
         # Get window definition
         windows = self.define_line_windows(line_name)
         if windows is None:
-            warnings.warn(f"Unknown absorption line: {line_name}")
+            self._warn(f"Unknown absorption line: {line_name}")
             return np.nan if not return_error else (np.nan, np.nan)
 
         # Get line region data
@@ -273,7 +310,7 @@ class LineIndexCalculator:
 
             # Check data points
             if len(line_flux) < 3:
-                warnings.warn(f"Insufficient data points for {line_name} line region")
+                self._warn(f"Insufficient data points for {line_name} line region")
                 return np.nan if not return_error else (np.nan, np.nan)
 
             # Calculate continuum
@@ -282,7 +319,7 @@ class LineIndexCalculator:
             
             # Check for valid continuum values
             if blue_cont <= 0 or red_cont <= 0 or not np.isfinite(blue_cont) or not np.isfinite(red_cont):
-                warnings.warn(f"Invalid continuum values for {line_name}: blue={blue_cont}, red={red_cont}")
+                self._warn(f"Invalid continuum values for {line_name}: blue={blue_cont}, red={red_cont}")
                 return np.nan if not return_error else (np.nan, np.nan)
             
             wave_cont = np.array([
@@ -297,7 +334,7 @@ class LineIndexCalculator:
 
             # Check for division by zero
             if np.any(cont_at_line <= 0):
-                warnings.warn(f"Zero or negative continuum values at line wavelengths for {line_name}")
+                self._warn(f"Zero or negative continuum values at line wavelengths for {line_name}")
                 return np.nan if not return_error else (np.nan, np.nan)
 
             # Calculate integral
@@ -310,7 +347,7 @@ class LineIndexCalculator:
             
             return index
         except Exception as e:
-            warnings.warn(f"Error calculating {line_name} index: {str(e)}")
+            self._warn(f"Error calculating {line_name} index: {str(e)}")
             return np.nan if not return_error else (np.nan, np.nan)
     
     def calculate_all_indices(self):
@@ -322,7 +359,9 @@ class LineIndexCalculator:
         dict : Dictionary of index values
         """
         result = {}
-        for line_name in ['Hbeta', 'Mgb', 'Fe5015', 'Fe5270', 'Fe5335']:
+        for line_name in ['Hbeta', 'Mgb', 'Fe5015'
+                        # , 'Fe5270', 'Fe5335'
+                        ]:
             try:
                 index = self.calculate_index(line_name)
                 if not np.isnan(index):
@@ -355,10 +394,10 @@ class LineIndexCalculator:
         if mode is not None and number is not None:
             valid_modes = ['P2P', 'VNB', 'RNB', 'MUSE']
             if mode not in valid_modes:
-                warnings.warn(f"Mode must be one of {valid_modes}, got {mode}")
+                self._warn(f"Mode must be one of {valid_modes}, got {mode}")
                 mode = None
             if not isinstance(number, int):
-                warnings.warn(f"Number must be an integer, got {type(number)}")
+                self._warn(f"Number must be an integer, got {type(number)}")
                 number = 0
             mode_title = f"{mode}{number}" if mode is not None else None
         else:
@@ -404,7 +443,7 @@ class LineIndexCalculator:
                 flux_range = self.flux[wave_mask] + em_flux_resampled[wave_mask]
             except Exception as e:
                 flux_range = self.flux[wave_mask]
-                warnings.warn(f"Error resampling emission flux: {str(e)}")
+                self._warn(f"Error resampling emission flux: {str(e)}")
         else:
             flux_range = self.flux[wave_mask]
         fit_range = self.fit_flux[fit_mask]
@@ -420,13 +459,13 @@ class LineIndexCalculator:
             # Default y-axis range if valid data cannot be determined
             y_min = -1
             y_max = 1
-            warnings.warn("Could not determine valid flux range for plotting. Using default range.")
+            self._warn("Could not determine valid flux range for plotting. Using default range.")
         
         # Ensure y_min and y_max are valid (not NaN or Inf)
         if not np.isfinite(y_min) or not np.isfinite(y_max) or y_min >= y_max:
             y_min = -1
             y_max = 1
-            warnings.warn("Invalid y-axis limits detected. Using default range.")
+            self._warn("Invalid y-axis limits detected. Using default range.")
         
         # Plot spectra
         if hasattr(self, 'em_flux_list'):
@@ -441,7 +480,7 @@ class LineIndexCalculator:
             except Exception as e:
                 ax1.plot(self.wave, self.flux, color='tab:blue', 
                         label='Original Spectrum', alpha=0.8)
-                warnings.warn(f"Error plotting emission components: {str(e)}")
+                self._warn(f"Error plotting emission components: {str(e)}")
         else:
             ax1.plot(self.wave, self.flux, color='tab:blue', 
                     label='Original Spectrum', alpha=0.8)
@@ -462,13 +501,13 @@ class LineIndexCalculator:
         else:
             y_min_processed = -1
             y_max_processed = 1
-            warnings.warn("Could not determine valid flux range for processed panel. Using default range.")
+            self._warn("Could not determine valid flux range for processed panel. Using default range.")
         
         # Ensure valid limits
         if not np.isfinite(y_min_processed) or not np.isfinite(y_max_processed) or y_min_processed >= y_max_processed:
             y_min_processed = -1
             y_max_processed = 1
-            warnings.warn("Invalid y-axis limits for processed panel. Using default range.")
+            self._warn("Invalid y-axis limits for processed panel. Using default range.")
         
         # Second panel: Processed spectrum
         ax2.plot(self.wave, self.flux, color='tab:blue', 
@@ -527,7 +566,7 @@ class LineIndexCalculator:
                             if np.any(mask):
                                 red_cont_orig = np.nanmedian(self.flux[mask])
                     except Exception as e:
-                        warnings.warn(f"Error calculating original continuum: {str(e)}")
+                        self._warn(f"Error calculating original continuum: {str(e)}")
                     
                     # Calculate fitted spectrum continuum points
                     try:
@@ -538,7 +577,7 @@ class LineIndexCalculator:
                         if np.any(mask_red):
                             red_cont_fit = np.nanmedian(self.fit_flux[mask_red])
                     except Exception as e:
-                        warnings.warn(f"Error calculating fitted continuum: {str(e)}")
+                        self._warn(f"Error calculating fitted continuum: {str(e)}")
                     
                     # Skip if we don't have valid continuum points
                     if blue_cont_fit is None or red_cont_fit is None or not np.isfinite(blue_cont_fit) or not np.isfinite(red_cont_fit):
@@ -659,7 +698,7 @@ class LineIndexCalculator:
                                         bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
                         
                         except Exception as e:
-                            warnings.warn(f"Error calculating index for {line_name}: {e}")
+                            self._warn(f"Error calculating index for {line_name}: {e}")
         
         # Set panel properties
         ax1.set_xlim(min_wave, max_wave)
@@ -698,12 +737,12 @@ class LineIndexCalculator:
                 plt.savefig(filepath, format='pdf', bbox_inches='tight')
                 print(f"Figure saved as: {filepath}")
             except Exception as e:
-                warnings.warn(f"Error saving figure: {str(e)}")
+                self._warn(f"Error saving figure: {str(e)}")
         
         return fig, [ax1, ax2]
 
 
-def calculate_lick_indices(wave, flux, index_definitions=None, indices_list=None):
+def calculate_lick_indices(wave, flux, index_definitions=None, indices_list=None, show_warnings=True):
     """
     Calculate Lick indices for a single spectrum
     
@@ -717,6 +756,8 @@ def calculate_lick_indices(wave, flux, index_definitions=None, indices_list=None
         Index definition dictionary
     indices_list : list of str, optional
         List of indices to calculate
+    show_warnings : bool, optional
+        Whether to show warnings
         
     Returns:
     --------
@@ -728,7 +769,8 @@ def calculate_lick_indices(wave, flux, index_definitions=None, indices_list=None
         flux=flux, 
         fit_wave=wave, 
         fit_flux=flux, 
-        continuum_mode='original'
+        continuum_mode='original',
+        show_warnings=show_warnings
     )
     
     # Calculate all indices
