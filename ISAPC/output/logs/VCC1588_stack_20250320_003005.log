@@ -1,0 +1,20 @@
+2025-03-20 00:30:05 - INFO - ISAPC analysis started, target: data/MUSE/VCC1588_stack.fits
+2025-03-20 00:30:05 - INFO - Parameters: redshift=0.0042, wavelength range=None, mode=ALL
+2025-03-20 00:30:06 - INFO - Data loaded in 0.3 seconds
+2025-03-20 00:30:06 - INFO - Using wavelength range: (4830.830511850229, 5206.632144991037)
+2025-03-20 00:30:06 - INFO - Automatically selected template: templates\spectra_emiles_9.0.npz
+2025-03-20 00:37:13 - ERROR - Error during analysis: setting an array element with a sequence. The requested array has an inhomogeneous shape after 1 dimensions. The detected shape was (10,) + inhomogeneous part.
+2025-03-20 00:37:13 - ERROR - Traceback (most recent call last):
+  File "E:\ProGram\Dr.Zheng\2024NAOC-IUS\Wkp\2024-NAOC-IUSpectrum\ISAPC\main.py", line 157, in main
+    run_rdb_analysis(args, cube, p2p_results)
+  File "E:\ProGram\Dr.Zheng\2024NAOC-IUS\Wkp\2024-NAOC-IUSpectrum\ISAPC\analysis\radial.py", line 191, in run_rdb_analysis
+    binned_data.save(output_dir / f"{galaxy_name}_RDB_binned_data.npz")
+  File "E:\ProGram\Dr.Zheng\2024NAOC-IUS\Wkp\2024-NAOC-IUSpectrum\ISAPC\binning.py", line 1181, in save
+    np.savez(
+  File "C:\ProgramData\Anaconda3\envs\Ast_py_311\Lib\site-packages\numpy\lib\_npyio_impl.py", line 683, in savez
+    _savez(file, args, kwds, False, allow_pickle=allow_pickle)
+  File "C:\ProgramData\Anaconda3\envs\Ast_py_311\Lib\site-packages\numpy\lib\_npyio_impl.py", line 793, in _savez
+    val = np.asanyarray(val)
+          ^^^^^^^^^^^^^^^^^^
+ValueError: setting an array element with a sequence. The requested array has an inhomogeneous shape after 1 dimensions. The detected shape was (10,) + inhomogeneous part.
+

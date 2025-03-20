@@ -3,549 +3,1551 @@ Spectral Binning Tools - Support for Voronoi binning and radial binning
 """
 import numpy as np
 import warnings
-from typing import Tuple, Dict, Optional, Union, List
+import logging
+from typing import Tuple, Dict, Optional, Union, List, Any
+import matplotlib.pyplot as plt
+from pathlib import Path
+import pandas as pd
+from matplotlib.ticker import AutoMinorLocator
 
-from vorbin.voronoi_2d_binning import voronoi_2d_binning
-from utils.parallel import ParallelTqdm
-from joblib import delayed
-from utils.calc import resample_spectrum, spectres
+logger = logging.getLogger(__name__)
 
-class VoronoiBinning:
-    """Class for Voronoi binning algorithm-based spectral binning"""
+# Constants
+C_KMS = 299792.458  # Speed of light in km/s
+
+def make_bins(wavs):
+    """Given wavelength points, find edges and widths of wavelength bins."""
+    edges = np.zeros(wavs.shape[0]+1)
+    widths = np.zeros(wavs.shape[0])
+    edges[0] = wavs[0] - (wavs[1] - wavs[0])/2
+    widths[-1] = (wavs[-1] - wavs[-2])
+    edges[-1] = wavs[-1] + (wavs[-1] - wavs[-2])/2
+    edges[1:-1] = (wavs[1:] + wavs[:-1])/2
+    widths[:-1] = edges[1:-1] - edges[:-2]
+    return edges, widths
+
+def spectres(new_wavs, spec_wavs, spec_fluxes, spec_errs=None, fill=None, verbose=True):
+    """
+    Resamples spectra (and optionally associated uncertainties) onto a new wavelength basis.
     
-    def __init__(
-        self,
-        x: np.ndarray,
-        y: np.ndarray,
-        signal: np.ndarray,
-        noise: np.ndarray,
-        wavelength: np.ndarray,
-        spectra: np.ndarray,
-        shape: Tuple[int, int],
-        pixelsize: float = 1.0
-    ):
-        """
-        Initialize Voronoi binning
+    Parameters
+    ----------
+    new_wavs : numpy.ndarray
+        Array containing the new wavelength sampling desired for the spectrum or spectra.
+    spec_wavs : numpy.ndarray
+        1D array containing the current wavelength sampling of the spectrum or spectra.
+    spec_fluxes : numpy.ndarray
+        Array containing spectral fluxes at the wavelengths specified in spec_wavs,
+        last dimension must correspond to the shape of spec_wavs.
+    spec_errs : numpy.ndarray (optional)
+        Array of the same shape as spec_fluxes containing uncertainties.
+    fill : float (optional)
+        Value to use outside the original wavelength range.
+    verbose : bool (optional)
+        Whether to show warnings.
+
+    Returns
+    -------
+    new_fluxes : numpy.ndarray
+        Array of resampled flux values.
+    new_errs : numpy.ndarray (optional)
+        Array of uncertainties associated with fluxes in new_fluxes.
+    """
+    # Implementation borrowed from spectres package
+    old_wavs = spec_wavs
+    old_fluxes = spec_fluxes
+    old_errs = spec_errs
+
+    # Make arrays of edge positions and widths for the old and new bins
+    old_edges, old_widths = make_bins(old_wavs)
+    new_edges, new_widths = make_bins(new_wavs)
+
+    # Generate output arrays to be populated
+    new_fluxes = np.zeros(old_fluxes[..., 0].shape + new_wavs.shape)
+
+    if old_errs is not None:
+        if old_errs.shape != old_fluxes.shape:
+            raise ValueError("If specified, spec_errs must be the same shape as spec_fluxes.")
+        else:
+            new_errs = np.copy(new_fluxes)
+
+    start = 0
+    stop = 0
+
+    # Calculate new flux and uncertainty values, looping over new bins
+    for j in range(new_wavs.shape[0]):
+        # Add filler values if new_wavs extends outside of spec_wavs
+        if (new_edges[j] < old_edges[0]) or (new_edges[j+1] > old_edges[-1]):
+            new_fluxes[..., j] = fill
+
+            if spec_errs is not None:
+                new_errs[..., j] = fill
+            continue
+
+        # Find first old bin which is partially covered by the new bin
+        while old_edges[start+1] <= new_edges[j]:
+            start += 1
+
+        # Find last old bin which is partially covered by the new bin
+        while old_edges[stop+1] < new_edges[j+1]:
+            stop += 1
+
+        # If new bin is fully inside an old bin, use the old bin value
+        if stop == start:
+            new_fluxes[..., j] = old_fluxes[..., start]
+            if old_errs is not None:
+                new_errs[..., j] = old_errs[..., start]
+        else:
+            # Calculate proportional overlap with first and last old bins
+            start_factor = ((old_edges[start+1] - new_edges[j]) / 
+                           (old_edges[start+1] - old_edges[start]))
+            end_factor = ((new_edges[j+1] - old_edges[stop]) / 
+                         (old_edges[stop+1] - old_edges[stop]))
+
+            # Adjust old bin widths by overlap factor
+            old_widths[start] *= start_factor
+            old_widths[stop] *= end_factor
+
+            # Populate new_fluxes spectrum and uncertainty arrays
+            f_widths = old_widths[start:stop+1] * old_fluxes[..., start:stop+1]
+            new_fluxes[..., j] = np.sum(f_widths, axis=-1)
+            new_fluxes[..., j] /= np.sum(old_widths[start:stop+1])
+
+            if old_errs is not None:
+                e_wid = old_widths[start:stop+1] * old_errs[..., start:stop+1]
+                new_errs[..., j] = np.sqrt(np.sum(e_wid**2, axis=-1))
+                new_errs[..., j] /= np.sum(old_widths[start:stop+1])
+
+            # Restore the old bin widths
+            old_widths[start] /= start_factor
+            old_widths[stop] /= end_factor
+
+    # Return both flux and error if errors were provided
+    if old_errs is not None:
+        return new_fluxes, new_errs
+    else:
+        return new_fluxes
+
+def apply_velocity_shift(spectrum, wavelength, velocity):
+    """
+    Apply a velocity shift to a spectrum.
+    
+    Parameters
+    ----------
+    spectrum : numpy.ndarray
+        Spectrum flux values.
+    wavelength : numpy.ndarray
+        Wavelength array.
+    velocity : float
+        Velocity shift in km/s.
         
-        Parameters
-        ----------
-        x : ndarray
-            Pixel x coordinate array
-        y : ndarray
-            Pixel y coordinate array
-        signal : ndarray
-            Signal strength array
-        noise : ndarray
-            Noise strength array
-        wavelength : ndarray
-            Wavelength array
-        spectra : ndarray
-            All pixel spectra array (wavelength, n_pixels) 
-        shape : tuple
-            Original image shape (n_y, n_x)
-        pixelsize : float, default=1.0
-            Pixel size (arcsec)
-        """
-        self.x = x
-        self.y = y
-        self.signal = signal
-        self.noise = noise
-        self.wavelength = wavelength
+    Returns
+    -------
+    numpy.ndarray
+        Velocity-shifted spectrum.
+    """
+    shifted_wavelength = wavelength / (1 + velocity/C_KMS)
+    return spectres(wavelength, shifted_wavelength, spectrum, fill=0.0)
+
+def run_voronoi_binning(x, y, signal, noise, target_snr, plot=False, quiet=True, cvt=True):
+    """
+    Run Voronoi binning algorithm.
+    
+    Parameters
+    ----------
+    x, y : array_like
+        Coordinates of the pixels.
+    signal : array_like
+        Signal at each pixel.
+    noise : array_like
+        Noise at each pixel.
+    target_snr : float
+        Target signal-to-noise ratio for the bins.
+    plot : bool, optional
+        Whether to plot the bins.
+    quiet : bool, optional
+        Whether to suppress information.
+    cvt : bool, optional
+        Whether to use centroidal Voronoi tessellation.
+        
+    Returns
+    -------
+    tuple
+        (bin_num, x_gen, y_gen, sn, n_pixels, scale)
+    """
+    try:
+        from vorbin.voronoi_2d_binning import voronoi_2d_binning
+        result = voronoi_2d_binning(
+            x, y, signal, noise, target_snr, 
+            plot=plot, quiet=quiet, cvt=cvt
+        )
+        
+        # Check how many values are returned and handle appropriately
+        if isinstance(result, tuple):
+            if len(result) == 6:
+                # Standard return: bin_num, x_gen, y_gen, sn, n_pixels, scale
+                return result
+            elif len(result) > 6:
+                # Some versions return extra values we don't need
+                bin_num, x_gen, y_gen, sn, n_pixels, scale = result[:6]
+                return bin_num, x_gen, y_gen, sn, n_pixels, scale
+            else:
+                # Not enough values returned
+                logger.warning(f"Unexpected number of return values from voronoi_2d_binning: {len(result)}")
+                raise ValueError("Voronoi binning returned insufficient values")
+        else:
+            # Single return value (likely just bin_num)
+            bin_num = result
+            # Create sensible defaults for other values
+            unique_bins = np.unique(bin_num)
+            x_gen = np.zeros(len(unique_bins))
+            y_gen = np.zeros(len(unique_bins))
+            sn = np.ones(len(unique_bins)) * target_snr
+            n_pixels = np.ones(len(unique_bins))
+            scale = 1.0
+            
+            # Calculate bin centers and statistics
+            for i, bin_id in enumerate(unique_bins):
+                mask = bin_num == bin_id
+                if np.any(mask):
+                    x_gen[i] = np.mean(x[mask])
+                    y_gen[i] = np.mean(y[mask])
+                    n_pixels[i] = np.sum(mask)
+            
+            return bin_num, x_gen, y_gen, sn, n_pixels, scale
+            
+    except ImportError:
+        logger.error("vorbin package not found. Please install with 'pip install vorbin'")
+        raise
+
+def calculate_radial_bins(x, y, center_x=0, center_y=0, pa=0, ellipticity=0, 
+                         n_rings=10, log_spacing=False):
+    """
+    Calculate radial bins for a set of coordinates.
+    
+    Parameters
+    ----------
+    x, y : array_like
+        Coordinates of the pixels.
+    center_x, center_y : float, optional
+        Center coordinates.
+    pa : float, optional
+        Position angle in degrees.
+    ellipticity : float, optional
+        Ellipticity (0-1).
+    n_rings : int, optional
+        Number of rings.
+    log_spacing : bool, optional
+        Whether to use logarithmic spacing.
+        
+    Returns
+    -------
+    tuple
+        (bin_num, bin_edges, bin_radii)
+    """
+    # Convert PA to radians
+    pa_rad = np.radians(pa)
+    
+    # Calculate relative coordinates
+    x_rel = x - center_x
+    y_rel = y - center_y
+    
+    # Rotate coordinates to align with position angle
+    x_rot = x_rel * np.cos(pa_rad) + y_rel * np.sin(pa_rad)
+    y_rot = -x_rel * np.sin(pa_rad) + y_rel * np.cos(pa_rad)
+    
+    # Apply ellipticity (convert to semi-major axis)
+    if ellipticity > 0:
+        a = np.sqrt(x_rot**2 + (y_rot / (1 - ellipticity))**2)
+    else:
+        a = np.sqrt(x_rot**2 + y_rot**2)
+    
+    # Determine bin edges
+    max_radius = np.max(a)
+    min_radius = np.min(a) if np.min(a) > 0 else max_radius / (n_rings * 10)  # Avoid zero
+    
+    if log_spacing:
+        # Logarithmic spacing (better for galaxy centers)
+        bin_edges = np.logspace(np.log10(min_radius), np.log10(max_radius), n_rings+1)
+    else:
+        # Linear spacing
+        bin_edges = np.linspace(0, max_radius, n_rings+1)
+    
+    # Assign each pixel to a bin
+    bin_num = np.zeros_like(a, dtype=int)
+    bin_radii = []
+    
+    for i in range(n_rings):
+        if i == 0:
+            # First bin includes everything less than the first edge
+            mask = (a < bin_edges[1])
+        elif i == n_rings - 1:
+            # Last bin includes everything greater than or equal to the last edge
+            mask = (a >= bin_edges[i])
+        else:
+            # Middle bins include everything between edges
+            mask = (a >= bin_edges[i]) & (a < bin_edges[i+1])
+        
+        bin_num[mask] = i
+        if np.any(mask):
+            bin_radii.append(np.mean(a[mask]))
+        else:
+            bin_radii.append((bin_edges[i] + bin_edges[i+1]) / 2)
+    
+    return bin_num, bin_edges, np.array(bin_radii)
+
+class BinnedSpectra:
+    """
+    Class to hold binned spectra and related data.
+    
+    Attributes
+    ----------
+    bin_type : str
+        Type of binning ('voronoi' or 'radial')
+    bin_num : numpy.ndarray
+        Bin assignment for each spaxel
+    bin_indices : list
+        List of arrays containing indices of spaxels in each bin
+    spectra : numpy.ndarray
+        Binned spectra, shape (n_wavelength, n_bins)
+    wavelength : numpy.ndarray
+        Wavelength array
+    metadata : dict
+        Additional metadata
+    """
+    
+    def __init__(self, bin_type, bin_num, bin_indices, spectra, wavelength, metadata=None):
+        """Initialize with binned data."""
+        self.bin_type = bin_type
+        self.bin_num = bin_num
+        self.bin_indices = bin_indices
         self.spectra = spectra
-        self.shape = shape
-        self.pixelsize = pixelsize
+        self.wavelength = wavelength
+        self.metadata = metadata if metadata is not None else {}
         
-        # Calculate SNR
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            self.snr = np.zeros_like(signal)
-            valid_mask = noise > 0
-            self.snr[valid_mask] = signal[valid_mask] / noise[valid_mask]
-        
-        # Initialize result storage
-        self.bin_number = None
-        self.bin_signal = None
-        self.bin_noise = None
-        self.bin_spectrum = None
-        self.bin_snr = None
-        self.bin_x = None
-        self.bin_y = None
-        self.bin_npixels = None
-        self.binned_spectra = None
+        # Number of bins
+        self.n_bins = len(bin_indices)
     
-    def compute_bins(self, target_snr: float, quiet: bool = True) -> Dict:
+    def to_p2p_compatible(self, cube):
         """
-        Compute Voronoi binning
+        Convert to P2P-compatible format.
         
         Parameters
         ----------
-        target_snr : float
-            Target signal-to-noise ratio
-        quiet : bool, default=True
-            Whether to display detailed information
+        cube : MUSECube
+            Original data cube
             
         Returns
         -------
         dict
-            Binning result dictionary
+            Dictionary containing pseudo-cube data that can be processed by P2P functions
         """
-        # Use only valid pixels
-        valid_mask = (self.snr > 0) & np.isfinite(self.snr)
-        x = self.x[valid_mask]
-        y = self.y[valid_mask]
-        signal = self.signal[valid_mask]
-        noise = self.noise[valid_mask]
+        # Create a fake cube with shape (n_wavelength, 1, n_bins)
+        fake_cube = np.zeros((self.spectra.shape[0], 1, self.spectra.shape[1]))
+        fake_cube[:, 0, :] = self.spectra
         
-        if len(x) < 10:
-            raise ValueError("Not enough valid pixels for binning")
+        # Create fake cube variance (constant for now)
+        fake_variance = np.ones_like(fake_cube)
         
-        # Perform Voronoi binning
-        try:
-            bin_number, x_gen, y_gen, bin_x, bin_y, bin_snr, bin_npixels, scale = voronoi_2d_binning(
-                x, y, signal, noise, target_snr,
-                pixelsize=self.pixelsize, plot=False, quiet=quiet,
-                cvt=True, wvt=True
-            )
-        except Exception as e:
-            # Handle errors in the Voronoi algorithm
-            warnings.warn(f"Error in Voronoi binning: {str(e)}. Using simple binning.")
-            
-            # Simple radial binning as fallback
-            bin_number = np.zeros_like(x, dtype=int)
-            bin_x = np.array([np.mean(x)])
-            bin_y = np.array([np.mean(y)])
-            bin_snr = np.array([np.mean(signal/noise)])
-            bin_npixels = np.array([len(x)])
+        # Create fake SNR map
+        snr_map = np.ones((1, self.n_bins))
+        if 'sn' in self.metadata:
+            snr_map[0, :] = self.metadata['sn']
         
-        # Save binning results
-        self.bin_number = bin_number
-        self.bin_x = bin_x
-        self.bin_y = bin_y
-        self.bin_snr = bin_snr
-        self.bin_npixels = bin_npixels
-        
-        # Create binning index mapping
-        bin_map = np.full(self.shape, -1)
-        valid_idx = np.where(valid_mask)[0]
-        
-        # Map bin numbers back to original 2D grid
-        row = self.y.astype(int)
-        col = self.x.astype(int)
-        
-        for i, bin_idx in enumerate(bin_number):
-            pixel_idx = valid_idx[i]
-            r = row[pixel_idx]
-            c = col[pixel_idx]
-            
-            # Ensure indices are within valid range
-            if 0 <= r < self.shape[0] and 0 <= c < self.shape[1]:
-                bin_map[r, c] = bin_idx
-        
-        # Return bin results
-        return {
-            'bin_map': bin_map,
-            'n_bins': int(np.max(bin_number)) + 1 if len(bin_number) > 0 else 0,
-            'bin_x': bin_x,
-            'bin_y': bin_y,
-            'bin_snr': bin_snr,
-            'bin_npixels': bin_npixels
-        }
-    
-    def extract_binned_spectra(
-        self, 
-        bin_map: np.ndarray,
-        velocity_field: Optional[np.ndarray] = None
-    ) -> Dict[int, np.ndarray]:
-        """
-        Extract combined spectra after binning
-        
-        Parameters
-        ----------
-        bin_map : ndarray
-            Binning index mapping
-        velocity_field : ndarray, optional
-            Velocity field, for spectrum alignment correction
-            
-        Returns
-        -------
-        dict
-            Dictionary of binned spectra, keys are bin indices
-        """
-        # Calculate bin pixels
-        n_bins = int(np.max(bin_map)) + 1
-        binned_spectra = {}
-        binned_errors = {}
-        
-        # Recalculate row/column indices
-        n_y, n_x = self.shape
-        row = (self.y + 0.5).astype(int)  # +0.5 for rounding
-        col = (self.x + 0.5).astype(int)
-        
-        # Collect spectra for each bin
-        for bin_idx in range(n_bins):
-            # Find all pixels in this bin
-            pixel_indices = []
-            for i, (r, c) in enumerate(zip(row, col)):
-                # Ensure indices are within valid range
-                if 0 <= r < n_y and 0 <= c < n_x and bin_map[r, c] == bin_idx:
-                    pixel_indices.append(i)
-            
-            if not pixel_indices:
-                continue
+        # Create class with necessary attributes for P2P functions
+        class PseudoCube:
+            def __init__(self, orig_cube, fake_cube_data, spectra_obj):
+                # Don't call parent initializer
+                self._initialized = True
                 
-            # Get spectra
-            bin_spectra = self.spectra[:, pixel_indices]
-            
-            # If velocity field provided, align spectra
-            if velocity_field is not None:
+                # Copy needed attributes from original cube
+                self._redshift = orig_cube._redshift
+                self._wvl_air_angstrom_range = orig_cube._wvl_air_angstrom_range
+                
+                # Copy FWHM and pixel size attributes - using correct attribute names from MUSECube
+                self._FWHM_gal = orig_cube._FWHM_gal if hasattr(orig_cube, '_FWHM_gal') else 1.0
+                self._pxl_size_x = orig_cube._pxl_size_x if hasattr(orig_cube, '_pxl_size_x') else 0.2
+                self._pxl_size_y = orig_cube._pxl_size_y if hasattr(orig_cube, '_pxl_size_y') else 0.2
+                
+                # Set data from fake cube
+                self.cube = fake_cube_data
+                self.cubevar = fake_variance
+                self.wave = spectra_obj.wavelength
+                self._lambda_gal = spectra_obj.wavelength
+                
+                # Set dimensions
+                self._n_y = self.cube.shape[1]
+                self._n_x = self.cube.shape[2]
+                
+                # Setup for ppxf
+                self._spectra = spectra_obj.spectra
+                self._spectra_2d = spectra_obj.spectra  # Flattened version
+                self._ln_lambda_gal = np.log(self.wave)
+                
+                # Calculate velocity scale
+                c = 299792.458
+                dlambda = np.min(np.diff(self.wave))
+                self.velscale = c * dlambda / self.wave[0]
+                self._vel_scale = self.velscale
+                
+                # These are needed when running ppxf
+                self._n_wave_fit = len(self.wave)
+                
+                # Keep bin information
+                self.bin_num = spectra_obj.bin_num
+                self.bin_indices = spectra_obj.bin_indices
+                self.bin_metadata = spectra_obj.metadata
+                
+                # Initialize result fields exactly as in MUSECube
+                self._velocity_field = np.full((self._n_y, self._n_x), np.nan)
+                self._dispersion_field = np.full((self._n_y, self._n_x), np.nan)
+                self._bestfit_field = np.full((self._n_wave_fit, self._n_y, self._n_x), np.nan)
+                self._optimal_tmpls = None
+                self._template_weights = None
+                self._poly_coeffs = None
+                self._sps = None
+                
+                # For emission lines
+                self._emission_flux = {}
+                self._emission_vel = {}
+                self._emission_sig = {}
+                self._gas_bestfit_field = None
+                self._emission_wavelength = {}
+                
+                # For spectral indices
+                self._spectral_indices = {}
+                self._index_calculators = {}
+                
+                # Save original cube reference for method calls
+                self._orig_cube = orig_cube
+                
+            def fit_spectra(self, template_filename, ppxf_vel_init=0, ppxf_vel_disp_init=40, ppxf_deg=3, n_jobs=-1):
+                """
+                Fit the stellar continuum using pPXF.
+                
+                This version adapts the method to work with binned spectra. It processes each bin
+                instead of each spaxel, using the mapping from bins to spaxels.
+                
+                Parameters
+                ----------
+                template_filename : str
+                    Filename of the stellar template
+                ppxf_vel_init : int, default=0
+                    Initial guess for the velocity in pPXF
+                ppxf_vel_disp_init : int, default=40
+                    Initial guess for the velocity dispersion in pPXF
+                ppxf_deg : int, default=3
+                    Degree of the additive polynomial for pPXF
+                n_jobs : int, default=-1
+                    Number of parallel jobs to run (-1 means using all processors)
+                    
+                Returns
+                -------
+                tuple
+                    (velocity_field, dispersion_field, bestfit_field, optimal_templates, polynomial_coefficients)
+                """
+                import os
+                import logging
+                import warnings
+                import numpy as np
+                from ppxf import ppxf_util
+                from ppxf.ppxf import ppxf
+                from ppxf.sps_util import sps_lib
+                from joblib import Parallel, delayed
+                
+                logger = logging.getLogger(__name__)
+                
                 try:
-                    # Extract bin velocities
-                    bin_velocities = [velocity_field[r, c] if 0 <= r < n_y and 0 <= c < n_x and np.isfinite(velocity_field[r, c]) else 0
-                                     for r, c in zip(row[pixel_indices], col[pixel_indices])]
+                    # Check if template file exists
+                    if not os.path.exists(template_filename):
+                        raise FileNotFoundError(f"Template file not found: {template_filename}")
                     
-                    # Align and accumulate spectra
-                    aligned_spectra = np.zeros_like(bin_spectra)
+                    # Load template
+                    sps = sps_lib(
+                        filename=template_filename,
+                        velscale=self._vel_scale,
+                        fwhm_gal=None,
+                        norm_range=self._wvl_air_angstrom_range
+                    )
+                    self._sps = sps  # Store SPS object for later reference
+                    sps.templates = sps.templates.reshape(sps.templates.shape[0], -1)
                     
-                    for i, vel in enumerate(bin_velocities):
-                        if np.isnan(vel):
-                            aligned_spectra[:, i] = bin_spectra[:, i]
-                        else:
-                            # Calculate wavelength shift
-                            z = vel / 299792.458  # c in km/s
-                            shifted_wave = self.wavelength * (1 + z)
+                    # Normalize stellar template
+                    sps.templates /= np.median(sps.templates)
+                    tmpl_mask = ppxf_util.determine_mask(
+                        ln_lam=self._ln_lambda_gal,
+                        lam_range_temp=np.exp(sps.ln_lam_temp[[0, -1]]),
+                        width=1000
+                    )
+                    
+                    # Initialize storage for templates and weights
+                    n_templates = sps.templates.shape[1]
+                    n_wave_fit = self._n_wave_fit  # Length of the rebinned wavelength array
+                    n_wave_temp = sps.templates.shape[0]  # Length of the template wavelength array
+                    
+                    # Important: Initialize fields with correct dimensions
+                    # For optimal templates, use the template wavelength grid
+                    self._optimal_tmpls = np.full((n_wave_temp, self._n_y, self._n_x), np.nan)
+                    self._template_weights = np.full((n_templates, self._n_y, self._n_x), np.nan)
+                    self._poly_coeffs = []  # Store polynomial coefficients
+                    
+                    # For observed galaxy wavelength grid
+                    self._bestfit_field = np.full((n_wave_fit, self._n_y, self._n_x), np.nan)
+                    
+                    # Process each bin instead of each spaxel
+                    n_bins = self._spectra.shape[1]  # Number of bins
+                    
+                    def fit_bin(bin_idx):
+                        """Fit a single bin spectrum"""
+                        try:
+                            # For pseudo-cube, we map bin_idx to (i=0, j=bin_idx)
+                            i, j = 0, bin_idx
+                            galaxy_data = self._spectra[:, bin_idx]
                             
-                            # Interpolate to original wavelength
-                            try:
-                                aligned_spectra[:, i] = spectres(
-                                    self.wavelength, shifted_wave, bin_spectra[:, i],
-                                    fill=0
+                            # Use constant noise for now
+                            galaxy_noise = np.ones_like(galaxy_data)
+                            
+                            # Skip low SNR or invalid bins
+                            if np.count_nonzero(galaxy_data) < 50 or np.count_nonzero(np.isfinite(galaxy_data)) < 50:
+                                return i, j, None
+                            
+                            # Replace NaN values to avoid problems in ppxf
+                            if np.any(~np.isfinite(galaxy_data)):
+                                galaxy_data = np.nan_to_num(galaxy_data, nan=0.0, posinf=0.0, neginf=0.0)
+                            if np.any(~np.isfinite(galaxy_noise)):
+                                galaxy_noise = np.nan_to_num(galaxy_noise, nan=1.0, posinf=1.0, neginf=1.0)
+                            
+                            with warnings.catch_warnings():
+                                warnings.filterwarnings(
+                                    'ignore', category=RuntimeWarning,
+                                    message='invalid value encountered in scalar divide'
                                 )
-                            except Exception as e:
-                                # Fall back to original spectrum if alignment fails
-                                warnings.warn(f"Error aligning spectrum: {str(e)}")
-                                aligned_spectra[:, i] = bin_spectra[:, i]
-                    
-                    # Use aligned spectra
-                    bin_spectra = aligned_spectra
-                except Exception as e:
-                    warnings.warn(f"Error during velocity alignment: {str(e)}. Using original spectra.")
-            
-            # Calculate bin spectrum (simple average)
-            try:
-                # First check for NaN values
-                valid_mask = np.all(np.isfinite(bin_spectra), axis=0)
-                if np.any(valid_mask):
-                    binned_spectra[bin_idx] = np.nanmean(bin_spectra[:, valid_mask], axis=1)
-                else:
-                    # If all spectra have NaNs, create a placeholder spectrum
-                    warnings.warn(f"Bin {bin_idx} has no valid spectra")
-                    binned_spectra[bin_idx] = np.zeros_like(self.wavelength)
-            except Exception as e:
-                warnings.warn(f"Error averaging bin {bin_idx}: {str(e)}")
-                continue
-        
-        self.binned_spectra = binned_spectra
-        return binned_spectra
-
-
-class RadialBinning:
-    """Radial binning class"""
-    
-    def __init__(
-        self,
-        x: np.ndarray,
-        y: np.ndarray,
-        signal: np.ndarray,
-        noise: np.ndarray,
-        wavelength: np.ndarray,
-        spectra: np.ndarray,
-        shape: Tuple[int, int]
-    ):
-        """
-        Initialize radial binning
-        
-        Parameters
-        ----------
-        x : ndarray
-            Pixel x coordinate array
-        y : ndarray
-            Pixel y coordinate array
-        signal : ndarray
-            Signal strength array
-        noise : ndarray
-            Noise strength array
-        wavelength : ndarray
-            Wavelength array
-        spectra : ndarray
-            All pixel spectra array (wavelength, n_pixels)
-        shape : tuple
-            Original image shape (n_y, n_x)
-        """
-        self.x = x
-        self.y = y
-        self.signal = signal
-        self.noise = noise
-        self.wavelength = wavelength
-        self.spectra = spectra
-        self.shape = shape
-        
-        # Calculate SNR
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            self.snr = np.zeros_like(signal)
-            valid_mask = noise > 0
-            self.snr[valid_mask] = signal[valid_mask] / noise[valid_mask]
-        
-        # Initialize result storage
-        self.bin_edges = None
-        self.binned_spectra = None
-        self.bin_map = None
-        self.radial_map = None
-    
-    def compute_bins(
-        self,
-        n_bins: int = 10,
-        center_x: Optional[float] = None,
-        center_y: Optional[float] = None,
-        pa: float = 0.0,
-        ellipticity: float = 0.0,
-        log_spacing: bool = True,
-        min_radius: float = 0.0,
-        max_radius: Optional[float] = None,
-        min_snr: float = 0.0
-    ) -> Dict:
-        """
-        Compute radial binning
-        
-        Parameters
-        ----------
-        n_bins : int, default=10
-            Number of radial bins
-        center_x : float, optional
-            Center x coordinate, default is image center
-        center_y : float, optional
-            Center y coordinate, default is image center
-        pa : float, default=0.0
-            Position angle (degrees)
-        ellipticity : float, default=0.0
-            Ellipticity (0-1)
-        log_spacing : bool, default=True
-            Whether to use logarithmic spacing
-        min_radius : float, default=0.0
-            Minimum radius
-        max_radius : float, optional
-            Maximum radius, default uses maximum distance
-        min_snr : float, default=0.0
-            Minimum SNR requirement
-            
-        Returns
-        -------
-        dict
-            Binning result dictionary
-        """
-        n_y, n_x = self.shape
-        
-        # Set default center
-        if center_x is None:
-            center_x = n_x / 2
-        if center_y is None:
-            center_y = n_y / 2
-        
-        # Calculate distance to center
-        x_rel = self.x - center_x
-        y_rel = self.y - center_y
-        
-        # Apply position angle and ellipticity
-        try:
-            if ellipticity > 0 or pa != 0:
-                # Convert to radians
-                pa_rad = np.radians(pa)
-                
-                # Rotate coordinate system
-                x_rot = x_rel * np.cos(pa_rad) + y_rel * np.sin(pa_rad)
-                y_rot = -x_rel * np.sin(pa_rad) + y_rel * np.cos(pa_rad)
-                
-                # Apply ellipticity
-                b_to_a = 1 - ellipticity
-                radius = np.sqrt(x_rot**2 + (y_rot/b_to_a)**2)
-            else:
-                # Simple Euclidean distance
-                radius = np.sqrt(x_rel**2 + y_rel**2)
-        except Exception as e:
-            warnings.warn(f"Error calculating radii: {str(e)}. Using simple distance.")
-            radius = np.sqrt(x_rel**2 + y_rel**2)
-        
-        # Create radius map
-        radial_map = np.full(self.shape, np.nan)
-        
-        # Recalculate row/column indices
-        row = (self.y + 0.5).astype(int)  # +0.5 for rounding
-        col = (self.x + 0.5).astype(int)
-        
-        for i, r in enumerate(radius):
-            if 0 <= row[i] < n_y and 0 <= col[i] < n_x:
-                radial_map[row[i], col[i]] = r
-        
-        # Save radius map
-        self.radial_map = radial_map
-        
-        # Set maximum radius
-        if max_radius is None:
-            valid_radius = radius[np.isfinite(radius)]
-            if len(valid_radius) > 0:
-                max_radius = np.nanmax(valid_radius)
-            else:
-                max_radius = 10 * min_radius if min_radius > 0 else 100
-        
-        # Create radial bin edges
-        try:
-            if log_spacing:
-                # Logarithmic spacing
-                bin_edges = np.logspace(
-                    np.log10(max(min_radius, 0.5)), 
-                    np.log10(max_radius), 
-                    n_bins + 1
-                )
-            else:
-                # Linear spacing
-                bin_edges = np.linspace(min_radius, max_radius, n_bins + 1)
-        except Exception as e:
-            warnings.warn(f"Error creating bin edges: {str(e)}. Using default linear spacing.")
-            bin_edges = np.linspace(min_radius, max_radius, n_bins + 1)
-        
-        self.bin_edges = bin_edges
-        
-        # Create bin mapping
-        bin_map = np.full(self.shape, -1)
-        valid_mask = (self.snr >= min_snr) & np.isfinite(radius)
-        
-        # Assign pixels to bins
-        for bin_idx in range(n_bins):
-            try:
-                # Get inner and outer radius
-                r_in = bin_edges[bin_idx]
-                r_out = bin_edges[bin_idx + 1]
-                
-                # Assign pixels to bin
-                for i, r in enumerate(radius):
-                    if r >= r_in and r < r_out and valid_mask[i]:
-                        r_idx = row[i]
-                        c_idx = col[i]
-                        if 0 <= r_idx < n_y and 0 <= c_idx < n_x:
-                            bin_map[r_idx, c_idx] = bin_idx
-            except Exception as e:
-                warnings.warn(f"Error assigning bin {bin_idx}: {str(e)}")
-                continue
-        
-        # Save bin mapping
-        self.bin_map = bin_map
-        
-        # Calculate pixels per bin
-        bin_counts = []
-        for bin_idx in range(n_bins):
-            count = np.sum(bin_map == bin_idx)
-            bin_counts.append(count)
-        
-        # Return bin information
-        return {
-            'bin_map': bin_map,
-            'radial_map': radial_map,
-            'bin_edges': bin_edges,
-            'bin_counts': bin_counts,
-            'center': (center_x, center_y),
-            'pa': pa,
-            'ellipticity': ellipticity
-        }
-    
-    def extract_binned_spectra(
-        self, 
-        bin_map: np.ndarray,
-        velocity_field: Optional[np.ndarray] = None
-    ) -> Dict[int, np.ndarray]:
-        """
-        Extract radial bin combined spectra
-        
-        Parameters
-        ----------
-        bin_map : ndarray
-            Binning index mapping
-        velocity_field : ndarray, optional
-            Velocity field, for spectrum alignment correction
-            
-        Returns
-        -------
-        dict
-            Dictionary of binned spectra, keys are bin indices
-        """
-        # Calculate bin pixels
-        n_bins = int(np.max(bin_map)) + 1
-        binned_spectra = {}
-        
-        # Recalculate row/column indices
-        n_y, n_x = self.shape
-        row = (self.y + 0.5).astype(int)  # +0.5 for rounding
-        col = (self.x + 0.5).astype(int)
-        
-        # Collect spectra for each bin
-        for bin_idx in range(n_bins):
-            try:
-                # Find all pixels in this bin
-                pixel_indices = []
-                for i, (r, c) in enumerate(zip(row, col)):
-                    # Ensure indices are within valid range
-                    if 0 <= r < n_y and 0 <= c < n_x and bin_map[r, c] == bin_idx:
-                        pixel_indices.append(i)
-                
-                if not pixel_indices:
-                    continue
-                    
-                # Get spectra
-                bin_spectra = self.spectra[:, pixel_indices]
-                
-                # If velocity field provided, align spectra
-                if velocity_field is not None:
-                    try:
-                        # Extract bin velocities
-                        bin_velocities = [velocity_field[r, c] if 0 <= r < n_y and 0 <= c < n_x and np.isfinite(velocity_field[r, c]) else 0
-                                        for r, c in zip(row[pixel_indices], col[pixel_indices])]
-                        
-                        # Align and accumulate spectra
-                        aligned_spectra = np.zeros_like(bin_spectra)
-                        
-                        for i, vel in enumerate(bin_velocities):
-                            if np.isnan(vel):
-                                aligned_spectra[:, i] = bin_spectra[:, i]
-                            else:
-                                # Calculate wavelength shift
-                                z = vel / 299792.458  # c in km/s
-                                shifted_wave = self.wavelength * (1 + z)
-                                
                                 try:
-                                    # Interpolate to original wavelength using spectres
-                                    aligned_spectra[:, i] = spectres(
-                                        self.wavelength, shifted_wave, bin_spectra[:, i],
-                                        fill=0
+                                    pp = ppxf(
+                                        sps.templates, galaxy_data, galaxy_noise,
+                                        self._vel_scale, mask=tmpl_mask,
+                                        start=[ppxf_vel_init, ppxf_vel_disp_init], degree=ppxf_deg,
+                                        lam=self._lambda_gal, lam_temp=sps.lam_temp,
+                                        quiet=True
+                                    )
+                                    
+                                    # Ensure dispersion value is reasonable
+                                    if pp.sol[1] < 0:
+                                        pp.sol[1] = 10.0  # Set to a reasonable minimum value
+                                    
+                                    # Calculate polynomial coefficients for later use
+                                    poly_coeff = np.polyfit(self._lambda_gal, pp.apoly, ppxf_deg)
+                                    
+                                    # Calculate optimal template directly from weights on TEMPLATE wavelength grid
+                                    optimal_template = sps.templates @ pp.weights
+                                    
+                                    # Calculate best-fit on GALAXY wavelength grid
+                                    bestfit = pp.bestfit
+                                    
+                                    return i, j, (
+                                        pp.sol[0], pp.sol[1], bestfit,
+                                        optimal_template,
+                                        pp.weights,
+                                        poly_coeff
                                     )
                                 except Exception as e:
-                                    # Fall back to original spectrum if alignment fails
-                                    warnings.warn(f"Error aligning spectrum: {str(e)}")
-                                    aligned_spectra[:, i] = bin_spectra[:, i]
+                                    # If fitting fails, try again with a simpler configuration
+                                    try:
+                                        pp = ppxf(
+                                            sps.templates, galaxy_data, galaxy_noise,
+                                            self._vel_scale, mask=tmpl_mask,
+                                            start=[ppxf_vel_init, ppxf_vel_disp_init], degree=0,  # Simplify to constant polynomial
+                                            lam=self._lambda_gal, lam_temp=sps.lam_temp,
+                                            quiet=True
+                                        )
+                                        
+                                        # Ensure dispersion value is reasonable
+                                        if pp.sol[1] < 0:
+                                            pp.sol[1] = 10.0
+                                        
+                                        # Calculate polynomial coefficients (constant term)
+                                        poly_coeff = np.array([pp.apoly[0]])
+                                        
+                                        # Calculate optimal template directly from weights on TEMPLATE wavelength grid
+                                        optimal_template = sps.templates @ pp.weights
+                                        
+                                        # Calculate best-fit on GALAXY wavelength grid
+                                        bestfit = pp.bestfit
+                                        
+                                        return i, j, (
+                                            pp.sol[0], pp.sol[1], bestfit,
+                                            optimal_template,
+                                            pp.weights,
+                                            poly_coeff
+                                        )
+                                    except Exception as e:
+                                        # Both attempts failed, return None
+                                        if bin_idx % 100 == 0:  # Reduce log clutter by only logging every 100th failure
+                                            logger.debug(f"Fitting failed for bin {bin_idx}: {str(e)}")
+                                        return i, j, None
+                        except Exception as e:
+                            logger.error(f"Error in fit_bin for bin {bin_idx}: {str(e)}")
+                            return 0, bin_idx, None
+                    
+                    # Process all bins
+                    # Use Progress or simple Parallel based on availability
+                    try:
+                        from utils.parallel import ParallelTqdm
+                        fit_results = ParallelTqdm(
+                            n_jobs=n_jobs, desc='Fitting binned spectra', total_tasks=n_bins
+                        )(delayed(fit_bin)(idx) for idx in range(n_bins))
+                    except ImportError:
+                        # Fallback to standard Parallel
+                        fit_results = Parallel(n_jobs=n_jobs)(delayed(fit_bin)(idx) for idx in range(n_bins))
+                    
+                    # Process results
+                    for fit_result in fit_results:
+                        if fit_result[2] is None:
+                            continue
                         
-                        # Use aligned spectra
-                        bin_spectra = aligned_spectra
-                    except Exception as e:
-                        warnings.warn(f"Error during velocity alignment: {str(e)}. Using original spectra.")
+                        row, col, (vel, disp, bestfit, optimal_tmpl, weights, poly_coeff) = fit_result
+                        
+                        # For pseudocube, we store results in a flattened way where bin index = column index
+                        self._velocity_field[row, col] = vel
+                        self._dispersion_field[row, col] = disp
+                        
+                        # Store best-fit on GALAXY wavelength grid
+                        self._bestfit_field[:, row, col] = bestfit
+                        
+                        # Store optimal template on TEMPLATE wavelength grid
+                        self._optimal_tmpls[:, row, col] = optimal_tmpl
+                            
+                        # Store template weights
+                        self._template_weights[:len(weights), row, col] = weights
+                            
+                        self._poly_coeffs.append((row, col, poly_coeff))
+                    
+                    return (self._velocity_field, self._dispersion_field,
+                            self._bestfit_field, self._optimal_tmpls, self._poly_coeffs)
                 
-                # Calculate bin spectrum (simple average)
-                valid_mask = np.all(np.isfinite(bin_spectra), axis=0)
-                if np.any(valid_mask):
-                    binned_spectra[bin_idx] = np.nanmean(bin_spectra[:, valid_mask], axis=1)
+                except Exception as e:
+                    logger.error(f"Error in fit_spectra: {str(e)}")
+                    return (np.full((self._n_y, self._n_x), np.nan),
+                            np.full((self._n_y, self._n_x), np.nan),
+                            np.full((n_wave_fit, self._n_y, self._n_x), np.nan),
+                            np.full((n_wave_temp if 'n_wave_temp' in locals() else n_wave_fit, 
+                                    self._n_y, self._n_x), np.nan),
+                            [])
+            
+            def fit_emission_lines(self, template_filename, line_names=None, ppxf_vel_init=None,
+                                ppxf_sig_init=50.0, ppxf_deg=8, n_jobs=-1, verbose=True):
+                """
+                Fit emission line components based on stellar template.
+                Adapted for binned spectra in PseudoCube.
+                
+                Parameters
+                ----------
+                template_filename : str
+                    Filename of the stellar template
+                line_names : List[str], optional
+                    List of emission lines to fit, defaults to all available lines
+                ppxf_vel_init : np.ndarray, optional
+                    Initial velocity field, defaults to stellar velocity field
+                ppxf_sig_init : float, default=50.0
+                    Initial velocity dispersion in km/s for gas
+                ppxf_deg : int, default=8
+                    Degree of additive polynomial for pPXF
+                n_jobs : int, default=-1
+                    Number of parallel jobs to run
+                verbose : bool, default=True
+                    Whether to print verbose output
+                    
+                Returns
+                -------
+                Dict[str, Any]
+                    Dictionary containing emission line fitting results
+                """
+                import os
+                import logging
+                import warnings
+                import numpy as np
+                from ppxf import ppxf_util
+                from ppxf.ppxf import ppxf
+                from joblib import Parallel, delayed
+
+                logger = logging.getLogger(__name__)
+                # Set log level
+                original_level = logger.level
+                if not verbose:
+                    logger.setLevel(logging.WARNING)
                 else:
-                    warnings.warn(f"Bin {bin_idx} has no valid spectra")
-                    binned_spectra[bin_idx] = np.zeros_like(self.wavelength)
-            except Exception as e:
-                warnings.warn(f"Error extracting spectra for bin {bin_idx}: {str(e)}")
-                continue
+                    logger.setLevel(logging.INFO)
+                
+                try:    
+                    # Check if stellar fitting has already been performed
+                    if self._sps is None or self._optimal_tmpls is None:
+                        raise ValueError("Must run fit_spectra() before fit_emission_lines()")
+                    
+                    if ppxf_vel_init is None:
+                        # Use stellar velocity field as initial value
+                        ppxf_vel_init = self._velocity_field
+                    
+                    # Initialize result storage
+                    self._emission_flux = {}
+                    self._emission_vel = {}
+                    self._emission_sig = {}
+                    self._gas_bestfit_field = np.full((self._n_wave_fit, self._n_y, self._n_x), np.nan)
+                    self._emission_wavelength = {}
+                    
+                    # Generate emission line templates using ppxf's emission_lines function
+                    lam_range_gal = [np.min(self._lambda_gal), np.max(self._lambda_gal)]
+                    
+                    from ppxf.ppxf_util import emission_lines
+                    gas_templates, gas_names, line_wave = emission_lines(
+                        self._sps.ln_lam_temp, lam_range_gal, self._FWHM_gal
+                    )
+
+                    # Set up gas components - using 1 gas kinematic component
+                    ngas_comp = 1
+                    gas_templates = np.tile(gas_templates, ngas_comp)
+                    gas_names = np.asarray([a + f"_({p+1})" for p in range(ngas_comp) for a in gas_names])
+                    line_wave = np.tile(line_wave, ngas_comp)
+                    
+                    # Filter emission lines if specific ones are requested
+                    if line_names is not None:
+                        valid_indices = []
+                        for i, name in enumerate(gas_names):
+                            base_name = name.split('_(')[0] if '_(' in name else name
+                            if any(requested.lower() in base_name.lower() for requested in line_names):
+                                valid_indices.append(i)
+                        
+                        if valid_indices:
+                            gas_templates = gas_templates[:, valid_indices]
+                            gas_names = [gas_names[i] for i in valid_indices]
+                            line_wave = [line_wave[i] for i in valid_indices]
+                    
+                    # Store emission line wavelengths for reference
+                    self._emission_wavelength = dict(zip(gas_names, line_wave))
+                    logger.info("Emission lines included in gas templates:")
+                    logger.info(gas_names)
+                    
+                    # Initialize emission line storage
+                    for name in gas_names:
+                        base_name = name.split('_(')[0] if '_(' in name else name
+                        if base_name not in self._emission_flux:
+                            self._emission_flux[base_name] = np.full((self._n_y, self._n_x), np.nan)
+                            self._emission_vel[base_name] = np.full((self._n_y, self._n_x), np.nan)
+                            self._emission_sig[base_name] = np.full((self._n_y, self._n_x), np.nan)
+                    
+                    # Store ppxf results for each bin
+                    self._ppxf_gas_results = []
+                    
+                    # Process each bin
+                    n_bins = self._spectra.shape[1]
+                    
+                    def fit_bin_emission(bin_idx):
+                        """Fit emission lines for a single bin"""
+                        try:
+                            # For pseudo-cube, we map bin_idx to (i=0, j=bin_idx)
+                            i, j = 0, bin_idx
+                            
+                            # Skip if first-time fitting failed
+                            if np.isnan(self._velocity_field[i, j]):
+                                return i, j, None
+                            
+                            # Get bin spectrum
+                            galaxy_data = self._spectra[:, bin_idx]
+                            
+                            # Use constant noise for now
+                            galaxy_noise = np.ones_like(galaxy_data)
+                            
+                            # Replace NaN values to avoid problems in ppxf
+                            if np.any(~np.isfinite(galaxy_data)):
+                                galaxy_data = np.nan_to_num(galaxy_data, nan=0.0, posinf=0.0, neginf=0.0)
+                            if np.any(~np.isfinite(galaxy_noise)):
+                                galaxy_noise = np.nan_to_num(galaxy_noise, nan=1.0, posinf=1.0, neginf=1.0)
+                            
+                            # Get optimal stellar template for this bin
+                            optimal_template = self._optimal_tmpls[:, i, j]
+                            
+                            # Get initial velocity value
+                            vel_init = self._velocity_field[i, j] if not np.isnan(self._velocity_field[i, j]) else 0
+                            
+                            try:
+                                # Load SPS for this bin
+                                from ppxf.sps_util import sps_lib
+                                sps = sps_lib(
+                                    filename=template_filename,
+                                    velscale=self._vel_scale,
+                                    fwhm_gal=None,
+                                    norm_range=self._wvl_air_angstrom_range
+                                )
+                                
+                                # Combine stellar and gas templates
+                                stars_gas_templates = np.column_stack([optimal_template, gas_templates])
+                                
+                                # Define component types - [0] for stellar, [1] for gas components
+                                component = [0] + [1]*2  # This indicates 2 gas components
+                                gas_component = np.array(component) > 0  # True for gas components
+                                
+                                # Define moments for each component type
+                                moments = [-2, 2]  # -2 for stellar (fixed dispersion), 2 for gas (full kinematics)
+                                ncomp = len(moments)  # Should be 2
+                                tied = [['', ''] for _ in range(ncomp)]
+                                
+                                # Set initial parameters
+                                start = [
+                                    [vel_init, self._dispersion_field[i, j]],  # Stellar initial kinematics
+                                    [vel_init, ppxf_sig_init]                  # Gas initial kinematics
+                                ]
+                                
+                                # Set boundary conditions
+                                vlim = lambda x: vel_init + x*np.array([-100, 100])
+                                bounds = [
+                                    [vlim(2), [20, 300]],  # Stellar bounds
+                                    [vlim(2), [20, 100]]   # Gas bounds
+                                ]
+                                
+                                # Call ppxf with appropriate parameters and warning suppression
+                                try:
+                                    # Suppress warnings for division operations
+                                    with warnings.catch_warnings():
+                                        warnings.filterwarnings('ignore', category=RuntimeWarning, 
+                                                            message='invalid value encountered in scalar divide')
+                                        warnings.filterwarnings('ignore', category=RuntimeWarning, 
+                                                            message='divide by zero encountered')
+                                        
+                                        # Ensure noise values are not zero to prevent division issues
+                                        galaxy_noise = np.maximum(galaxy_noise, 1e-10)
+                                        
+                                        pp = ppxf(
+                                            stars_gas_templates, galaxy_data, galaxy_noise, 
+                                            self._vel_scale, start,
+                                            moments=moments, degree=ppxf_deg, mdegree=-1,
+                                            component=component, 
+                                            gas_component=gas_component, 
+                                            gas_names=gas_names, 
+                                            lam=self._lambda_gal,
+                                            lam_temp=sps.lam_temp,
+                                            tied=tied,
+                                            bounds=bounds,
+                                            quiet=True
+                                        )
+                                        
+                                    # Extract results
+                                    # Calculate best-fit models for stellar and gas components
+                                    bestfit = pp.bestfit if hasattr(pp, 'bestfit') else np.zeros_like(galaxy_data)
+                                    
+                                    # Extract gas best-fit component
+                                    gas_bestfit = np.zeros_like(bestfit)
+                                    if hasattr(pp, 'gas_bestfit'):
+                                        gas_bestfit = pp.gas_bestfit
+                                    elif hasattr(pp, 'component') and hasattr(pp, 'bestfit'):
+                                        # Try to extract gas component from the full model
+                                        comp = pp.component
+                                        if len(comp) > 0:
+                                            gas_idx = np.where(comp > 0)[0]
+                                            if len(gas_idx) > 0:
+                                                gas_bestfit = np.sum(pp.matrix[:, gas_idx] @ pp.weights[gas_idx], axis=1)
+                                    
+                                    # Calculate stellar component (total - gas)
+                                    stellar_bestfit = bestfit - gas_bestfit
+                                    
+                                    # Extract polynomial coefficients
+                                    if hasattr(pp, 'apoly'):
+                                        apoly = pp.apoly
+                                    
+                                    # Properly calculate optimal template with polynomial
+                                    apoly_se_2 = np.polyfit(self._lambda_gal, pp.apoly, 3)
+                                    NEL_cal_tmp = (stars_gas_templates[:,0] * pp.weights[0]) + np.poly1d(apoly_se_2)(sps.lam_temp)
+                                    
+                                    # Get stellar and gas kinematic solutions
+                                    stellar_sol = [pp.sol[0][0],pp.sol[0][1]] if hasattr(pp, 'sol') else [vel_init, self._dispersion_field[i, j]]
+                                    
+                                    # Get gas kinematics
+                                    gas_sol = None
+                                    if hasattr(pp, 'gas_kinematics'):
+                                        gas_sol = pp.gas_kinematics[0]  # Take first gas component
+                                    else:
+                                        # Try to extract from sol
+                                        if hasattr(pp, 'sol') and hasattr(pp, 'ncomp') and pp.ncomp > 1:
+                                            gas_sol = [pp.sol[1][0],pp.sol[1][1]]  # Take the second component's solution
+                                    
+                                    # Store results
+                                    result = {
+                                        'flux': pp.gas_flux if hasattr(pp, 'gas_flux') else None,
+                                        'gas_bestfit': gas_bestfit,
+                                        'stellar_bestfit': stellar_bestfit,
+                                        'total_bestfit': bestfit,
+                                        'sol': stellar_sol,  # Stellar kinematics
+                                        'gas_sol': gas_sol,  # Gas kinematics
+                                        'weights': pp.weights if hasattr(pp, 'weights') else None,
+                                        'NEL_cal_tmp': NEL_cal_tmp
+                                    }
+                                    return i, j, result
+                                    
+                                except Exception as e:
+                                    if verbose and bin_idx % 100 == 0:  # Reduce log clutter
+                                        logger.warning(f"Gas fitting failed for bin {bin_idx}: {str(e)}")
+                                    return i, j, None
+                            
+                            except Exception as e:
+                                if verbose and bin_idx % 100 == 0:  # Reduce log clutter
+                                    logger.warning(f"Error in emission line fitting for bin {bin_idx}: {str(e)}")
+                                return i, j, None 
+                        except Exception as e:
+                            logger.error(f"Error in fit_bin_emission for bin {bin_idx}: {str(e)}")
+                            return 0, bin_idx, None
+                    
+                    # Process all bins
+                    # Use Progress or simple Parallel based on availability
+                    try:
+                        from utils.parallel import ParallelTqdm
+                        fit_results = ParallelTqdm(
+                            n_jobs=n_jobs, desc='Fitting emission lines', total_tasks=n_bins
+                        )(delayed(fit_bin_emission)(idx) for idx in range(n_bins))
+                    except ImportError:
+                        # Fallback to standard Parallel
+                        fit_results = Parallel(n_jobs=n_jobs)(delayed(fit_bin_emission)(idx) for idx in range(n_bins))
+                    
+                    # Process results
+                    for fit_result in fit_results:
+                        if fit_result[2] is None:
+                            continue
+                        
+                        row, col, result = fit_result
+                        
+                        # Save ppxf result for this bin
+                        self._ppxf_gas_results.append((row, col, result))
+                        
+                        # Save gas fitting result
+                        if 'gas_bestfit' in result and result['gas_bestfit'] is not None:
+                            self._gas_bestfit_field[:, row, col] = result['gas_bestfit']
+                        
+                        # Update optimal template if needed
+                        if 'NEL_cal_tmp' in result and result['NEL_cal_tmp'] is not None:
+                            self._optimal_tmpls[:, row, col] = result['NEL_cal_tmp']
+                        
+                        # Update kinematics if needed
+                        if 'sol' in result and result['sol'] is not None:
+                            self._velocity_field[row, col] = result['sol'][0]
+                            self._dispersion_field[row, col] = result['sol'][1]
+                        
+                        # Save emission line flux and velocity information
+                        if 'flux' in result and result['flux'] is not None:
+                            # Process emission line fluxes
+                            for k, full_name in enumerate(gas_names):
+                                if k < len(result['flux']):
+                                    # Get base name without component number
+                                    base_name = full_name.split('_(')[0] if '_(' in full_name else full_name
+                                    
+                                    # Store flux
+                                    self._emission_flux[base_name][row, col] = result['flux'][k]
+                                    
+                                    # Store kinematics if available
+                                    if 'gas_sol' in result and result['gas_sol'] is not None:
+                                        self._emission_vel[base_name][row, col] = result['gas_sol'][0]
+                                        self._emission_sig[base_name][row, col] = result['gas_sol'][1]
+                    
+                    # Restore original log level
+                    logger.setLevel(original_level)
+                    
+                    # Return result dictionary
+                    return {
+                        'emission_flux': self._emission_flux,
+                        'emission_vel': self._emission_vel,
+                        'emission_sig': self._emission_sig,
+                        'gas_bestfit_field': self._gas_bestfit_field,
+                        'emission_wavelength': self._emission_wavelength,
+                        'optimal_tmpls': self._optimal_tmpls,
+                        'velocity_field': self._velocity_field,
+                        'dispersion_field': self._dispersion_field,
+                    }
+                
+                except Exception as e:
+                    logger.error(f"Error in fit_emission_lines: {str(e)}")
+                    logger.setLevel(original_level)
+                    return {
+                        'emission_flux': {},
+                        'emission_vel': {},
+                        'emission_sig': {},
+                        'gas_bestfit_field': np.full((self._n_wave_fit, self._n_y, self._n_x), np.nan),
+                        'emission_wavelength': {}
+                    }
+            
+            def calculate_spectral_indices(self, indices_list=None, n_jobs=-1, verbose=False):
+                """
+                Calculate spectral indices for each bin using LineIndexCalculator
+                
+                Parameters
+                ----------
+                indices_list : list of str, optional
+                    List of spectral indices to calculate, None uses standard set
+                n_jobs : int, default=-1
+                    Number of parallel jobs
+                verbose : bool, default=False
+                    Whether to display detailed information
+                        
+                Returns
+                -------
+                dict
+                    Dictionary of spectral indices
+                """
+                import os
+                import logging
+                import warnings
+                import numpy as np
+                from joblib import Parallel, delayed
+
+                logger = logging.getLogger(__name__)
+                
+                # Set log level
+                original_level = logger.level
+                if not verbose:
+                    logger.setLevel(logging.WARNING)
+                else:
+                    logger.setLevel(logging.INFO)
+                
+                try:
+                    # Import LineIndexCalculator
+                    try:
+                        from spectral_indices import LineIndexCalculator
+                    except ImportError:
+                        logger.error("spectral_indices module not found. Please make sure it's in your Python path.")
+                        return {}
+                    
+                    # Define standard spectral indices if not provided
+                    if indices_list is None:
+                        indices_list = ['Hbeta', 'Fe5015', 'Mgb']
+                    
+                    # Get min/max wavelength from original data
+                    orig_wave_min = np.min(self._lambda_gal)
+                    orig_wave_max = np.max(self._lambda_gal)
+                    logger.info(f"Original wavelength range: {orig_wave_min:.2f} - {orig_wave_max:.2f} Å")
+                    
+                    # Complete index definitions including blue and red bands
+                    full_index_definitions = {
+                        'Hbeta': {
+                            'blue': (4827.875, 4847.875),
+                            'band': (4847.875, 4876.625),
+                            'red': (4876.625, 4891.625)
+                        },
+                        'Mgb': {
+                            'blue': (5142.625, 5161.375),
+                            'band': (5160.125, 5192.625),
+                            'red': (5191.375, 5206.375)
+                        },
+                        'Fe5015': {
+                            'blue': (4946.500, 4977.750),
+                            'band': (4977.750, 5054.000),
+                            'red': (5054.000, 5065.250)
+                        },
+                    }
+                    
+                    valid_indices = []
+                    for index_name in indices_list:
+                        if index_name in full_index_definitions:
+                            windows = full_index_definitions[index_name]
+                            # Check if index overlaps with data wavelength range
+                            if (orig_wave_min <= windows['red'][1] and orig_wave_max >= windows['blue'][0]):
+                                valid_indices.append(index_name)
+                                logger.info(f"Index {index_name} is within wavelength range")
+                            else:
+                                logger.warning(f"Index {index_name} outside wavelength range")
+                        else:
+                            # Include other indices without checking range
+                            valid_indices.append(index_name)
+                    
+                    if not valid_indices:
+                        logger.warning("No valid spectral indices to calculate within wavelength range")
+                        return {}
+                    
+                    # Update indices list
+                    indices_list = valid_indices
+                    
+                    # Initialize spectral indices
+                    self._spectral_indices = {index_name: np.full((self._n_y, self._n_x), np.nan) for index_name in indices_list}
+                    
+                    # Check if we have emission line fitting results
+                    has_emission_lines = (self._gas_bestfit_field is not None and 
+                                    np.any(~np.isnan(self._gas_bestfit_field)))
+                    
+                    # Store calculators for later plotting if needed
+                    self._index_calculators = {}
+                    
+                    # Process each bin
+                    n_bins = self._spectra.shape[1]
+                    
+                    def calculate_index(bin_idx):
+                        """
+                        Calculate spectral indices for a single bin
+                        """
+                        try:
+                            # For pseudo-cube, we map bin_idx to (i=0, j=bin_idx)
+                            i, j = 0, bin_idx
+                            
+                            # Skip if first-time fitting failed
+                            if np.isnan(self._velocity_field[i, j]):
+                                return i, j, {index_name: np.nan for index_name in indices_list}
+                            
+                            # Get bin spectrum
+                            bin_spectrum = self._spectra[:, bin_idx]
+                            
+                            # Get optimal template
+                            optimal_template = self._optimal_tmpls[:, i, j]
+                            
+                            # Get velocity
+                            velocity = self._velocity_field[i, j]
+                            
+                            # Get gas model if available
+                            gas_model = None
+                            if has_emission_lines:
+                                gas_model = self._gas_bestfit_field[:, i, j]
+                                # Verify gas model has valid values
+                                if not np.any(np.isfinite(gas_model)) or np.all(gas_model == 0):
+                                    gas_model = None
+                            
+                            # Create LineIndexCalculator with warning suppression
+                            with warnings.catch_warnings():
+                                warnings.filterwarnings('ignore', category=RuntimeWarning, 
+                                                    message='invalid value encountered in')
+                                warnings.filterwarnings('ignore', category=RuntimeWarning, 
+                                                    message='divide by zero')
+                                
+                                try:
+                                    calculator = LineIndexCalculator(
+                                        wave=self._lambda_gal,           # Observation wavelength grid
+                                        flux=bin_spectrum,               # Observed spectrum
+                                        fit_wave=self._sps.lam_temp,     # Template wavelength grid
+                                        fit_flux=optimal_template,       # Template spectrum
+                                        em_wave=self._lambda_gal if gas_model is not None else None,  # Emission line wavelength grid
+                                        em_flux_list=gas_model,          # Emission line spectrum
+                                        velocity_correction=velocity,    # Velocity correction
+                                        continuum_mode='auto'            # Auto select continuum mode
+                                    )
+                                except Exception as e:
+                                    logger.debug(f"Error creating LineIndexCalculator for bin {bin_idx}: {str(e)}")
+                                    return i, j, {index_name: np.nan for index_name in indices_list}
+                                
+                                # Calculate all indices at once to minimize function calls
+                                indices_values = {}
+                                for index_name in indices_list:
+                                    try:
+                                        # Use calculate_index method that handles pre-processing
+                                        index_value = calculator.calculate_index(index_name)
+                                        indices_values[index_name] = index_value
+                                    except Exception as e:
+                                        indices_values[index_name] = np.nan
+                                
+                                # Store calculator for the first bin for later plotting
+                                if bin_idx == 0:
+                                    self._index_calculators['first_bin'] = calculator
+                                
+                                return i, j, indices_values
+                        except Exception as e:
+                            logger.error(f"Error in calculate_index for bin {bin_idx}: {str(e)}")
+                            return 0, bin_idx, {index_name: np.nan for index_name in indices_list}
+                    
+                    # Process all bins
+                    # Use Progress or simple Parallel based on availability
+                    try:
+                        from utils.parallel import ParallelTqdm
+                        index_results = ParallelTqdm(
+                            n_jobs=n_jobs, desc='Calculating spectral indices', total_tasks=n_bins
+                        )(delayed(calculate_index)(idx) for idx in range(n_bins))
+                    except ImportError:
+                        # Fallback to standard Parallel
+                        index_results = Parallel(n_jobs=n_jobs)(delayed(calculate_index)(idx) for idx in range(n_bins))
+                    
+                    # Process results
+                    for result in index_results:
+                        if result is None or result[2] is None:
+                            continue
+                            
+                        row, col, indices_values = result
+                        for index_name, value in indices_values.items():
+                            if index_name in self._spectral_indices:
+                                self._spectral_indices[index_name][row, col] = value
+                    
+                    # Restore original log level
+                    logger.setLevel(original_level)
+                    
+                    return self._spectral_indices
+                
+                except Exception as e:
+                    logger.error(f"Error in calculate_spectral_indices: {str(e)}")
+                    logger.setLevel(original_level)
+                    return {}
         
-        self.binned_spectra = binned_spectra
-        return binned_spectra
+        return PseudoCube(cube, fake_cube, self)
+    
+    def save(self, filename):
+        """
+        保存binned数据到文件
+        
+        Parameters
+        ----------
+        filename : str 或 Path
+            输出文件名
+        """
+        import pickle
+        import os
+        import logging
+        import numpy as np
+        from pathlib import Path
+        logger = logging.getLogger(__name__)
+        
+        try:
+            # 将filename转换为Path对象
+            if not isinstance(filename, Path):
+                filename = Path(filename)
+            
+            # 基本文件名（不带扩展名）
+            base_filename = filename.stem
+            
+            # 创建pickle文件名（.pkl扩展名）
+            pickle_filename = filename.parent / f"{base_filename}.pkl"
+            
+            # 创建一个字典，包含所有需要保存的数据
+            save_data = {
+                'wavelength': self.wavelength,
+                'spectra': self.spectra,
+                'bin_num': self.bin_num,
+                'bin_indices': self.bin_indices,
+                'bin_type': self.bin_type,
+                'n_bins': self.n_bins,
+                'metadata': self.metadata
+            }
+            
+            # 使用pickle保存所有数据，包括不规则形状的数据
+            with open(pickle_filename, 'wb') as f:
+                pickle.dump(save_data, f)
+            
+            logger.info(f"Saved binned data to {pickle_filename}")
+            
+            # 尝试另存为legacy格式
+            try:
+                # 创建legacy目录
+                legacy_dir = filename.parent / f"{base_filename}_data"
+                legacy_dir.mkdir(exist_ok=True, parents=True)
+                
+                # 保存波长（一维数组，直接保存）
+                np.save(legacy_dir / "wavelength.npy", self.wavelength)
+                
+                # 保存bin号（一维数组，直接保存）
+                np.save(legacy_dir / "bin_num.npy", self.bin_num)
+                
+                # 逐个保存每个bin的光谱
+                for i in range(self.n_bins):
+                    spec_file = legacy_dir / f"spectra_{i}.npy"
+                    # 确保我们保存一维数组
+                    spec = self.spectra[:, i].flatten() if self.spectra.ndim > 1 else self.spectra
+                    np.save(spec_file, spec)
+                
+                # 保存元数据 - 转换为JSON可序列化格式
+                import json
+                
+                # 递归转换函数
+                def to_serializable(obj):
+                    if isinstance(obj, np.ndarray):
+                        return obj.tolist() if obj.ndim > 0 else float(obj)
+                    elif isinstance(obj, list):
+                        return [to_serializable(item) for item in obj]
+                    elif isinstance(obj, dict):
+                        return {k: to_serializable(v) for k, v in obj.items()}
+                    elif isinstance(obj, (np.int64, np.int32, np.float64, np.float32)):
+                        return obj.item()
+                    else:
+                        try:
+                            json.dumps(obj)
+                            return obj
+                        except:
+                            return str(obj)
+                
+                # 转换元数据
+                meta_json = to_serializable(self.metadata)
+                
+                # 保存为JSON
+                with open(legacy_dir / "metadata.json", 'w') as f:
+                    json.dump(meta_json, f)
+                
+                logger.info(f"Saved legacy format to {legacy_dir}")
+                
+            except Exception as e:
+                logger.error(f"Error saving legacy format: {str(e)}")
+                # 继续执行，确保主要保存操作不受影响
+        
+        except Exception as e:
+            logger.error(f"Error saving binned data: {str(e)}")
+            raise
+
+    @classmethod
+    def load(cls, filename):
+        """
+        从文件加载binned数据
+        
+        Parameters
+        ----------
+        filename : str 或 Path
+            输入文件名
+                
+        Returns
+        -------
+        BinnedData子类
+            加载的数据
+        """
+        import pickle
+        import os
+        import logging
+        import numpy as np
+        from pathlib import Path
+        logger = logging.getLogger(__name__)
+        
+        try:
+            # 将filename转换为Path对象
+            if not isinstance(filename, Path):
+                filename = Path(filename)
+            
+            # 基本文件名（不带扩展名）
+            base_filename = filename.stem
+            
+            # 创建pickle文件名（.pkl扩展名）
+            pickle_filename = filename.parent / f"{base_filename}.pkl"
+            
+            # 如果pickle文件存在，使用它
+            if pickle_filename.exists():
+                with open(pickle_filename, 'rb') as f:
+                    save_data = pickle.load(f)
+                
+                # 创建新对象
+                obj = cls.__new__(cls)
+                
+                # 设置属性
+                obj.wavelength = save_data['wavelength']
+                obj.spectra = save_data['spectra']
+                obj.bin_num = save_data['bin_num']
+                obj.bin_indices = save_data['bin_indices']
+                obj.bin_type = save_data['bin_type']
+                obj.n_bins = save_data['n_bins']
+                obj.metadata = save_data['metadata']
+                
+                logger.info(f"Loaded binned data from {pickle_filename}")
+                return obj
+            
+            # 如果pickle文件不存在，尝试使用npz文件
+            elif filename.exists():
+                try:
+                    data = np.load(filename, allow_pickle=True)
+                    
+                    # 创建新对象
+                    obj = cls.__new__(cls)
+                    
+                    # 设置基本属性
+                    obj.wavelength = data['wavelength']
+                    obj.bin_num = data['bin_num']
+                    obj.bin_type = str(data['bin_type']) if 'bin_type' in data else 'unknown'
+                    obj.n_bins = int(data['n_bins'])
+                    
+                    # 加载光谱
+                    if 'spectra' in data:
+                        obj.spectra = data['spectra']
+                    
+                    # 加载元数据
+                    if 'metadata' in data:
+                        obj.metadata = data['metadata'].item()
+                    else:
+                        obj.metadata = {}
+                    
+                    # 加载bin_indices
+                    if 'bin_indices_list' in data:
+                        obj.bin_indices = []
+                        for indices in data['bin_indices_list']:
+                            obj.bin_indices.append(np.array(indices))
+                    elif 'bin_indices' in data:
+                        obj.bin_indices = data['bin_indices']
+                    else:
+                        obj.bin_indices = []
+                    
+                    logger.info(f"Loaded binned data from {filename}")
+                    return obj
+                except Exception as e:
+                    logger.warning(f"Error loading npz file: {str(e)}, trying legacy format")
+                
+            # 尝试加载legacy格式
+            legacy_dir = filename.parent / f"{base_filename}_data"
+            
+            if legacy_dir.exists():
+                # 创建新对象
+                obj = cls.__new__(cls)
+                
+                # 加载波长
+                wavelength_file = legacy_dir / "wavelength.npy"
+                if wavelength_file.exists():
+                    obj.wavelength = np.load(wavelength_file)
+                else:
+                    raise FileNotFoundError(f"Wavelength file not found: {wavelength_file}")
+                
+                # 加载bin号
+                bin_num_file = legacy_dir / "bin_num.npy"
+                if bin_num_file.exists():
+                    obj.bin_num = np.load(bin_num_file)
+                else:
+                    raise FileNotFoundError(f"Bin number file not found: {bin_num_file}")
+                
+                # 确定bins数量
+                unique_bins = np.unique(obj.bin_num)
+                obj.n_bins = len(unique_bins[unique_bins >= 0])  # 只计算有效bin
+                obj.bin_type = 'unknown'
+                
+                # 加载光谱
+                spectra_list = []
+                for i in range(obj.n_bins):
+                    spec_file = legacy_dir / f"spectra_{i}.npy"
+                    if spec_file.exists():
+                        spectra_list.append(np.load(spec_file))
+                
+                # 将光谱列表转换为数组
+                if spectra_list:
+                    obj.spectra = np.column_stack(spectra_list)
+                else:
+                    obj.spectra = np.array([])
+                
+                # 加载元数据
+                import json
+                metadata_file = legacy_dir / "metadata.json"
+                if metadata_file.exists():
+                    with open(metadata_file, 'r') as f:
+                        obj.metadata = json.load(f)
+                else:
+                    obj.metadata = {}
+                
+                # 重建bin_indices
+                obj.bin_indices = []
+                for i, bin_id in enumerate(unique_bins):
+                    if bin_id >= 0:
+                        indices = np.where(obj.bin_num == bin_id)[0]
+                        obj.bin_indices.append(indices)
+                
+                logger.info(f"Loaded legacy format from {legacy_dir}")
+                return obj
+            else:
+                raise FileNotFoundError(f"No data file found at {filename} or legacy format at {legacy_dir}")
+        
+        except Exception as e:
+            logger.error(f"Error loading binned data: {str(e)}")
+            raise
+
+# Utility functions for plotting
+def plot_binned_map(x, y, bin_num, values=None, title=None, cmap='viridis', 
+                   vmin=None, vmax=None, savefile=None, figsize=(10, 8), 
+                   equal_aspect=True):
+    """
+    Plot a map of bins, optionally colored by values.
+    
+    Parameters
+    ----------
+    x, y : array_like
+        Coordinates of pixels
+    bin_num : array_like
+        Bin assignment for each pixel
+    values : array_like, optional
+        Values to use for coloring bins
+    title : str, optional
+        Plot title
+    cmap : str, optional
+        Colormap name
+    vmin, vmax : float, optional
+        Color scale limits
+    savefile : str, optional
+        Filename to save plot
+    figsize : tuple, optional
+        Figure size
+    equal_aspect : bool, optional
+        Whether to keep aspect ratio equal
+    
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+        Figure object
+    """
+    fig, ax = plt.subplots(figsize=figsize)
+    
+    if values is not None:
+        # Map bin values to pixels
+        pixel_values = np.full_like(x, np.nan, dtype=float)
+        for bin_id in np.unique(bin_num):
+            mask = bin_num == bin_id
+            if bin_id < len(values) and not np.isnan(values[bin_id]):
+                pixel_values[mask] = values[bin_id]
+        
+        # Plot values
+        sc = ax.scatter(x, y, c=pixel_values, cmap=cmap, s=5, vmin=vmin, vmax=vmax)
+        plt.colorbar(sc, ax=ax)
+    else:
+        # Create a color map for bins
+        unique_bins = np.unique(bin_num)
+        cmap_obj = plt.cm.get_cmap(cmap, len(unique_bins))
+        
+        # Plot each bin with a different color
+        for i, bin_id in enumerate(unique_bins):
+            mask = bin_num == bin_id
+            ax.scatter(x[mask], y[mask], c=[cmap_obj(i)], s=5, alpha=0.8, edgecolor='none')
+    
+    if equal_aspect:
+        ax.set_aspect('equal')
+    
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    
+    if title:
+        ax.set_title(title)
+    
+    if savefile:
+        plt.savefig(savefile, dpi=150, bbox_inches='tight')
+    
+    return fig
+
+def plot_radial_profile(radii, values, yerr=None, title=None, xlabel='Radius', 
+                       ylabel=None, savefile=None, figsize=(10, 6)):
+    """
+    Plot a radial profile.
+    
+    Parameters
+    ----------
+    radii : array_like
+        Radii of the bins
+    values : array_like
+        Values to plot
+    yerr : array_like, optional
+        Error bars for values
+    title : str, optional
+        Plot title
+    xlabel : str, optional
+        X-axis label
+    ylabel : str, optional
+        Y-axis label
+    savefile : str, optional
+        Filename to save plot
+    figsize : tuple, optional
+        Figure size
+    
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+        Figure object
+    """
+    fig, ax = plt.subplots(figsize=figsize)
+    
+    if yerr is not None:
+        ax.errorbar(radii, values, yerr=yerr, fmt='o-', capsize=3)
+    else:
+        ax.plot(radii, values, 'o-')
+    
+    ax.set_xlabel(xlabel)
+    if ylabel:
+        ax.set_ylabel(ylabel)
+    
+    if title:
+        ax.set_title(title)
+    
+    ax.grid(True, alpha=0.3)
+    
+    if savefile:
+        plt.savefig(savefile, dpi=150, bbox_inches='tight')
+    
+    return fig

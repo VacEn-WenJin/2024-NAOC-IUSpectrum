@@ -6,7 +6,7 @@ import logging
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
-
+import matplotlib.colors as mcolors
 import spectral_indices
 import galaxy_params
 import visualization
@@ -781,7 +781,9 @@ def create_emission_maps(emission_params, plots_dir, galaxy_name):
                 fig, ax = plt.subplots(figsize=(8, 7))
                 
                 # 对数比例显示
-                norm = plt.colors.LogNorm(
+                # 对数比例显示
+                
+                norm = mcolors.LogNorm(
                     vmin=np.percentile(valid_values, 1),
                     vmax=np.percentile(valid_values, 99)
                 )
@@ -811,7 +813,7 @@ def create_emission_maps(emission_params, plots_dir, galaxy_name):
                 fig, ax = plt.subplots(figsize=(8, 7))
                 
                 # 对数比例显示
-                norm = plt.colors.LogNorm(
+                norm = mcolors.LogNorm(
                     vmin=np.percentile(valid_values, 1),
                     vmax=np.percentile(valid_values, 99)
                 )

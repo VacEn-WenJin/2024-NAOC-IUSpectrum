@@ -66,6 +66,7 @@ def setup_parser():
     # Voronoi binning parameters
     vnb_group = parser.add_argument_group('Voronoi binning options')
     vnb_group.add_argument('--target-snr', type=float, default=20, help='Target signal-to-noise ratio')
+    vnb_group.add_argument('--cvt', action='store_true', help='Use centroidal Voronoi tessellation')
     
     # Radial binning parameters
     rdb_group = parser.add_argument_group('Radial binning options')
@@ -76,6 +77,10 @@ def setup_parser():
     rdb_group.add_argument('--ellipticity', type=float, default=0.0, help='Ellipticity (0-1)')
     rdb_group.add_argument('--log-spacing', action='store_true', help='Use logarithmic spacing')
     
+    # Binning common options
+    parser.add_argument('--no-velocity-correct', action='store_true', 
+                      help='Disable velocity correction when combining spectra')
+
     return parser
 
 
