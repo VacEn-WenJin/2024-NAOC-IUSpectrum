@@ -14,7 +14,7 @@ import galaxy_params
 import visualization
 from utils.io import save_results_to_npz
 from binning import (
-    run_voronoi_binning, apply_velocity_shift, BinnedSpectra,
+    run_voronoi_binning, apply_velocity_shift, BinnedSpectra,VoronoiBinnedData,
     plot_binned_map, plot_radial_profile
 )
 
@@ -94,16 +94,38 @@ def run_vnb_analysis(args, cube, p2p_results=None):
     # Step 2: Run Voronoi binning
     # --------------------------
     try:
+        # 验证输入数据的有效性
+        valid_mask = np.isfinite(x) & np.isfinite(y) & np.isfinite(signal) & np.isfinite(noise) & (noise > 0)
+        valid_count = np.sum(valid_mask)
+        if valid_count < 10:  # 至少需要10个有效点才能进行有意义的分箱
+            logger.warning(f"Only {valid_count} valid data points available, Voronoi binning may be unreliable")
+        
         logger.info(f"Running Voronoi binning with target SNR = {target_snr}")
         bin_num, x_gen, y_gen, sn, n_pixels, scale = run_voronoi_binning(
             x, y, signal, noise, target_snr, 
-            plot=0, quiet=True, cvt=True
+            plot=0, quiet=True, cvt=True,
+            min_snr=target_snr/3  # 允许SNR降低到目标值的1/3
         )
         
-        # Get unique bin numbers
+        # Get unique bin numbers and filter out negative values (无效bin)
         unique_bins = np.unique(bin_num)
-        n_bins = len(unique_bins)
-        logger.info(f"Created {n_bins} Voronoi bins")
+        valid_bins = unique_bins[unique_bins >= 0]
+        n_bins = len(valid_bins)
+        
+        if n_bins == 0:
+            logger.error("Voronoi binning failed to create any valid bins")
+            # 创建一个后备单bin方案
+            bin_num = np.zeros_like(x, dtype=int)
+            bin_num[~valid_mask] = -1  # 将无效点标记为-1
+            valid_bins = np.array([0])
+            n_bins = 1
+            x_gen = np.array([np.mean(x[valid_mask])])
+            y_gen = np.array([np.mean(y[valid_mask])])
+            sn = np.array([np.mean(signal[valid_mask]/noise[valid_mask]) if np.any(valid_mask) else 1.0])
+            n_pixels = np.array([np.sum(valid_mask)])
+            logger.warning("Created a single bin as fallback due to binning failure")
+        else:
+            logger.info(f"Created {n_bins} Voronoi bins")
         
         # Create arrays to store bin results
         bin_indices = []
@@ -118,18 +140,39 @@ def run_vnb_analysis(args, cube, p2p_results=None):
         
         # Combine spectra in each bin
         logger.info("Combining spectra in each bin...")
-        for i, bin_id in enumerate(unique_bins):
+        for i, bin_id in enumerate(valid_bins):
             # Get indices of spectra in this bin
             mask = bin_num == bin_id
             indices = np.where(mask)[0]
+            
+            if len(indices) == 0:
+                logger.warning(f"Bin {bin_id} contains no pixels, using nearest bin instead")
+                # 如果这个bin没有像素，使用最近的非空bin的数据
+                non_empty_bins = [b for b in valid_bins if np.any(bin_num == b)]
+                if non_empty_bins:
+                    closest_bin = non_empty_bins[0]
+                    indices = np.where(bin_num == closest_bin)[0]
+                else:
+                    # 如果所有bin都是空的，使用所有有效数据点
+                    indices = np.where(valid_mask)[0]
+            
             bin_indices.append(indices)
             
             # Combine spectra
             bin_spectra_list = []
             
             for idx in indices:
+                # 确保索引在有效范围内
+                if idx >= len(cube._spectra[0]):
+                    logger.warning(f"Index {idx} out of range for cube spectra, skipping")
+                    continue
+                    
                 # Get spectrum
                 spectrum = cube._spectra[:, idx]
+                
+                # 跳过无效光谱
+                if not np.any(np.isfinite(spectrum)):
+                    continue
                 
                 # Apply velocity correction if available
                 if velocity_field is not None:
@@ -138,40 +181,81 @@ def run_vnb_analysis(args, cube, p2p_results=None):
                     col = idx % cube._n_x
                     
                     # Check if position is valid
-                    if row < velocity_field.shape[0] and col < velocity_field.shape[1]:
+                    if (row < velocity_field.shape[0] and col < velocity_field.shape[1] and 
+                        np.isfinite(velocity_field[row, col])):
                         vel = velocity_field[row, col]
-                        
-                        # Apply correction only if velocity is valid
-                        if np.isfinite(vel):
-                            spectrum = apply_velocity_shift(spectrum, cube._lambda_gal, vel)
+                        spectrum = apply_velocity_shift(spectrum, cube._lambda_gal, vel)
                 
                 bin_spectra_list.append(spectrum)
             
             # Combine spectra (median)
-            bin_spectra[:, i] = np.nanmedian(np.array(bin_spectra_list), axis=0)
+            if bin_spectra_list:
+                bin_spectra[:, i] = np.nanmedian(np.array(bin_spectra_list), axis=0)
+            else:
+                # 如果没有有效光谱，填充NaN
+                bin_spectra[:, i] = np.nan
+                logger.warning(f"Bin {bin_id} has no valid spectra")
         
-        # Create BinnedSpectra object
-        binned_data = BinnedSpectra(
-            bin_type='voronoi',
+        # 创建元数据字典
+        metadata = {
+            'x_gen': x_gen,
+            'y_gen': y_gen,
+            'sn': sn,
+            'n_pixels': n_pixels,
+            'scale': scale,
+            'target_snr': target_snr
+        }
+        
+        # 如果p2p_results中有距离信息，添加到元数据
+        if p2p_results is not None and 'distance' in p2p_results:
+            # 为每个bin计算平均距离
+            if 'field' in p2p_results['distance']:
+                distance_field = p2p_results['distance']['field']
+                bin_distances = []
+                
+                for i, bin_id in enumerate(valid_bins):
+                    mask = bin_num == bin_id
+                    if np.any(mask):
+                        # 获取此bin中点的线性索引
+                        indices = np.where(mask)[0]
+                        
+                        # 转换为2D索引
+                        rows = indices // cube._n_x
+                        cols = indices % cube._n_x
+                        
+                        # 计算平均距离
+                        valid_dist = []
+                        for r, c in zip(rows, cols):
+                            if (r < distance_field.shape[0] and c < distance_field.shape[1] and 
+                                np.isfinite(distance_field[r, c])):
+                                valid_dist.append(distance_field[r, c])
+                        
+                        if valid_dist:
+                            bin_distances.append(np.mean(valid_dist))
+                        else:
+                            bin_distances.append(np.nan)
+                    else:
+                        bin_distances.append(np.nan)
+                
+                metadata['bin_distances'] = np.array(bin_distances)
+        
+        # Create VoronoiBinnedData object
+        binned_data = VoronoiBinnedData(
             bin_num=bin_num,
             bin_indices=bin_indices,
             spectra=bin_spectra,
             wavelength=cube._lambda_gal,
-            metadata={
-                'x_gen': x_gen,
-                'y_gen': y_gen,
-                'sn': sn,
-                'n_pixels': n_pixels,
-                'scale': scale,
-                'target_snr': target_snr
-            }
+            metadata=metadata
         )
         
         # Save binned data
         binned_data.save(output_dir / f"{galaxy_name}_VNB_binned_data.npz")
         logger.info(f"Saved binned data to {galaxy_name}_VNB_binned_data.npz")
         
-        # Create bin visualization
+        # 创建可视化图表
+        binned_data.create_visualization_plots(output_dir, galaxy_name)
+        
+        # Create additional bin visualization
         if not args.no_plots:
             fig = plot_binned_map(
                 x, y, bin_num, title=f"{galaxy_name} - Voronoi Bins (SNR={target_snr})",
@@ -186,8 +270,13 @@ def run_vnb_analysis(args, cube, p2p_results=None):
                 cmap='viridis', savefile=plots_dir / f"{galaxy_name}_VNB_snr.png"
             )
             plt.close(fig)
+            
+        return binned_data
+
     except Exception as e:
         logger.error(f"Error in Voronoi binning: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         raise
     
     # Step 3: Create pseudo-cube for processing

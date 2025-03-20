@@ -149,9 +149,9 @@ def apply_velocity_shift(spectrum, wavelength, velocity):
     shifted_wavelength = wavelength / (1 + velocity/C_KMS)
     return spectres(wavelength, shifted_wavelength, spectrum, fill=0.0)
 
-def run_voronoi_binning(x, y, signal, noise, target_snr, plot=False, quiet=True, cvt=True):
+def run_voronoi_binning(x, y, signal, noise, target_snr, plot=False, quiet=True, cvt=True, min_snr=None):
     """
-    Run Voronoi binning algorithm.
+    Run Voronoi binning algorithm with enhanced error handling.
     
     Parameters
     ----------
@@ -169,56 +169,112 @@ def run_voronoi_binning(x, y, signal, noise, target_snr, plot=False, quiet=True,
         Whether to suppress information.
     cvt : bool, optional
         Whether to use centroidal Voronoi tessellation.
+    min_snr : float, optional
+        Minimum SNR to try if original target fails. Defaults to target_snr/2.
         
     Returns
     -------
     tuple
         (bin_num, x_gen, y_gen, sn, n_pixels, scale)
     """
-    try:
-        from vorbin.voronoi_2d_binning import voronoi_2d_binning
-        result = voronoi_2d_binning(
-            x, y, signal, noise, target_snr, 
-            plot=plot, quiet=quiet, cvt=cvt
-        )
-        
-        # Check how many values are returned and handle appropriately
-        if isinstance(result, tuple):
-            if len(result) == 6:
-                # Standard return: bin_num, x_gen, y_gen, sn, n_pixels, scale
-                return result
-            elif len(result) > 6:
-                # Some versions return extra values we don't need
-                bin_num, x_gen, y_gen, sn, n_pixels, scale = result[:6]
-                return bin_num, x_gen, y_gen, sn, n_pixels, scale
+    import logging
+    import numpy as np
+    logger = logging.getLogger(__name__)
+    
+    # 处理输入数据，确保没有无效值
+    valid_mask = np.isfinite(x) & np.isfinite(y) & np.isfinite(signal) & np.isfinite(noise) & (noise > 0)
+    if np.sum(valid_mask) < 10:  # 需要至少10个有效点
+        logger.error(f"Too few valid data points for Voronoi binning: {np.sum(valid_mask)}")
+        # 创建一个简单的单bin解决方案
+        bin_num = np.zeros_like(x, dtype=int)
+        x_gen = np.array([np.mean(x[valid_mask])] if np.any(valid_mask) else [0])
+        y_gen = np.array([np.mean(y[valid_mask])] if np.any(valid_mask) else [0])
+        sn = np.array([np.mean(signal[valid_mask]/noise[valid_mask])] if np.any(valid_mask) else [1])
+        n_pixels = np.array([np.sum(valid_mask)])
+        scale = 1.0
+        logger.warning("Created a single bin as fallback due to insufficient valid data")
+        return bin_num, x_gen, y_gen, sn, n_pixels, scale
+    
+    # 使用有效点
+    x_valid = x[valid_mask]
+    y_valid = y[valid_mask]
+    signal_valid = signal[valid_mask]
+    noise_valid = noise[valid_mask]
+    
+    # 如果没有指定最小SNR，默认为目标值的一半
+    if min_snr is None:
+        min_snr = target_snr / 2
+    
+    # 逐步降低SNR，直到成功
+    current_snr = target_snr
+    success = False
+    
+    while not success and current_snr >= min_snr:
+        try:
+            from vorbin.voronoi_2d_binning import voronoi_2d_binning
+            result = voronoi_2d_binning(
+                x_valid, y_valid, signal_valid, noise_valid, current_snr, 
+                plot=plot, quiet=quiet, cvt=cvt
+            )
+            
+            # 检查结果
+            if isinstance(result, tuple):
+                if len(result) >= 6:
+                    # 获取有效结果
+                    valid_bin_num, x_gen, y_gen, sn, n_pixels, scale = result[:6]
+                    success = True
+                else:
+                    # 结果不完整
+                    logger.warning(f"Voronoi binning returned insufficient values with SNR={current_snr}")
+                    current_snr *= 0.8  # 降低SNR并重试
             else:
-                # Not enough values returned
-                logger.warning(f"Unexpected number of return values from voronoi_2d_binning: {len(result)}")
-                raise ValueError("Voronoi binning returned insufficient values")
-        else:
-            # Single return value (likely just bin_num)
-            bin_num = result
-            # Create sensible defaults for other values
-            unique_bins = np.unique(bin_num)
-            x_gen = np.zeros(len(unique_bins))
-            y_gen = np.zeros(len(unique_bins))
-            sn = np.ones(len(unique_bins)) * target_snr
-            n_pixels = np.ones(len(unique_bins))
-            scale = 1.0
-            
-            # Calculate bin centers and statistics
-            for i, bin_id in enumerate(unique_bins):
-                mask = bin_num == bin_id
-                if np.any(mask):
-                    x_gen[i] = np.mean(x[mask])
-                    y_gen[i] = np.mean(y[mask])
-                    n_pixels[i] = np.sum(mask)
-            
-            return bin_num, x_gen, y_gen, sn, n_pixels, scale
-            
-    except ImportError:
-        logger.error("vorbin package not found. Please install with 'pip install vorbin'")
-        raise
+                # 单一返回值（可能只是bin_num）
+                valid_bin_num = result
+                # 创建合理的默认值
+                unique_bins = np.unique(valid_bin_num)
+                if len(unique_bins) > 0:  # 确保有bin
+                    x_gen = np.zeros(len(unique_bins))
+                    y_gen = np.zeros(len(unique_bins))
+                    sn = np.ones(len(unique_bins)) * current_snr
+                    n_pixels = np.ones(len(unique_bins))
+                    
+                    # 计算bin中心和统计信息
+                    for i, bin_id in enumerate(unique_bins):
+                        mask = valid_bin_num == bin_id
+                        if np.any(mask):
+                            x_gen[i] = np.mean(x_valid[mask])
+                            y_gen[i] = np.mean(y_valid[mask])
+                            n_pixels[i] = np.sum(mask)
+                    
+                    scale = 1.0
+                    success = True
+                else:
+                    # 没有有效bin，降低SNR并重试
+                    logger.warning(f"No valid bins created with SNR={current_snr}")
+                    current_snr *= 0.8
+        
+        except Exception as e:
+            logger.warning(f"Voronoi binning failed with SNR={current_snr}: {str(e)}")
+            current_snr *= 0.8  # 降低SNR并重试
+    
+    # 如果所有尝试都失败，创建单一bin作为后备方案
+    if not success:
+        logger.warning(f"All Voronoi binning attempts failed, creating a single bin as fallback")
+        valid_bin_num = np.zeros_like(x_valid, dtype=int)
+        x_gen = np.array([np.mean(x_valid)])
+        y_gen = np.array([np.mean(y_valid)])
+        sn = np.array([np.mean(signal_valid/noise_valid)])
+        n_pixels = np.array([len(x_valid)])
+        scale = 1.0
+    
+    # 将bin编号映射回原始数组
+    bin_num = -np.ones_like(x, dtype=int)  # 初始化为-1（无效值）
+    bin_num[valid_mask] = valid_bin_num
+    
+    if current_snr < target_snr:
+        logger.info(f"Voronoi binning succeeded with reduced SNR={current_snr} (target was {target_snr})")
+    
+    return bin_num, x_gen, y_gen, sn, n_pixels, scale
 
 def calculate_radial_bins(x, y, center_x=0, center_y=0, pa=0, ellipticity=0, 
                          n_rings=10, log_spacing=False):
@@ -1176,6 +1232,200 @@ class BinnedSpectra:
         
         return PseudoCube(cube, fake_cube, self)
     
+    def to_plot_format(self):
+        """
+        将binned数据转换为绘图友好的格式
+        
+        Returns
+        -------
+        dict
+            包含适用于绘图函数的数据
+        """
+        import numpy as np
+        
+        # 确保我们有距离信息
+        has_distance = False
+        distances = []
+        
+        # 从元数据中提取距离信息
+        if 'distance' in self.metadata:
+            has_distance = True
+            distances = self.metadata['distance']
+        elif 'bin_distances' in self.metadata:
+            has_distance = True
+            distances = self.metadata['bin_distances']
+        elif 'radii' in self.metadata:
+            has_distance = True
+            distances = self.metadata['radii']
+        
+        # 如果没有找到现成的距离信息，可以创建简单的序列
+        if not has_distance:
+            distances = np.arange(self.n_bins)
+        
+        # 为绘图准备数据结构
+        plot_data = {
+            # 基本信息
+            'bin_type': self.bin_type,
+            'n_bins': self.n_bins,
+            
+            # 距离信息
+            'distance': {
+                'bin_distances': distances
+            },
+            
+            # 恒星运动学参数 - 设置一个默认结构
+            'stellar_kinematics': {
+                'velocity': np.zeros(self.n_bins),
+                'dispersion': np.zeros(self.n_bins)
+            },
+            
+            # 发射线参数 - 设置一个默认空结构
+            'emission': {},
+            
+            # 谱指数 - 设置一个默认空结构
+            'indices': {}
+        }
+        
+        # 从元数据填充恒星运动学
+        if 'stellar_vel' in self.metadata:
+            plot_data['stellar_kinematics']['velocity'] = self.metadata['stellar_vel']
+        if 'stellar_disp' in self.metadata:
+            plot_data['stellar_kinematics']['dispersion'] = self.metadata['stellar_disp']
+        elif 'stellar_sigma' in self.metadata:
+            plot_data['stellar_kinematics']['dispersion'] = self.metadata['stellar_sigma']
+        
+        # 填充发射线参数
+        line_prefixes = ['flux_', 'em_vel_', 'em_sig_']
+        for key in self.metadata:
+            for prefix in line_prefixes:
+                if key.startswith(prefix):
+                    line_name = key[len(prefix):]
+                    plot_data['emission'][key] = self.metadata[key]
+        
+        # 填充谱指数
+        for key in self.metadata:
+            if key.startswith('index_'):
+                index_name = key[6:]
+                plot_data['indices'][index_name] = self.metadata[key]
+        
+        # 添加恒星物理参数
+        stellar_pop_keys = ['log_age', 'age', 'metallicity']
+        has_stellar_pop = False
+        stellar_pop = {}
+        
+        for key in stellar_pop_keys:
+            if key in self.metadata:
+                stellar_pop[key] = self.metadata[key]
+                has_stellar_pop = True
+        
+        if has_stellar_pop:
+            plot_data['stellar_population'] = stellar_pop
+        
+        return plot_data
+    
+    def create_visualization_plots(self, output_dir, galaxy_name):
+        """
+        为binned数据创建可视化图表
+        
+        Parameters
+        ----------
+        output_dir : Path
+            输出目录
+        galaxy_name : str
+            星系名称
+        """
+        import logging
+        import matplotlib.pyplot as plt
+        from pathlib import Path
+        
+        logger = logging.getLogger(__name__)
+        
+        try:
+            # 创建plots目录
+            plots_dir = output_dir / 'plots'
+            plots_dir.mkdir(exist_ok=True, parents=True)
+            
+            # 转换为绘图格式
+            plot_data = self.to_plot_format()
+            
+            # 导入绘图模块
+            # 注意：这里假设p2p模块已经导入
+            try:
+                from analysis.p2p import create_radial_profile_plots
+                
+                # 创建径向剖面图
+                create_radial_profile_plots(
+                    plot_data, 
+                    plots_dir=plots_dir, 
+                    galaxy_name=galaxy_name, 
+                    analysis_type=self.bin_type.upper()
+                )
+                
+                logger.info(f"Created radial profile plots in {plots_dir}")
+            except ImportError:
+                logger.warning("p2p module not available, falling back to basic visualization")
+                
+                # 创建基本径向剖面图
+                if 'stellar_kinematics' in plot_data and 'distance' in plot_data:
+                    # 创建速度剖面图
+                    fig, ax = plt.subplots(figsize=(10, 6))
+                    ax.plot(plot_data['distance']['bin_distances'], 
+                          plot_data['stellar_kinematics']['velocity'], 
+                          'o-', label='Velocity')
+                    ax.set_xlabel('Radius (arcsec)')
+                    ax.set_ylabel('Velocity (km/s)')
+                    ax.set_title(f'{galaxy_name} Velocity Profile')
+                    ax.grid(True, alpha=0.3)
+                    plt.tight_layout()
+                    fig.savefig(plots_dir / f"{galaxy_name}_{self.bin_type}_velocity_profile.png", dpi=150)
+                    plt.close(fig)
+                    
+                    # 创建弥散剖面图
+                    fig, ax = plt.subplots(figsize=(10, 6))
+                    ax.plot(plot_data['distance']['bin_distances'], 
+                          plot_data['stellar_kinematics']['dispersion'], 
+                          'o-', label='Dispersion')
+                    ax.set_xlabel('Radius (arcsec)')
+                    ax.set_ylabel('Velocity Dispersion (km/s)')
+                    ax.set_title(f'{galaxy_name} Velocity Dispersion Profile')
+                    ax.grid(True, alpha=0.3)
+                    plt.tight_layout()
+                    fig.savefig(plots_dir / f"{galaxy_name}_{self.bin_type}_dispersion_profile.png", dpi=150)
+                    plt.close(fig)
+            
+            # 绘制各个bin的光谱（选择一部分bin）
+            try:
+                n_samples = min(4, self.n_bins)  # 最多绘制4个bin
+                sample_indices = [0]  # 始终包括第一个bin
+                
+                # 添加其他bin的索引（均匀分布）
+                if self.n_bins > 1:
+                    sample_indices.extend([
+                        i * (self.n_bins - 1) // (n_samples - 1)
+                        for i in range(1, n_samples)
+                    ])
+                
+                for i, bin_idx in enumerate(sample_indices):
+                    if bin_idx < self.spectra.shape[1]:
+                        fig, ax = plt.subplots(figsize=(10, 5))
+                        ax.plot(self.wavelength, self.spectra[:, bin_idx], 'k-')
+                        ax.set_xlabel('Wavelength (Å)')
+                        ax.set_ylabel('Flux')
+                        ax.set_title(f'Bin {bin_idx} Spectrum')
+                        plt.tight_layout()
+                        fig.savefig(plots_dir / f"{galaxy_name}_{self.bin_type}_bin_{bin_idx}_spectrum.png", dpi=150)
+                        plt.close(fig)
+                
+                logger.info(f"Created spectrum plots for {len(sample_indices)} bins")
+                
+            except Exception as e:
+                logger.error(f"Error creating bin spectrum plots: {e}")
+                plt.close('all')
+            
+        except Exception as e:
+            logger.error(f"Error creating visualization plots: {e}")
+            plt.close('all')
+    
     def save(self, filename):
         """
         保存binned数据到文件
@@ -1431,6 +1681,68 @@ class BinnedSpectra:
         except Exception as e:
             logger.error(f"Error loading binned data: {str(e)}")
             raise
+
+class VoronoiBinnedData(BinnedSpectra):
+    """
+    Voronoi binned 数据类
+    
+    扩展BinnedSpectra类，专门用于Voronoi binning结果
+    """
+    
+    def __init__(self, bin_num, bin_indices, spectra, wavelength, metadata=None):
+        """
+        初始化Voronoi binned数据
+        
+        Parameters
+        ----------
+        bin_num : numpy.ndarray
+            每个像素对应的bin号
+        bin_indices : list
+            每个bin中包含的像素索引列表
+        spectra : numpy.ndarray
+            合并后的光谱数据，形状为(n_wavelength, n_bins)
+        wavelength : numpy.ndarray
+            波长数组
+        metadata : dict, optional
+            额外的元数据
+        """
+        super().__init__("voronoi", bin_num, bin_indices, spectra, wavelength, metadata)
+
+class RadialBinnedData(BinnedSpectra):
+    """
+    径向binned数据类
+    
+    扩展BinnedSpectra类，专门用于径向binning结果
+    """
+    
+    def __init__(self, bin_num, bin_indices, spectra, wavelength, bin_radii=None, metadata=None):
+        """
+        初始化径向binned数据
+        
+        Parameters
+        ----------
+        bin_num : numpy.ndarray
+            每个像素对应的bin号
+        bin_indices : list
+            每个bin中包含的像素索引列表
+        spectra : numpy.ndarray
+            合并后的光谱数据，形状为(n_wavelength, n_bins)
+        wavelength : numpy.ndarray
+            波长数组
+        bin_radii : numpy.ndarray, optional
+            每个bin的半径
+        metadata : dict, optional
+            额外的元数据
+        """
+        if metadata is None:
+            metadata = {}
+            
+        # 确保有径向距离信息
+        if bin_radii is not None:
+            metadata['bin_distances'] = bin_radii
+            metadata['radii'] = bin_radii
+            
+        super().__init__("radial", bin_num, bin_indices, spectra, wavelength, metadata)
 
 # Utility functions for plotting
 def plot_binned_map(x, y, bin_num, values=None, title=None, cmap='viridis', 
