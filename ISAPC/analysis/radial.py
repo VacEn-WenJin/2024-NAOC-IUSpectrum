@@ -14,7 +14,7 @@ import galaxy_params
 import visualization
 from utils.io import save_results_to_npz
 from binning import (
-    calculate_radial_bins, apply_velocity_shift, BinnedSpectra,
+    calculate_radial_bins, apply_velocity_shift, BinnedSpectra, RadialBinnedData,
     plot_binned_map, plot_radial_profile
 )
 
@@ -65,6 +65,36 @@ def run_rdb_analysis(args, cube, p2p_results=None):
     # Step 1: Extract coordinates for binning
     # ---------------------------------------------
     try:
+        # 检查是否有goodwavelength可用于截取光谱
+        wave_mask = None
+        good_lambda = None
+
+        # 首先检查cube对象是否已经有_goodwavelength属性
+        if hasattr(cube, '_goodwavelength') and cube._goodwavelength is not None:
+            good_lambda = cube._goodwavelength
+            wave_mask = (cube._lambda_gal >= good_lambda[0]) & (cube._lambda_gal <= good_lambda[1])
+            logger.info(f"Using goodwavelength range from cube object: {good_lambda[0]:.1f} - {good_lambda[1]:.1f} Å")
+        # 如果没有，尝试从FITS头中读取
+        elif hasattr(cube, '_fits_hdu_header'):
+            if 'WAVGOOD0' in cube._fits_hdu_header and 'WAVGOOD1' in cube._fits_hdu_header:
+                good_lambda = (
+                    float(cube._fits_hdu_header['WAVGOOD0']) / (1 + cube._redshift),
+                    float(cube._fits_hdu_header['WAVGOOD1']) / (1 + cube._redshift)
+                )
+                wave_mask = (cube._lambda_gal >= good_lambda[0]) & (cube._lambda_gal <= good_lambda[1])
+                logger.info(f"Found goodwavelength range in header with redshift correction: {good_lambda[0]:.1f} - {good_lambda[1]:.1f} Å")
+            else:
+                # 如果在FITS头中也找不到
+                wave_mask = np.ones_like(cube._lambda_gal, dtype=bool)
+                logger.info("No goodwavelength range found in header, using full wavelength range")
+        else:
+            # 如果没有goodwavelength，使用全部波长
+            wave_mask = np.ones_like(cube._lambda_gal, dtype=bool)
+            logger.info("No goodwavelength range found, using full wavelength range")
+
+        # 截取波长范围
+        wavelength = cube._lambda_gal[wave_mask]
+        
         # Get coordinates
         x = np.zeros(cube._n_y * cube._n_x)
         y = np.zeros(cube._n_y * cube._n_x)
@@ -107,7 +137,7 @@ def run_rdb_analysis(args, cube, p2p_results=None):
         
         # Create arrays to store bin results
         bin_indices = []
-        bin_spectra = np.zeros((len(cube._lambda_gal), n_bins))
+        bin_spectra = np.zeros((len(wavelength), n_bins))  # 使用截取后的波长长度
         
         # Get velocity field for correction if available from P2P results
         velocity_field = None
@@ -139,7 +169,10 @@ def run_rdb_analysis(args, cube, p2p_results=None):
                 
                 # Get spectrum - need to convert to indices that match spectral array
                 spaxel_idx = row * cube._n_x + col
-                spectrum = cube._spectra[:, spaxel_idx]
+                
+                # 获取并截取光谱
+                full_spectrum = cube._spectra[:, spaxel_idx]
+                spectrum = full_spectrum[wave_mask]
                 
                 # Apply velocity correction if available
                 if velocity_field is not None:
@@ -149,7 +182,7 @@ def run_rdb_analysis(args, cube, p2p_results=None):
                         
                         # Apply correction only if velocity is valid
                         if np.isfinite(vel):
-                            spectrum = apply_velocity_shift(spectrum, cube._lambda_gal, vel)
+                            spectrum = apply_velocity_shift(spectrum, wavelength, vel)
                 
                 spectra_list.append(spectrum)
             
@@ -160,7 +193,16 @@ def run_rdb_analysis(args, cube, p2p_results=None):
             bin_spectra[:, i] = np.nanmedian(stacked_spectra, axis=0)
             
             # Calculate SNR
-            continuum_region = (cube._lambda_gal > 5000) & (cube._lambda_gal < 5200)
+            # 使用截取的波长区域内找合适的连续谱区域
+            if np.any((wavelength > 5000) & (wavelength < 5200)):
+                continuum_region = (wavelength > 5000) & (wavelength < 5200)
+            else:
+                # 如果截取后的波长区域不包含5000-5200区间，选择中间1/3作为连续谱
+                total_len = len(wavelength)
+                start_idx = total_len // 3
+                end_idx = 2 * total_len // 3
+                continuum_region = np.arange(start_idx, end_idx)
+            
             signal = np.nanmedian(bin_spectra[continuum_region, i])
             noise = np.nanstd(bin_spectra[continuum_region, i])
             if noise > 0:
@@ -168,28 +210,34 @@ def run_rdb_analysis(args, cube, p2p_results=None):
             else:
                 bin_snr[i] = 0
         
-        # Create BinnedSpectra object
-        binned_data = BinnedSpectra(
-            bin_type='radial',
+        # Create metadata
+        metadata = {
+            'bin_edges': bin_edges,
+            'bin_radii': bin_radii,
+            'center_x': center_x,
+            'center_y': center_y,
+            'pa': pa,
+            'ellipticity': ellipticity,
+            'log_spacing': log_spacing,
+            'sn': bin_snr
+        }
+        
+        # Create RadialBinnedData object
+        binned_data = RadialBinnedData(
             bin_num=bin_num,
             bin_indices=bin_indices,
             spectra=bin_spectra,
-            wavelength=cube._lambda_gal,
-            metadata={
-                'bin_edges': bin_edges,
-                'bin_radii': bin_radii,
-                'center_x': center_x,
-                'center_y': center_y,
-                'pa': pa,
-                'ellipticity': ellipticity,
-                'log_spacing': log_spacing,
-                'sn': bin_snr
-            }
+            wavelength=wavelength,  # 使用截取后的波长
+            bin_radii=bin_radii,
+            metadata=metadata
         )
         
         # Save binned data
         binned_data.save(output_dir / f"{galaxy_name}_RDB_binned_data.npz")
         logger.info(f"Saved binned data to {galaxy_name}_RDB_binned_data.npz")
+        
+        # 创建可视化图表
+        binned_data.create_visualization_plots(output_dir, galaxy_name)
         
         # Create bin visualization
         if not args.no_plots:
@@ -428,15 +476,20 @@ def run_rdb_analysis(args, cube, p2p_results=None):
         if 'stellar_kinematics' in rdb_results:
             vel = rdb_results['stellar_kinematics']['velocity']
             disp = rdb_results['stellar_kinematics']['dispersion']
+            
+            # 确保一维数组格式
+            vel = vel.flatten() if hasattr(vel, 'flatten') else vel
+            disp = disp.flatten() if hasattr(disp, 'flatten') else disp
+            
             component_sol = [f'[{v}, {d}]' for v, d in zip(vel, disp)]
         else:
             component_sol = ['[0, 0]'] * n_bins
         
         # Add emission line fluxes if available
-        h_beta_el_value = np.full(n_bins, np.nan)
-        h_beta_el_anr = np.full(n_bins, np.nan)
-        o3_5007_el_value = np.full(n_bins, np.nan)
-        o3_5007_el_anr = np.full(n_bins, np.nan)
+        h_beta_el_value = np.full(n_bins, np.nan).flatten()
+        h_beta_el_anr = np.full(n_bins, np.nan).flatten()
+        o3_5007_el_value = np.full(n_bins, np.nan).flatten()
+        o3_5007_el_anr = np.full(n_bins, np.nan).flatten()
         
         if 'emission' in rdb_results:
             emission = rdb_results['emission']
@@ -444,31 +497,35 @@ def run_rdb_analysis(args, cube, p2p_results=None):
             # Look for Hbeta flux
             for key in emission:
                 if key.startswith('flux_') and 'Hbeta' in key:
-                    h_beta_el_value = emission[key]
+                    h_beta_el_value = emission[key].flatten() if hasattr(emission[key], 'flatten') else emission[key]
                     break
             
             # Look for OIII flux
             for key in emission:
                 if key.startswith('flux_') and ('[OIII]5007' in key or 'OIII_5007' in key):
-                    o3_5007_el_value = emission[key]
+                    o3_5007_el_value = emission[key].flatten() if hasattr(emission[key], 'flatten') else emission[key]
                     break
         
         # Add spectral indices if available
-        h_beta_si = np.full(n_bins, np.nan)
-        mg_b_si = np.full(n_bins, np.nan)
-        fe_5015_si = np.full(n_bins, np.nan)
+        h_beta_si = np.full(n_bins, np.nan).flatten()
+        mg_b_si = np.full(n_bins, np.nan).flatten()
+        fe_5015_si = np.full(n_bins, np.nan).flatten()
         
         if 'indices' in rdb_results:
             indices = rdb_results['indices']
             
             if 'Hbeta' in indices:
-                h_beta_si = indices['Hbeta']
+                h_beta_si = indices['Hbeta'].flatten() if hasattr(indices['Hbeta'], 'flatten') else indices['Hbeta']
             
             if 'Mgb' in indices:
-                mg_b_si = indices['Mgb']
+                mg_b_si = indices['Mgb'].flatten() if hasattr(indices['Mgb'], 'flatten') else indices['Mgb']
             
             if 'Fe5015' in indices:
-                fe_5015_si = indices['Fe5015']
+                fe_5015_si = indices['Fe5015'].flatten() if hasattr(indices['Fe5015'], 'flatten') else indices['Fe5015']
+        
+        # 确保所有数组都是一维的
+        bin_radii_flat = bin_radii.flatten() if hasattr(bin_radii, 'flatten') else bin_radii
+        bin_snr_flat = bin_snr.flatten() if hasattr(bin_snr, 'flatten') else bin_snr
         
         # Create final dataframe
         legacy_df = pd.DataFrame({
@@ -480,8 +537,8 @@ def run_rdb_analysis(args, cube, p2p_results=None):
             'H_beta_SI': h_beta_si,
             'Mg_b_SI': mg_b_si,
             'Fe_5015_SI': fe_5015_si,
-            'R': bin_radii,  # Add radius information (crucial for RDB)
-            'SNR': bin_snr,
+            'R': bin_radii_flat,  # Add radius information (crucial for RDB)
+            'SNR': bin_snr_flat,
             'K_index': bin_indices_str
         })
         
@@ -606,8 +663,10 @@ def run_rdb_analysis(args, cube, p2p_results=None):
                 
                 # Plot emission line velocities if available
                 if 'velocity' in emission:
+                    emission_vel = emission['velocity'].flatten() if hasattr(emission['velocity'], 'flatten') else emission['velocity']
+                    
                     fig = plot_radial_profile(
-                        bin_radii, emission['velocity'],
+                        bin_radii, emission_vel,
                         title=f"{galaxy_name} - Gas Velocity Profile",
                         xlabel="Radius (arcsec)",
                         ylabel="Velocity (km/s)",
@@ -619,7 +678,7 @@ def run_rdb_analysis(args, cube, p2p_results=None):
                     gas_vel_values = np.zeros_like(bin_num, dtype=float)
                     for i, bin_id in enumerate(unique_bins):
                         mask = bin_num == bin_id
-                        gas_vel_values[mask] = emission['velocity'][i]
+                        gas_vel_values[mask] = emission_vel[i]
                     
                     fig = plot_binned_map(
                         x_2d, y_2d, bin_num, values=gas_vel_values,
@@ -636,10 +695,13 @@ def run_rdb_analysis(args, cube, p2p_results=None):
                     if key.startswith('flux_'):
                         line_name = key[5:]  # Remove 'flux_' prefix
                         
+                        # 确保是一维数组
+                        line_values = values.flatten() if hasattr(values, 'flatten') else values
+                        
                         # Only plot if we have valid values
-                        if np.any(~np.isnan(values)):
+                        if np.any(~np.isnan(line_values)):
                             fig = plot_radial_profile(
-                                bin_radii, values,
+                                bin_radii, line_values,
                                 title=f"{galaxy_name} - {line_name} Flux Profile",
                                 xlabel="Radius (arcsec)",
                                 ylabel="Flux",
@@ -651,7 +713,7 @@ def run_rdb_analysis(args, cube, p2p_results=None):
                             flux_values = np.zeros_like(bin_num, dtype=float)
                             for i, bin_id in enumerate(unique_bins):
                                 mask = bin_num == bin_id
-                                flux_values[mask] = values[i]
+                                flux_values[mask] = line_values[i] if i < len(line_values) else np.nan
                             
                             fig = plot_binned_map(
                                 x_2d, y_2d, bin_num, values=flux_values,
@@ -665,9 +727,12 @@ def run_rdb_analysis(args, cube, p2p_results=None):
                 # Plot line ratios
                 if 'line_ratios' in emission:
                     for ratio_name, values in emission['line_ratios'].items():
-                        if np.any(~np.isnan(values)):
+                        # 确保是一维数组
+                        ratio_values = values.flatten() if hasattr(values, 'flatten') else values
+                        
+                        if np.any(~np.isnan(ratio_values)):
                             fig = plot_radial_profile(
-                                bin_radii, values,
+                                bin_radii, ratio_values,
                                 title=f"{galaxy_name} - {ratio_name} Ratio Profile",
                                 xlabel="Radius (arcsec)",
                                 ylabel="Ratio",
@@ -676,13 +741,13 @@ def run_rdb_analysis(args, cube, p2p_results=None):
                             plt.close(fig)
                             
                             # Create 2D map
-                            ratio_values = np.zeros_like(bin_num, dtype=float)
+                            ratio_map_values = np.zeros_like(bin_num, dtype=float)
                             for i, bin_id in enumerate(unique_bins):
                                 mask = bin_num == bin_id
-                                ratio_values[mask] = values[i]
+                                ratio_map_values[mask] = ratio_values[i] if i < len(ratio_values) else np.nan
                             
                             fig = plot_binned_map(
-                                x_2d, y_2d, bin_num, values=ratio_values,
+                                x_2d, y_2d, bin_num, values=ratio_map_values,
                                 title=f"{galaxy_name} - {ratio_name} Ratio",
                                 cmap='viridis',
                                 equal_aspect=args.equal_aspect if hasattr(args, 'equal_aspect') else True,
@@ -695,10 +760,13 @@ def run_rdb_analysis(args, cube, p2p_results=None):
                 indices = rdb_results['indices']
                 
                 for index_name, values in indices.items():
+                    # 确保是一维数组
+                    index_values = values.flatten() if hasattr(values, 'flatten') else values
+                    
                     # Only plot if we have valid values
-                    if np.any(~np.isnan(values)):
+                    if np.any(~np.isnan(index_values)):
                         fig = plot_radial_profile(
-                            bin_radii, values,
+                            bin_radii, index_values,
                             title=f"{galaxy_name} - {index_name} Index Profile",
                             xlabel="Radius (arcsec)",
                             ylabel=f"{index_name} Index",
@@ -707,13 +775,13 @@ def run_rdb_analysis(args, cube, p2p_results=None):
                         plt.close(fig)
                         
                         # Create 2D map
-                        index_values = np.zeros_like(bin_num, dtype=float)
+                        index_map_values = np.zeros_like(bin_num, dtype=float)
                         for i, bin_id in enumerate(unique_bins):
                             mask = bin_num == bin_id
-                            index_values[mask] = values[i]
+                            index_map_values[mask] = index_values[i] if i < len(index_values) else np.nan
                         
                         fig = plot_binned_map(
-                            x_2d, y_2d, bin_num, values=index_values,
+                            x_2d, y_2d, bin_num, values=index_map_values,
                             title=f"{galaxy_name} - {index_name} Index",
                             cmap='viridis',
                             equal_aspect=args.equal_aspect if hasattr(args, 'equal_aspect') else True,

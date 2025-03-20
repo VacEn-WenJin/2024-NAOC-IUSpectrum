@@ -60,12 +60,51 @@ def run_vnb_analysis(args, cube, p2p_results=None):
     # Step 1: Calculate signal and noise for binning
     # ---------------------------------------------
     try:
+        # 检查是否有goodwavelength可用于截取光谱
+        wave_mask = None
+        good_lambda = None
+
+        # 首先检查cube对象是否已经有_goodwavelength属性
+        if hasattr(cube, '_goodwavelength') and cube._goodwavelength is not None:
+            good_lambda = cube._goodwavelength
+            wave_mask = (cube._lambda_gal >= good_lambda[0]) & (cube._lambda_gal <= good_lambda[1])
+            logger.info(f"Using goodwavelength range from cube object: {good_lambda[0]:.1f} - {good_lambda[1]:.1f} Å")
+        # 如果没有，尝试从FITS头中读取
+        elif hasattr(cube, '_fits_hdu_header'):
+            if 'WAVGOOD0' in cube._fits_hdu_header and 'WAVGOOD1' in cube._fits_hdu_header:
+                good_lambda = (
+                    float(cube._fits_hdu_header['WAVGOOD0']) / (1 + cube._redshift),
+                    float(cube._fits_hdu_header['WAVGOOD1']) / (1 + cube._redshift)
+                )
+                wave_mask = (cube._lambda_gal >= good_lambda[0]) & (cube._lambda_gal <= good_lambda[1])
+                logger.info(f"Found goodwavelength range in header with redshift correction: {good_lambda[0]:.1f} - {good_lambda[1]:.1f} Å")
+            else:
+                # 如果在FITS头中也找不到
+                wave_mask = np.ones_like(cube._lambda_gal, dtype=bool)
+                logger.info("No goodwavelength range found in header, using full wavelength range")
+        else:
+            # 如果没有goodwavelength，使用全部波长
+            wave_mask = np.ones_like(cube._lambda_gal, dtype=bool)
+            logger.info("No goodwavelength range found, using full wavelength range")
+
+        # 截取波长范围
+        wavelength = cube._lambda_gal[wave_mask]
+        
         # Use median of a continuum region to estimate signal
-        continuum_region = (cube._lambda_gal > 5000) & (cube._lambda_gal < 5200)
+        # 在截取的波长区域内找合适的连续谱区域
+        if np.any((wavelength > 5000) & (wavelength < 5200)):
+            continuum_region = (wavelength > 5000) & (wavelength < 5200)
+            continuum_indices = np.where(wave_mask)[0][continuum_region]
+        else:
+            # 如果截取后的波长区域不包含5000-5200区间，选择中间1/3作为连续谱
+            total_len = len(wavelength)
+            start_idx = total_len // 3
+            end_idx = 2 * total_len // 3
+            continuum_indices = np.where(wave_mask)[0][start_idx:end_idx]
         
         # Calculate signal and noise for each spectrum
-        signal = np.nanmedian(cube._spectra[continuum_region, :], axis=0)
-        noise = np.nanstd(cube._spectra[continuum_region, :], axis=0)
+        signal = np.nanmedian(cube._spectra[continuum_indices, :], axis=0)
+        noise = np.nanstd(cube._spectra[continuum_indices, :], axis=0)
         
         # Convert to 2D arrays
         signal_map = np.zeros((cube._n_y, cube._n_x))
@@ -129,7 +168,7 @@ def run_vnb_analysis(args, cube, p2p_results=None):
         
         # Create arrays to store bin results
         bin_indices = []
-        bin_spectra = np.zeros((len(cube._lambda_gal), n_bins))
+        bin_spectra = np.zeros((len(wavelength), n_bins))
         
         # Get velocity field for correction if available from P2P results
         velocity_field = None
@@ -167,8 +206,9 @@ def run_vnb_analysis(args, cube, p2p_results=None):
                     logger.warning(f"Index {idx} out of range for cube spectra, skipping")
                     continue
                     
-                # Get spectrum
-                spectrum = cube._spectra[:, idx]
+                # Get spectrum并应用wavelength截取
+                full_spectrum = cube._spectra[:, idx] 
+                spectrum = full_spectrum[wave_mask]
                 
                 # 跳过无效光谱
                 if not np.any(np.isfinite(spectrum)):
@@ -184,7 +224,7 @@ def run_vnb_analysis(args, cube, p2p_results=None):
                     if (row < velocity_field.shape[0] and col < velocity_field.shape[1] and 
                         np.isfinite(velocity_field[row, col])):
                         vel = velocity_field[row, col]
-                        spectrum = apply_velocity_shift(spectrum, cube._lambda_gal, vel)
+                        spectrum = apply_velocity_shift(spectrum, wavelength, vel)
                 
                 bin_spectra_list.append(spectrum)
             
@@ -244,7 +284,7 @@ def run_vnb_analysis(args, cube, p2p_results=None):
             bin_num=bin_num,
             bin_indices=bin_indices,
             spectra=bin_spectra,
-            wavelength=cube._lambda_gal,
+            wavelength=wavelength,  # 使用截取后的波长
             metadata=metadata
         )
         
@@ -271,7 +311,7 @@ def run_vnb_analysis(args, cube, p2p_results=None):
             )
             plt.close(fig)
             
-        return binned_data
+        # return binned_data
 
     except Exception as e:
         logger.error(f"Error in Voronoi binning: {e}")
@@ -279,8 +319,8 @@ def run_vnb_analysis(args, cube, p2p_results=None):
         logger.error(traceback.format_exc())
         raise
     
-    # Step 3: Create pseudo-cube for processing
-    # ---------------------------------------
+    # Step 3: Create pseudo-cube for processing #
+    # --------------------------------------- #
     try:
         # Convert binned data to P2P-compatible format
         pseudo_cube = binned_data.to_p2p_compatible(cube)
@@ -533,15 +573,15 @@ def run_vnb_analysis(args, cube, p2p_results=None):
         
         # Create final dataframe
         legacy_df = pd.DataFrame({
-            'H_beta_EL_value': h_beta_el_value,
-            'H_beta_EL_ANR': h_beta_el_anr,
-            'O_3_5007_EL_value': o3_5007_el_value,
-            'O_3_5007_EL_ANR': o3_5007_el_anr,
+            'H_beta_EL_value': h_beta_el_value.flatten() if hasattr(h_beta_el_value, 'flatten') else h_beta_el_value,
+            'H_beta_EL_ANR': h_beta_el_anr.flatten() if hasattr(h_beta_el_anr, 'flatten') else h_beta_el_anr,
+            'O_3_5007_EL_value': o3_5007_el_value.flatten() if hasattr(o3_5007_el_value, 'flatten') else o3_5007_el_value,
+            'O_3_5007_EL_ANR': o3_5007_el_anr.flatten() if hasattr(o3_5007_el_anr, 'flatten') else o3_5007_el_anr,
             'Component_Sol': component_sol,
-            'H_beta_SI': h_beta_si,
-            'Mg_b_SI': mg_b_si,
-            'Fe_5015_SI': fe_5015_si,
-            'SNR': sn,
+            'H_beta_SI': h_beta_si.flatten() if hasattr(h_beta_si, 'flatten') else h_beta_si,
+            'Mg_b_SI': mg_b_si.flatten() if hasattr(mg_b_si, 'flatten') else mg_b_si,
+            'Fe_5015_SI': fe_5015_si.flatten() if hasattr(fe_5015_si, 'flatten') else fe_5015_si,
+            'SNR': sn.flatten() if hasattr(sn, 'flatten') else sn,
             'K_index': bin_indices_str
         })
         

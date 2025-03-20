@@ -128,6 +128,7 @@ def main():
         )
         logger.info(f"Data loaded in {time.time() - start_time:.1f} seconds")
         logger.info(f"Using wavelength range: {cube._wvl_air_angstrom_range}")
+        cube._goodwavelength=cube._wvl_air_angstrom_range
     except Exception as e:
         logger.error(f"Data loading failed: {str(e)}")
         logger.error(traceback.format_exc())

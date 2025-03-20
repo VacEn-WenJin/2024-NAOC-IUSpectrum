@@ -420,16 +420,20 @@ class BinnedSpectra:
                 self._redshift = orig_cube._redshift
                 self._wvl_air_angstrom_range = orig_cube._wvl_air_angstrom_range
                 
-                # Copy FWHM and pixel size attributes - using correct attribute names from MUSECube
+                # Copy FWHM and pixel size attributes
                 self._FWHM_gal = orig_cube._FWHM_gal if hasattr(orig_cube, '_FWHM_gal') else 1.0
                 self._pxl_size_x = orig_cube._pxl_size_x if hasattr(orig_cube, '_pxl_size_x') else 0.2
                 self._pxl_size_y = orig_cube._pxl_size_y if hasattr(orig_cube, '_pxl_size_y') else 0.2
                 
-                # Set data from fake cube
+                # Copy goodwavelength if available
+                if hasattr(orig_cube, '_goodwavelength'):
+                    self._goodwavelength = orig_cube._goodwavelength
+                
+                # Set data from fake cube using binned spectra's wavelength
                 self.cube = fake_cube_data
                 self.cubevar = fake_variance
-                self.wave = spectra_obj.wavelength
-                self._lambda_gal = spectra_obj.wavelength
+                self.wave = spectra_obj.wavelength   # 使用BinnedSpectra的波长（已截取）
+                self._lambda_gal = spectra_obj.wavelength  # 使用BinnedSpectra的波长（已截取）
                 
                 # Set dimensions
                 self._n_y = self.cube.shape[1]
@@ -1845,10 +1849,15 @@ def plot_radial_profile(radii, values, yerr=None, title=None, xlabel='Radius',
     """
     fig, ax = plt.subplots(figsize=figsize)
     
+    # 确保radii和values是一维数组
+    radii_flat = radii.flatten() if hasattr(radii, 'flatten') else radii
+    values_flat = values.flatten() if hasattr(values, 'flatten') else values
+    
     if yerr is not None:
-        ax.errorbar(radii, values, yerr=yerr, fmt='o-', capsize=3)
+        yerr_flat = yerr.flatten() if hasattr(yerr, 'flatten') else yerr
+        ax.errorbar(radii_flat, values_flat, yerr=yerr_flat, fmt='o-', capsize=3)
     else:
-        ax.plot(radii, values, 'o-')
+        ax.plot(radii_flat, values_flat, 'o-')
     
     ax.set_xlabel(xlabel)
     if ylabel:
