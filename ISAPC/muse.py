@@ -278,6 +278,83 @@ class MUSECube:
             logger.error(f"Error preprocessing cube: {str(e)}")
             raise
 
+    def calculate_snr(self, continuum_range=None):
+        """
+        Calculate signal-to-noise ratio from the spectra and fits
+        
+        Parameters
+        ----------
+        continuum_range : tuple of float, optional
+            Wavelength range to use for calculation (min, max)
+            
+        Returns
+        -------
+        dict
+            Dictionary containing SNR maps 
+        """
+        try:
+            # Check if fitting has been performed
+            if self._bestfit_field is None or np.all(np.isnan(self._bestfit_field)):
+                logger.warning("No spectral fitting results available for SNR calculation")
+                return None
+            
+            # Initialize result arrays
+            n_y, n_x = self._velocity_field.shape
+            snr_map = np.full((n_y, n_x), np.nan)
+            signal_map = np.full((n_y, n_x), np.nan)
+            noise_map = np.full((n_y, n_x), np.nan)
+            
+            # Get wavelength range for calculation
+            if continuum_range is None:
+                # Use a default range in rest-frame wavelength
+                continuum_range = (5075, 5125)  # Standard continuum region
+            
+            # Find wavelength indices within range
+            wave_mask = ((self._lambda_gal >= continuum_range[0]) & 
+                        (self._lambda_gal <= continuum_range[1]))
+            
+            if not np.any(wave_mask):
+                logger.warning(f"No wavelength points in range {continuum_range}")
+                return None
+            
+            # Calculate SNR for each valid spaxel
+            valid_mask = ~np.isnan(self._velocity_field)
+            for y in range(n_y):
+                for x in range(n_x):
+                    if valid_mask[y, x]:
+                        # Get spaxel index
+                        spaxel_idx = y * n_x + x
+                        
+                        # Get observed and model spectra for continuum region
+                        observed = self._spectra[wave_mask, spaxel_idx]
+                        model = self._bestfit_field[wave_mask, y, x]
+                        
+                        # Calculate signal as median of model
+                        signal = np.nanmedian(model)
+                        
+                        # Calculate noise as std of residuals
+                        residual = observed - model
+                        noise = np.nanstd(residual)
+                        
+                        # Calculate SNR
+                        if noise > 0:
+                            snr = signal / noise
+                            snr_map[y, x] = snr
+                            signal_map[y, x] = signal
+                            noise_map[y, x] = noise
+            
+            return {
+                'snr': snr_map,
+                'signal': signal_map,
+                'noise': noise_map,
+                'wavelength_range': continuum_range
+            }
+        
+        except Exception as e:
+            logger.error(f"Error calculating SNR: {str(e)}")
+            return None
+
+
     def fit_spectra(
             self,
             template_filename: str,
@@ -764,16 +841,47 @@ class MUSECube:
             # Restore original log level
             logger.setLevel(original_level)
             # Return result dictionary
-            return {
-                'emission_flux': self._emission_flux,
-                'emission_vel': self._emission_vel,
-                'emission_sig': self._emission_sig,
-                'gas_bestfit_field': self._gas_bestfit_field,
-                'emission_wavelength': self._emission_wavelength,
-                'optimal_tmpls': self._optimal_tmpls,
-                'velocity_field': self._velocity_field,
-                'dispersion_field': self._dispersion_field,
-            }
+            # Calculate SNR after emission line fitting (more accurate with full model)
+            snr_info = self.calculate_snr()
+            if snr_info is not None:
+                # Add SNR information to the result
+                result_dict = {
+                    'emission_flux': self._emission_flux,
+                    'emission_vel': self._emission_vel,
+                    'emission_sig': self._emission_sig,
+                    'gas_bestfit_field': self._gas_bestfit_field,
+                    'emission_wavelength': self._emission_wavelength,
+                    'optimal_tmpls': self._optimal_tmpls,
+                    'velocity_field': self._velocity_field,
+                    'dispersion_field': self._dispersion_field,
+                    'signal': snr_info['signal'],
+                    'noise': snr_info['noise'],
+                    'snr': snr_info['snr']
+                }
+            else:
+                # Use original result dictionary format
+                result_dict = {
+                    'emission_flux': self._emission_flux,
+                    'emission_vel': self._emission_vel,
+                    'emission_sig': self._emission_sig,
+                    'gas_bestfit_field': self._gas_bestfit_field,
+                    'emission_wavelength': self._emission_wavelength,
+                    'optimal_tmpls': self._optimal_tmpls,
+                    'velocity_field': self._velocity_field,
+                    'dispersion_field': self._dispersion_field
+                }
+
+            # return result_dict
+            # return {
+            #     'emission_flux': self._emission_flux,
+            #     'emission_vel': self._emission_vel,
+            #     'emission_sig': self._emission_sig,
+            #     'gas_bestfit_field': self._gas_bestfit_field,
+            #     'emission_wavelength': self._emission_wavelength,
+            #     'optimal_tmpls': self._optimal_tmpls,
+            #     'velocity_field': self._velocity_field,
+            #     'dispersion_field': self._dispersion_field,
+            #     }
         
         except Exception as e:
             logger.error(f"Error fitting emission lines: {str(e)}")
@@ -896,8 +1004,9 @@ class MUSECube:
                 if has_emission_lines:
                     gas_model = self._gas_bestfit_field[:, i, j]
                     # Verify gas model has valid values
-                    if not np.any(np.isfinite(gas_model)) or np.all(gas_model == 0):
-                        gas_model = None
+                    # if not np.any(np.isfinite(gas_model)) or np.all(gas_model == 0):
+                    #     print('!!!!!!')
+                    #     gas_model = None
                 
                 # Create LineIndexCalculator with warning suppression
                 with warnings.catch_warnings():
@@ -1042,12 +1151,12 @@ class MUSECube:
                         return None
                     
                     # Get gas model if available
-                    gas_model = None
-                    if self._gas_bestfit_field is not None:
-                        gas_model = self._gas_bestfit_field[:, row, col]
+                    # gas_model = None
+                    # if self._gas_bestfit_field is not None:
+                    gas_model = self._gas_bestfit_field[:, row, col]
                         # Verify gas model is valid
-                        if not np.any(np.isfinite(gas_model)) or np.all(gas_model == 0):
-                            gas_model = None
+                        # if not np.any(np.isfinite(gas_model)) or np.all(gas_model == 0):
+                        #     gas_model = None
                     
                     # Create LineIndexCalculator for this position
                     try:

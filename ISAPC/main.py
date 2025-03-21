@@ -1,163 +1,206 @@
 """
 ISAPC - IFU Spectrum Analysis Pipeline Cluster
 Main program and command-line interface
+Version 5.0.0 - Optimized for performance and consistency
 """
 import os
 import sys
-import argparse
 import logging
-import time
+import argparse
 import traceback
-from datetime import datetime
 from pathlib import Path
+import numpy as np
+from astropy.io import fits
 
-from muse import MUSECube
-from analysis.p2p import run_p2p_analysis  
+from analysis.p2p import run_p2p_analysis
 from analysis.voronoi import run_vnb_analysis
 from analysis.radial import run_rdb_analysis
-from utils.io import find_template
+from utils.io import save_results_to_npz, load_results_from_npz, save_standardized_results
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
 )
-logger = logging.getLogger(__name__)
-
+logger = logging.getLogger('ISAPC')
 
 def setup_parser():
-    """Create command-line argument parser"""
+    """Set up the command-line argument parser"""
     parser = argparse.ArgumentParser(
-        description='ISAPC - IFU Spectrum Analysis Pipeline Cluster',
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+        description="ISAPC - IFU Spectrum Analysis Pipeline Cluster"
     )
     
-    # Basic parameters
-    parser.add_argument('filename', help='Path to MUSE data cube file')
-    parser.add_argument('--redshift', type=float, required=True, help='Galaxy redshift')
-    parser.add_argument('--output-dir', default='output', help='Output directory')
-    parser.add_argument('--template', default=None, help='Path to stellar template file')
-    
-    # Wavelength settings
-    parser.add_argument('--wvl-range', type=float, nargs=2, default=None,
-                      help='Wavelength range to analyze (Å), if not specified uses goodwavelengthrange from data')
-    parser.add_argument('--no-good-wavelength', action='store_true', 
-                      help='Do not use goodwavelengthrange from data')
+    # Required arguments
+    parser.add_argument('filename', help='MUSE data cube filename')
+    parser.add_argument('-z', '--redshift', type=float, required=True,
+                        help='Galaxy redshift')
+    parser.add_argument('-t', '--template', required=True,
+                        help='Stellar template filename')
+    parser.add_argument('-o', '--output-dir', required=True,
+                        help='Output directory')
     
     # Analysis mode
-    parser.add_argument('--mode', choices=['P2P', 'VNB', 'RDB', 'ALL'], default='P2P',
-                      help='Analysis mode: Pixel-to-pixel (P2P), Voronoi binning (VNB), Radial binning (RDB), or All (ALL)')
-    
-    # Run configuration
-    parser.add_argument('--n-jobs', type=int, default=-1, help='Number of parallel jobs (-1 means using all CPUs)')
-    parser.add_argument('--no-plots', action='store_true', help='Disable plotting')
-    
-    # Plotting options
-    parser.add_argument('--equal-aspect', action='store_true', help='Keep aspect ratio equal for maps')
+    parser.add_argument('-m', '--mode', choices=['P2P', 'VNB', 'RDB', 'ALL'],
+                        default='ALL', help='Analysis mode')
     
     # Fitting parameters
-    parser.add_argument('--vel-init', type=float, default=0, help='Initial velocity guess (km/s)')
-    parser.add_argument('--sigma-init', type=float, default=40, help='Initial dispersion guess (km/s)')
-    parser.add_argument('--poly-degree', type=int, default=3, help='Degree of the additive polynomial for pPXF')
-    parser.add_argument('--no-emission', action='store_true', help='Skip emission line fitting')
-    parser.add_argument('--no-indices', action='store_true', help='Skip spectral indices calculation')
+    parser.add_argument('--vel-init', type=float, default=0,
+                        help='Initial velocity for fitting (km/s)')
+    parser.add_argument('--sigma-init', type=float, default=150,
+                        help='Initial velocity dispersion for fitting (km/s)')
+    parser.add_argument('--poly-degree', type=int, default=3,
+                        help='Degree of polynomial for continuum fitting')
     
-    # Voronoi binning parameters
-    vnb_group = parser.add_argument_group('Voronoi binning options')
-    vnb_group.add_argument('--target-snr', type=float, default=20, help='Target signal-to-noise ratio')
-    vnb_group.add_argument('--cvt', action='store_true', help='Use centroidal Voronoi tessellation')
+    # Binning parameters
+    parser.add_argument('--target-snr', type=float, default=30,
+                        help='Target SNR for Voronoi binning')
+    parser.add_argument('--min-snr', type=float, default=1,
+                        help='Minimum SNR for valid data')
+    parser.add_argument('--cvt', action='store_true',
+                        help='Use CVT algorithm for Voronoi binning')
+    parser.add_argument('--n-rings', type=int, default=10,
+                        help='Number of rings for radial binning')
+    parser.add_argument('--log-spacing', action='store_true',
+                        help='Use logarithmic spacing for radial bins')
+    parser.add_argument('--pa', type=float, default=None,
+                        help='Position angle for radial bins (degrees)')
+    parser.add_argument('--ellipticity', type=float, default=None,
+                        help='Ellipticity for radial bins (0-1)')
+    parser.add_argument('--center-x', type=float, default=None,
+                        help='X coordinate of center (pixels)')
+    parser.add_argument('--center-y', type=float, default=None,
+                        help='Y coordinate of center (pixels)')
     
-    # Radial binning parameters
-    rdb_group = parser.add_argument_group('Radial binning options')
-    rdb_group.add_argument('--n-rings', type=int, default=10, help='Number of radial rings')
-    rdb_group.add_argument('--center-x', type=float, help='Center X coordinate')
-    rdb_group.add_argument('--center-y', type=float, help='Center Y coordinate')
-    rdb_group.add_argument('--pa', type=float, default=0.0, help='Position angle (degrees)')
-    rdb_group.add_argument('--ellipticity', type=float, default=0.0, help='Ellipticity (0-1)')
-    rdb_group.add_argument('--log-spacing', action='store_true', help='Use logarithmic spacing')
+    # Plotting options
+    parser.add_argument('--no-plots', action='store_true',
+                        help='Disable plot generation')
+    parser.add_argument('--equal-aspect', action='store_true',
+                        help='Use equal aspect ratio for plots')
     
-    # Binning common options
-    parser.add_argument('--no-velocity-correct', action='store_true', 
-                      help='Disable velocity correction when combining spectra')
-
+    # Performance options
+    parser.add_argument('-j', '--n-jobs', type=int, default=-1,
+                        help='Number of parallel jobs (-1 for all cores)')
+    
+    # Analysis options
+    parser.add_argument('--no-emission', action='store_true',
+                        help='Skip emission line fitting')
+    parser.add_argument('--no-indices', action='store_true',
+                        help='Skip spectral indices calculation')
+    
+    # Data reuse options (modified)
+    parser.add_argument('--auto-reuse', action='store_true', default=True,
+                        help='Automatically load and reuse previous results if available')
+    parser.add_argument('--no-auto-reuse', action='store_false', dest='auto_reuse',
+                        help='Disable automatic reuse of previous results')
+    
     return parser
 
-
-def setup_logging(args):
-    """Configure file logging"""
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(exist_ok=True, parents=True)
-    
-    log_dir = output_dir / 'logs'
-    log_dir.mkdir(exist_ok=True)
-    
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    galaxy_name = Path(args.filename).stem
-    
-    log_file = log_dir / f"{galaxy_name}_{timestamp}.log"
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(logging.Formatter(
-        '%(asctime)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    ))
-    logger.addHandler(file_handler)
-    
-    logger.info(f"ISAPC analysis started, target: {args.filename}")
-    logger.info(f"Parameters: redshift={args.redshift}, wavelength range={args.wvl_range}, mode={args.mode}")
-
-
 def main():
-    """Main program entry point"""
+    """Main entry point for ISAPC"""
     # Parse command-line arguments
     parser = setup_parser()
     args = parser.parse_args()
     
-    # Set up file logging
-    setup_logging(args)
+    # Extract galaxy name from filename
+    galaxy_name = Path(args.filename).stem
     
-    # Read data
+    # Create output directories
+    output_dir = Path(args.output_dir)
+    galaxy_dir = output_dir / galaxy_name
+    data_dir = galaxy_dir / 'Data'
+    
+    galaxy_dir.mkdir(exist_ok=True, parents=True)
+    data_dir.mkdir(exist_ok=True, parents=True)
+    
+    logger.info(f"Starting ISAPC analysis for {galaxy_name} in mode {args.mode}")
+    
+    # Import the MUSECube class here to avoid circular imports
     try:
-        start_time = time.time()
+        from muse import MUSECube
+    except ImportError:
+        logger.error("Failed to import MUSECube class. Please ensure muse.py is in the Python path.")
+        return 1
+    
+    # Load data cube
+    try:
+        logger.info(f"Loading data cube from {args.filename}")
         cube = MUSECube(
             filename=args.filename,
             redshift=args.redshift,
-            wvl_air_angstrom_range=tuple(args.wvl_range) if args.wvl_range is not None else None,
-            use_good_wavelength=not args.no_good_wavelength
+            use_good_wavelength=True
         )
-        logger.info(f"Data loaded in {time.time() - start_time:.1f} seconds")
-        logger.info(f"Using wavelength range: {cube._wvl_air_angstrom_range}")
-        cube._goodwavelength=cube._wvl_air_angstrom_range
+        logger.info("Data cube loaded successfully")
     except Exception as e:
-        logger.error(f"Data loading failed: {str(e)}")
+        logger.error(f"Error loading data cube: {str(e)}")
         logger.error(traceback.format_exc())
         return 1
     
-    # Set template file
-    if args.template is None:
-        # Try to find template
-        args.template = find_template()
-        if args.template:
-            logger.info(f"Automatically selected template: {args.template}")
-        else:
-            logger.error("No template file found, please specify using --template")
-            return 1
-    
-    # Execute analysis
+    # Initialize shared results
     p2p_results = None
     
+    # Execute analysis
     try:
+        # Check for existing P2P results if we're running VNB or RDB
+        if args.mode in ['VNB', 'RDB'] and args.auto_reuse:
+            p2p_results_path = data_dir / f"{galaxy_name}_P2P_results.npz"
+            std_results_path = data_dir / f"{galaxy_name}_P2P_standardized.npz"
+            
+            # Try both potential file paths
+            if p2p_results_path.exists():
+                logger.info(f"Found P2P results at {p2p_results_path}")
+                try:
+                    p2p_results = load_results_from_npz(p2p_results_path)
+                    logger.info("Successfully loaded P2P results")
+                except Exception as e:
+                    logger.warning(f"Failed to load P2P results: {e}")
+                    p2p_results = None
+            elif std_results_path.exists():
+                logger.info(f"Found standardized P2P results at {std_results_path}")
+                try:
+                    p2p_results = load_results_from_npz(std_results_path)
+                    logger.info("Successfully loaded standardized P2P results")
+                except Exception as e:
+                    logger.warning(f"Failed to load standardized P2P results: {e}")
+                    p2p_results = None
+            
+            if p2p_results is None:
+                logger.warning("No P2P results found. VNB/RDB analyses may have limited functionality.")
+        
+        # P2P analysis
         if args.mode in ['P2P', 'ALL']:
             p2p_results = run_p2p_analysis(args, cube)
-        
-        if args.mode in ['VNB', 'ALL']:
-            run_vnb_analysis(args, cube, p2p_results)
-        
-        if args.mode in ['RDB', 'ALL']:
-            run_rdb_analysis(args, cube, p2p_results)
             
-        logger.info("ISAPC analysis completed")
+            # Save results
+            save_results_to_npz(
+                output_file=data_dir / f"{galaxy_name}_P2P_results.npz",
+                data_dict=p2p_results
+            )
+            logger.info(f"Saved P2P results to {data_dir / f'{galaxy_name}_P2P_results.npz'}")
+        
+        # VNB analysis
+        if args.mode in ['VNB', 'ALL']:
+            vnb_results = run_vnb_analysis(args, cube, p2p_results)
+            
+            # Save results
+            save_results_to_npz(
+                output_file=data_dir / f"{galaxy_name}_VNB_results.npz",
+                data_dict=vnb_results
+            )
+            logger.info(f"Saved VNB results to {data_dir / f'{galaxy_name}_VNB_results.npz'}")
+        
+        # RDB analysis
+        if args.mode in ['RDB', 'ALL']:
+            rdb_results = run_rdb_analysis(args, cube, p2p_results)
+            
+            # Save results
+            save_results_to_npz(
+                output_file=data_dir / f"{galaxy_name}_RDB_results.npz",
+                data_dict=rdb_results
+            )
+            logger.info(f"Saved RDB results to {data_dir / f'{galaxy_name}_RDB_results.npz'}")
+        
+        logger.info("ISAPC analysis completed successfully")
         return 0
         
     except Exception as e:
@@ -165,6 +208,5 @@ def main():
         logger.error(traceback.format_exc())
         return 1
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     sys.exit(main())

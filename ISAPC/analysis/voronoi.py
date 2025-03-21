@@ -1,30 +1,38 @@
 """
 Voronoi binning analysis module for ISAPC
+Version 5.0.0 - Enhanced with improved SNR target selection
 """
 import time
 import logging
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+from matplotlib.colors import ListedColormap
 from pathlib import Path
 import pandas as pd
 from joblib import Parallel, delayed
-import matplotlib.colors as mcolors
+import warnings
+import traceback
 import spectral_indices
 import galaxy_params
 import visualization
-from utils.io import save_results_to_npz
+from utils.io import save_results_to_npz, save_standardized_results
 from binning import (
-    run_voronoi_binning, apply_velocity_shift, BinnedSpectra,VoronoiBinnedData,
-    plot_binned_map, plot_radial_profile
+    BinnedSpectra, VoronoiBinnedData, calculate_wavelength_intersection,
+    combine_spectra_efficiently, calculate_snr
 )
+from utils.calc import spectres, apply_velocity_shift
+from vorbin.voronoi_2d_binning import voronoi_2d_binning
 
 logger = logging.getLogger(__name__)
 
+# Speed of light in km/s
+C_KMS = 299792.458
 
 def run_vnb_analysis(args, cube, p2p_results=None):
     """
-    Run Voronoi binning analysis on MUSE data cube
-
+    Run Voronoi binning analysis on MUSE data cube with improved SNR targeting
+    
     Parameters
     ----------
     args : argparse.Namespace
@@ -32,12 +40,12 @@ def run_vnb_analysis(args, cube, p2p_results=None):
     cube : MUSECube
         MUSE data cube object
     p2p_results : dict, optional
-        Results from P2P analysis, used to get velocity field for correction
+        P2P analysis results to use for binning
         
     Returns
     -------
     dict
-        Analysis results with binned data and physical parameters
+        Analysis results
     """
     logger.info("Starting Voronoi binning analysis...")
     start_time = time.time()
@@ -45,745 +53,1283 @@ def run_vnb_analysis(args, cube, p2p_results=None):
     # Disable warnings for spectral indices
     spectral_indices.set_warnings(False)
     
-    # Create output directory
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(exist_ok=True, parents=True)
-    plots_dir = output_dir / 'plots'
-    plots_dir.mkdir(exist_ok=True)
-    
-    # Extract galaxy name from filename
+    # Get galaxy name and create directories
     galaxy_name = Path(args.filename).stem
+    output_dir = Path(args.output_dir)
+    galaxy_dir = output_dir / galaxy_name
+    data_dir = galaxy_dir / 'Data'
+    plots_dir = galaxy_dir / 'Plots' / 'VNB'
     
-    # Get target SNR from args
-    target_snr = args.target_snr if hasattr(args, 'target_snr') else 20.0
+    galaxy_dir.mkdir(exist_ok=True, parents=True)
+    data_dir.mkdir(exist_ok=True)
+    plots_dir.mkdir(exist_ok=True, parents=True)
     
-    # Step 1: Calculate signal and noise for binning
-    # ---------------------------------------------
+    # Try to load P2P results if not provided but auto-reuse is enabled
+    if p2p_results is None and hasattr(args, 'auto_reuse') and args.auto_reuse:
+        from p2p_adapter import load_p2p_results_for_galaxy
+        p2p_results = load_p2p_results_for_galaxy(galaxy_name, args.output_dir)
+        
+        if p2p_results is not None:
+            logger.info("Successfully loaded P2P results for VNB analysis")
+    
+    # Set up target SNR and other binning parameters
+    # Base target SNR from arguments, but will be adjusted if binning fails
+    target_snr = args.target_snr if hasattr(args, 'target_snr') else 30
+    min_snr = args.min_snr if hasattr(args, 'min_snr') else 1
+    use_cvt = args.cvt if hasattr(args, 'cvt') else True
+    
+    # Extract coordinates, signal, and noise for VNB
+    # Use wavelength-integrated signal-to-noise
+    x = cube.x
+    y = cube.y
+    
+    # Following the notebook's approach, use a specific wavelength range for SNR calculation
+    # This range (5075-5125 Å) is often used for continuum SNR assessment
+    wave_mask = (cube._lambda_gal >= 5075) & (cube._lambda_gal <= 5125)
+    if np.sum(wave_mask) > 0:
+        # Calculate SNR using this specific range (as done in the notebook)
+        signal = np.nanmedian(cube._spectra[wave_mask], axis=0)
+        noise = np.nanstd(cube._spectra[wave_mask], axis=0)
+        logger.info("Using wavelength range 5075-5125 Å for SNR calculation")
+    else:
+        # Fallback to full spectrum if this range is not available
+        signal = np.nanmedian(cube._spectra, axis=0)
+        noise = np.nanmedian(np.sqrt(cube._log_variance), axis=0)
+        logger.info("Using full spectrum for SNR calculation (preferred range not available)")
+    
+    # Preprocess signal and noise to avoid problems with very low values
+    # Handle problematic pixels by setting minimum values
+    min_threshold = 1.0
+    
+    # Find pixels with problematic values (very low or NaN)
+    low_signal_mask = (signal < min_threshold) | ~np.isfinite(signal)
+    low_noise_mask = (noise < min_threshold) | ~np.isfinite(noise)
+    
+    # Set minimum values for signal and noise consistently
+    if np.any(low_signal_mask) or np.any(low_noise_mask):
+        logger.warning(f"Found {np.sum(low_signal_mask)} pixels with signal < {min_threshold}")
+        logger.warning(f"Found {np.sum(low_noise_mask)} pixels with noise < {min_threshold}")
+        
+        # Apply minimum value to signal
+        signal[low_signal_mask] = min_threshold
+        
+        # Apply minimum value to noise
+        noise[low_noise_mask] = min_threshold
+        
+        # For pixels where SNR < 1, set both signal and noise to the same value (=1)
+        # This effectively sets SNR = 1 for these pixels
+        low_snr_mask = (signal / noise) < 1.0
+        if np.any(low_snr_mask):
+            logger.warning(f"Setting both signal and noise to {min_threshold} for {np.sum(low_snr_mask)} pixels with SNR < 1")
+            signal[low_snr_mask] = min_threshold
+            noise[low_snr_mask] = min_threshold
+    
+    # Additional safety check - ensure no zeros or NaNs
+    signal = np.nan_to_num(signal, nan=min_threshold)
+    noise = np.nan_to_num(noise, nan=min_threshold)
+    
+    # Replace zeros with min_threshold
+    signal[signal == 0] = min_threshold
+    noise[noise == 0] = min_threshold
+    
+    # Apply minimum SNR threshold to avoid problems with very low SNR spaxels
+    valid_mask = (signal / noise) >= min_snr
+    if np.sum(valid_mask) < 10:
+        # If too few valid spaxels, lower threshold
+        logger.warning(f"Very few spaxels meet minimum SNR threshold ({np.sum(valid_mask)}). Lowering minimum SNR.")
+        min_snr = max(0.5, min_snr / 2)
+        valid_mask = (signal / noise) >= min_snr
+        
+        # Check if we still have too few pixels
+        if np.sum(valid_mask) < 5:
+            logger.warning("Still too few valid pixels after lowering threshold. Selecting pixels with highest SNR.")
+            # Force selection of the top pixels with highest SNR
+            snr_values = signal / noise
+            # Get indices sorted by SNR (highest first)
+            sorted_indices = np.argsort(snr_values)[::-1]
+            # Create a new mask that selects at least N pixels with highest SNR
+            min_pixels = min(100, max(10, int(0.01 * signal.size)))  # At least 1% of pixels or 10 pixels, whichever is more
+            force_indices = sorted_indices[:min_pixels]
+            new_mask = np.zeros_like(valid_mask)
+            new_mask[force_indices] = True
+            valid_mask = new_mask
+            
+            # If we still have no valid pixels (extremely rare case), use all pixels
+            if np.sum(valid_mask) == 0:
+                logger.warning("No valid pixels even after selection. Using all non-NaN pixels as fallback.")
+                valid_mask = np.isfinite(signal) & np.isfinite(noise)
+                # If still no valid pixels, this is truly bad data, but we'll try anyway
+                if np.sum(valid_mask) == 0:
+                    logger.warning("No valid pixels at all. Using all pixels regardless of quality.")
+                    valid_mask = np.ones_like(signal, dtype=bool)
+    
+    logger.info(f"Found {np.sum(valid_mask)} spaxels above minimum SNR threshold {min_snr}")
+    
+    # If we have P2P results, try to use them to improve SNR
+    if p2p_results is not None:
+        try:
+            # Use SNR from P2P results if available (like in the notebook)
+            if 'signal_noise' in p2p_results:
+                p2p_signal = p2p_results['signal_noise'].get('signal', None)
+                p2p_noise = p2p_results['signal_noise'].get('noise', None)
+                
+                if p2p_signal is not None and p2p_noise is not None:
+                    logger.info("Using signal and noise from P2P results")
+                    
+                    # Apply the same minimum threshold logic to P2P results
+                    p2p_signal = np.nan_to_num(p2p_signal, nan=min_threshold)
+                    p2p_noise = np.nan_to_num(p2p_noise, nan=min_threshold)
+                    
+                    p2p_signal[p2p_signal < min_threshold] = min_threshold
+                    p2p_noise[p2p_noise < min_threshold] = min_threshold
+                    
+                    # Set SNR=1 for pixels with SNR < 1
+                    low_snr_mask = (p2p_signal / p2p_noise) < 1.0
+                    if np.any(low_snr_mask):
+                        p2p_signal[low_snr_mask] = min_threshold
+                        p2p_noise[low_snr_mask] = min_threshold
+                    
+                    signal = p2p_signal
+                    noise = p2p_noise
+                    
+                    # Recalculate valid mask
+                    valid_mask = (signal / noise) >= min_snr
+            
+            # Use only good spaxels based on P2P results if available
+            if 'quality_mask' in p2p_results:
+                good_mask = p2p_results['quality_mask']
+                if good_mask is not None and good_mask.size == valid_mask.size:
+                    valid_mask = valid_mask & good_mask
+                    logger.info(f"Applied quality mask from P2P results, now have {np.sum(valid_mask)} valid spaxels")
+        except Exception as e:
+            logger.warning(f"Error applying P2P SNR data: {e}")
+    
+    # Get velocity field from P2P results if available
+    velocity_field = None
+    if p2p_results is not None:
+        try:
+            # First try the standardized format
+            if 'stellar_kinematics' in p2p_results and 'velocity_field' in p2p_results['stellar_kinematics']:
+                velocity_field = p2p_results['stellar_kinematics']['velocity_field']
+                logger.info("Using velocity field from P2P results (standardized format)")
+            # Then try the direct format
+            elif 'velocity_field' in p2p_results:
+                velocity_field = p2p_results['velocity_field']
+                logger.info("Using velocity field from P2P results (direct format)")
+            
+            # Check if the velocity field is valid
+            if velocity_field is not None and np.all(np.isnan(velocity_field)):
+                logger.warning("Velocity field from P2P results contains only NaNs")
+                velocity_field = None
+        except Exception as e:
+            logger.warning(f"Error extracting velocity field from P2P results: {e}")
+            velocity_field = None
+    
     try:
-        # 检查是否有goodwavelength可用于截取光谱
-        wave_mask = None
-        good_lambda = None
-
-        # 首先检查cube对象是否已经有_goodwavelength属性
-        if hasattr(cube, '_goodwavelength') and cube._goodwavelength is not None:
-            good_lambda = cube._goodwavelength
-            wave_mask = (cube._lambda_gal >= good_lambda[0]) & (cube._lambda_gal <= good_lambda[1])
-            logger.info(f"Using goodwavelength range from cube object: {good_lambda[0]:.1f} - {good_lambda[1]:.1f} Å")
-        # 如果没有，尝试从FITS头中读取
-        elif hasattr(cube, '_fits_hdu_header'):
-            if 'WAVGOOD0' in cube._fits_hdu_header and 'WAVGOOD1' in cube._fits_hdu_header:
-                good_lambda = (
-                    float(cube._fits_hdu_header['WAVGOOD0']) / (1 + cube._redshift),
-                    float(cube._fits_hdu_header['WAVGOOD1']) / (1 + cube._redshift)
-                )
-                wave_mask = (cube._lambda_gal >= good_lambda[0]) & (cube._lambda_gal <= good_lambda[1])
-                logger.info(f"Found goodwavelength range in header with redshift correction: {good_lambda[0]:.1f} - {good_lambda[1]:.1f} Å")
-            else:
-                # 如果在FITS头中也找不到
-                wave_mask = np.ones_like(cube._lambda_gal, dtype=bool)
-                logger.info("No goodwavelength range found in header, using full wavelength range")
+        # Determine the appropriate target SNR range
+        pixel_snr = signal / np.maximum(noise, 1e-10)
+        valid_snr = pixel_snr[valid_mask]
+        max_pixel_snr = np.nanmax(valid_snr)
+        median_snr = np.nanmedian(valid_snr)
+        
+        logger.info(f"Maximum pixel SNR: {max_pixel_snr:.1f}, Median pixel SNR: {median_snr:.1f}")
+        
+        # Determine recommended SNR range based on data characteristics
+        min_recommended_snr = max(min_snr * 2, median_snr * 1.2)
+        max_recommended_snr = min(max_pixel_snr * 0.8, median_snr * 3)
+        
+        # Ensure min and max are in a reasonable range
+        min_recommended_snr = max(5, min(min_recommended_snr, 40))
+        max_recommended_snr = max(15, min(max_recommended_snr, 50))
+        
+        # If user-specified target_snr is outside the recommended range, adjust
+        if target_snr < min_recommended_snr or target_snr > max_recommended_snr:
+            logger.warning(f"Specified target SNR {target_snr} is outside recommended range " 
+                         f"({min_recommended_snr:.1f} - {max_recommended_snr:.1f})")
+            
+            # Adjust target_snr to be within range
+            safe_target_snr = max(min_recommended_snr, min(target_snr, max_recommended_snr))
+            logger.info(f"Adjusting target SNR to {safe_target_snr:.1f}")
         else:
-            # 如果没有goodwavelength，使用全部波长
+            safe_target_snr = target_snr
+        
+        logger.info(f"Running Voronoi binning with target SNR = {safe_target_snr:.1f}")
+        
+        # First attempt with the selected target SNR
+        try:
+            success = True
+            # Use the valid_mask to filter data
+            x_valid = x[valid_mask]
+            y_valid = y[valid_mask]
+            signal_valid = signal[valid_mask]
+            noise_valid = noise[valid_mask]
+            
+            # Check if we have enough valid pixels
+            if len(x_valid) == 0:
+                raise ValueError("No valid pixels available for Voronoi binning")
+            
+            # Make sure arrays have consistent lengths
+            min_len = min(len(x_valid), len(y_valid), len(signal_valid), len(noise_valid))
+            if min_len == 0:
+                raise ValueError("Empty arrays after filtering")
+            
+            x_valid = x_valid[:min_len]
+            y_valid = y_valid[:min_len]
+            signal_valid = signal_valid[:min_len]
+            noise_valid = noise_valid[:min_len]
+            
+            # Double-check for any problematic values
+            for i in range(len(signal_valid)):
+                if signal_valid[i] < min_threshold or noise_valid[i] < min_threshold or (signal_valid[i]/noise_valid[i]) < 1.0:
+                    signal_valid[i] = min_threshold
+                    noise_valid[i] = min_threshold
+            
+            logger.info(f"Running Voronoi binning with {len(x_valid)} valid pixels")
+            
+            bin_num, x_gen, y_gen, sn, n_pixels, scale = voronoi_2d_binning(
+                x_valid, y_valid, 
+                signal_valid, noise_valid, 
+                safe_target_snr, plot=0, quiet=True, cvt=use_cvt)
+            best_result = (bin_num, x_gen, y_gen, sn, n_pixels, scale)
+            logger.info(f"Voronoi binning succeeded with target SNR = {safe_target_snr:.1f}")
+        except Exception as e:
+            success = False
+            best_result = None
+            logger.warning(f"Initial Voronoi binning failed: {str(e)}")
+        
+        # If initial attempt failed, try a systematic search through recommended SNR values
+        if not success:
+            # Try a more comprehensive search through the recommended range
+            search_range = np.linspace(min_recommended_snr, max_recommended_snr, 10)
+            
+            for snr_value in search_range:
+                # Skip the original value which already failed
+                if abs(snr_value - safe_target_snr) < 0.1:
+                    continue
+                
+                # Try with CVT first
+                try:
+                    logger.info(f"Trying Voronoi binning with target SNR = {snr_value:.1f}, CVT=True")
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        bin_num, x_gen, y_gen, sn, n_pixels, scale = voronoi_2d_binning(
+                            x_valid, y_valid, 
+                            signal_valid, noise_valid, 
+                            snr_value, plot=0, quiet=True, cvt=True)
+                    
+                    success = True
+                    best_result = (bin_num, x_gen, y_gen, sn, n_pixels, scale)
+                    logger.info(f"Voronoi binning succeeded with target SNR = {snr_value:.1f}")
+                    break
+                except Exception as e:
+                    # Now try without CVT
+                    try:
+                        logger.info(f"Trying Voronoi binning with target SNR = {snr_value:.1f}, CVT=False")
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore")
+                            bin_num, x_gen, y_gen, sn, n_pixels, scale = voronoi_2d_binning(
+                                x_valid, y_valid, 
+                                signal_valid, noise_valid, 
+                                snr_value, plot=0, quiet=True, cvt=False)
+                        
+                        success = True
+                        best_result = (bin_num, x_gen, y_gen, sn, n_pixels, scale)
+                        logger.info(f"Voronoi binning succeeded with target SNR = {snr_value:.1f} (CVT=False)")
+                        break
+                    except Exception as e2:
+                        continue
+        
+        # If still no success, try with a few fixed values known to often work
+        if not success:
+            for snr_fixed in [10, 15, 20, 25, 30, 40]:
+                if abs(snr_fixed - safe_target_snr) < 0.1:
+                    continue
+                
+                try:
+                    logger.info(f"Trying with fixed target SNR = {snr_fixed}")
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        # Try both with and without CVT
+                        for use_cvt_val in [True, False]:
+                            try:
+                                bin_num, x_gen, y_gen, sn, n_pixels, scale = voronoi_2d_binning(
+                                    x_valid, y_valid, 
+                                    signal_valid, noise_valid, 
+                                    snr_fixed, plot=0, quiet=True, cvt=use_cvt_val)
+                                
+                                success = True
+                                best_result = (bin_num, x_gen, y_gen, sn, n_pixels, scale)
+                                logger.info(f"Voronoi binning succeeded with fixed target SNR = {snr_fixed} (CVT={use_cvt_val})")
+                                break
+                            except:
+                                continue
+                        if success:
+                            break
+                except Exception as e:
+                    continue
+        
+        # If all attempts failed, use a grid binning approach as fallback
+        if not success or best_result is None:
+            logger.warning("All Voronoi binning attempts failed, using grid binning as fallback")
+            
+            # Determine a reasonable number of bins based on data size and SNR
+            valid_count = np.sum(valid_mask)
+            
+            # More sophisticated bin count calculation based on data size and SNR
+            if max_pixel_snr > 0:
+                # More bins for higher SNR data
+                bin_factor = min(5, max(1, max_pixel_snr / 10))
+            else:
+                bin_factor = 1
+            
+            num_bins = min(100, max(4, int(np.sqrt(valid_count / bin_factor))))
+            
+            # Determine grid dimensions - try to match aspect ratio of data
+            xrange = np.max(x_valid) - np.min(x_valid)
+            yrange = np.max(y_valid) - np.min(y_valid)
+            
+            aspect = xrange / max(yrange, 1e-10)  # Avoid division by zero
+            
+            if aspect > 1.5:  # Wider than tall
+                nx = int(np.sqrt(num_bins * aspect))
+                ny = int(num_bins / nx)
+            elif aspect < 0.67:  # Taller than wide
+                ny = int(np.sqrt(num_bins / aspect))
+                nx = int(num_bins / ny)
+            else:  # Roughly square
+                nx = ny = int(np.sqrt(num_bins))
+            
+            # Ensure at least 2x2 grid
+            nx = max(2, nx)
+            ny = max(2, ny)
+            
+            logger.info(f"Creating {nx}×{ny} grid binning with approximately {nx*ny} bins")
+            
+            # Get bounds of coordinates
+            xmin, xmax = np.min(x_valid), np.max(x_valid)
+            ymin, ymax = np.min(y_valid), np.max(y_valid)
+            
+            # Create grid binning
+            bin_result = create_grid_binning(
+                x_valid, y_valid,
+                signal_valid, noise_valid,
+                nx=nx, ny=ny, xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax
+            )
+            
+            if bin_result is not None:
+                # Map bin numbers back to the original arrays
+                bin_num_valid, x_gen, y_gen, sn_values, n_pixels, scale = bin_result
+                
+                bin_num_full = np.full_like(x, -1, dtype=int)
+                bin_num_full[valid_mask] = bin_num_valid
+                
+                best_result = (bin_num_valid, x_gen, y_gen, sn_values, n_pixels, scale)
+                success = True
+                logger.info(f"Created {len(x_gen)} grid bins as fallback")
+            else:
+                # Last resort: create a simple single bin
+                logger.warning("Grid binning failed, creating simple radial bins as last resort")
+                
+                # Create simple radial bins - often more useful than a uniform grid
+                center_x = np.median(x_valid)
+                center_y = np.median(y_valid)
+                
+                # Calculate distance from center
+                r = np.sqrt((x - center_x)**2 + (y - center_y)**2)
+                
+                # Create simple radial bins (4 is a reasonable minimum)
+                n_radial_bins = min(8, max(4, int(np.sqrt(valid_count / 10))))
+                
+                # Get maximum radius with margin
+                r_max = np.nanmax(r[valid_mask]) * 1.01
+                
+                # Create bin edges
+                bin_edges = np.linspace(0, r_max, n_radial_bins + 1)
+                
+                # Assign bins
+                bin_num_full = np.full_like(r, -1, dtype=int)
+                
+                for i in range(n_radial_bins):
+                    r_min = bin_edges[i]
+                    r_max_bin = bin_edges[i + 1]
+                    mask = valid_mask & (r >= r_min) & (r < r_max_bin)
+                    bin_num_full[mask] = i
+                
+                # Create generator coordinates, SNR values, and pixel counts
+                x_gen = []
+                y_gen = []
+                sn_values = []
+                n_pixels = []
+                
+                for i in range(n_radial_bins):
+                    mask = bin_num_full == i
+                    if np.any(mask):
+                        x_gen.append(np.mean(x[mask]))
+                        y_gen.append(np.mean(y[mask]))
+                        n_pixels.append(np.sum(mask))
+                        
+                        # Estimate SNR
+                        this_signal = np.mean(signal[mask])
+                        this_noise = np.mean(noise[mask])
+                        # Ensure minimum SNR of 1
+                        snr = max(1.0, this_signal / this_noise if this_noise > 0 else 1.0)
+                        sn_values.append(snr)
+                
+                # Convert to arrays
+                x_gen = np.array(x_gen)
+                y_gen = np.array(y_gen)
+                sn_values = np.array(sn_values)
+                n_pixels = np.array(n_pixels)
+                
+                # Check if we have any valid bins
+                if len(x_gen) > 0:
+                    best_result = (bin_num_full[valid_mask], x_gen, y_gen, sn_values, n_pixels, 1.0)
+                    success = True
+                    logger.info(f"Created {len(x_gen)} radial bins as fallback")
+                else:
+                    # If all else fails, use a simple single bin
+                    bin_num_full = np.zeros_like(x, dtype=int)
+                    bin_num_full[~valid_mask] = -1  # Mark invalid points as -1
+                    x_gen = np.array([np.mean(x_valid)])
+                    y_gen = np.array([np.mean(y_valid)])
+                    sn_values = np.array([max(median_snr, 5.0)])
+                    n_pixels = np.array([np.sum(valid_mask)])
+                    
+                    best_result = (bin_num_full[valid_mask], x_gen, y_gen, sn_values, n_pixels, 1.0)
+                    success = True
+                    logger.warning("Created a single bin as last resort fallback")
+        
+        # Extract the results from the successful binning operation
+        bin_num, x_gen, y_gen, sn, n_pixels, scale = best_result
+        
+        # Convert bin_num back to full size
+        full_bin_num = np.full(signal.shape, -1, dtype=int)
+        full_bin_num[valid_mask] = bin_num
+        
+        # Get bin indices for each bin
+        bin_indices = []
+        valid_bins = np.unique(bin_num[bin_num >= 0])
+        
+        for i in valid_bins:
+            indices = np.where(full_bin_num == i)[0]
+            bin_indices.append(indices)
+        
+        logger.info(f"Created {len(bin_indices)} Voronoi bins")
+        
+        # Calculate intersection of wavelength ranges accounting for velocity shifts
+        if velocity_field is not None:
+            wave_mask, min_wave, max_wave = calculate_wavelength_intersection(
+                cube._lambda_gal, velocity_field, cube._n_x
+            )
+            logger.info(f"Applying velocity correction with range {min_wave:.1f} - {max_wave:.1f} Å")
+        else:
             wave_mask = np.ones_like(cube._lambda_gal, dtype=bool)
-            logger.info("No goodwavelength range found, using full wavelength range")
-
-        # 截取波长范围
+            logger.info("No velocity correction applied")
+        
+        # Apply wavelength mask
         wavelength = cube._lambda_gal[wave_mask]
         
-        # Use median of a continuum region to estimate signal
-        # 在截取的波长区域内找合适的连续谱区域
-        if np.any((wavelength > 5000) & (wavelength < 5200)):
-            continuum_region = (wavelength > 5000) & (wavelength < 5200)
-            continuum_indices = np.where(wave_mask)[0][continuum_region]
-        else:
-            # 如果截取后的波长区域不包含5000-5200区间，选择中间1/3作为连续谱
-            total_len = len(wavelength)
-            start_idx = total_len // 3
-            end_idx = 2 * total_len // 3
-            continuum_indices = np.where(wave_mask)[0][start_idx:end_idx]
-        
-        # Calculate signal and noise for each spectrum
-        signal = np.nanmedian(cube._spectra[continuum_indices, :], axis=0)
-        noise = np.nanstd(cube._spectra[continuum_indices, :], axis=0)
-        
-        # Convert to 2D arrays
-        signal_map = np.zeros((cube._n_y, cube._n_x))
-        noise_map = np.zeros((cube._n_y, cube._n_x))
-        snr_map = np.zeros((cube._n_y, cube._n_x))
-        
-        # Fill arrays
-        for i in range(len(cube._spectra[0])):
-            row = (i // cube._n_x)
-            col = (i % cube._n_x)
-            if row < cube._n_y and col < cube._n_x:
-                signal_map[row, col] = signal[i]
-                noise_map[row, col] = noise[i]
-                if noise[i] > 0:
-                    snr_map[row, col] = signal[i] / noise[i]
-        
-        # Get coordinates
-        x = cube.x if hasattr(cube, 'x') else np.arange(len(signal)) % cube._n_x
-        y = cube.y if hasattr(cube, 'y') else np.arange(len(signal)) // cube._n_x
-        
-        logger.info(f"Calculated signal and noise for {len(signal)} spaxels")
-    except Exception as e:
-        logger.error(f"Error calculating signal and noise: {e}")
-        raise
-    
-    # Step 2: Run Voronoi binning
-    # --------------------------
-    try:
-        # 验证输入数据的有效性
-        valid_mask = np.isfinite(x) & np.isfinite(y) & np.isfinite(signal) & np.isfinite(noise) & (noise > 0)
-        valid_count = np.sum(valid_mask)
-        if valid_count < 10:  # 至少需要10个有效点才能进行有意义的分箱
-            logger.warning(f"Only {valid_count} valid data points available, Voronoi binning may be unreliable")
-        
-        logger.info(f"Running Voronoi binning with target SNR = {target_snr}")
-        bin_num, x_gen, y_gen, sn, n_pixels, scale = run_voronoi_binning(
-            x, y, signal, noise, target_snr, 
-            plot=0, quiet=True, cvt=True,
-            min_snr=target_snr/3  # 允许SNR降低到目标值的1/3
+        # Combine spectra in each bin with enhanced velocity correction
+        # This approach similar to the notebook's Spectrum_ReSMP function
+        binned_spectra = combine_spectra_with_velocity_correction(
+            cube._spectra[wave_mask], wavelength, bin_indices, velocity_field, cube._n_x, cube._n_y
         )
         
-        # Get unique bin numbers and filter out negative values (无效bin)
-        unique_bins = np.unique(bin_num)
-        valid_bins = unique_bins[unique_bins >= 0]
-        n_bins = len(valid_bins)
+        logger.info(f"Combined spectra into {len(bin_indices)} bins")
         
-        if n_bins == 0:
-            logger.error("Voronoi binning failed to create any valid bins")
-            # 创建一个后备单bin方案
-            bin_num = np.zeros_like(x, dtype=int)
-            bin_num[~valid_mask] = -1  # 将无效点标记为-1
-            valid_bins = np.array([0])
-            n_bins = 1
-            x_gen = np.array([np.mean(x[valid_mask])])
-            y_gen = np.array([np.mean(y[valid_mask])])
-            sn = np.array([np.mean(signal[valid_mask]/noise[valid_mask]) if np.any(valid_mask) else 1.0])
-            n_pixels = np.array([np.sum(valid_mask)])
-            logger.warning("Created a single bin as fallback due to binning failure")
-        else:
-            logger.info(f"Created {n_bins} Voronoi bins")
-        
-        # Create arrays to store bin results
-        bin_indices = []
-        bin_spectra = np.zeros((len(wavelength), n_bins))
-        
-        # Get velocity field for correction if available from P2P results
-        velocity_field = None
-        if p2p_results is not None and 'stellar_kinematics' in p2p_results:
-            if 'velocity_field' in p2p_results['stellar_kinematics']:
-                velocity_field = p2p_results['stellar_kinematics']['velocity_field']
-                logger.info("Using P2P velocity field for bin spectral correction")
-        
-        # Combine spectra in each bin
-        logger.info("Combining spectra in each bin...")
-        for i, bin_id in enumerate(valid_bins):
-            # Get indices of spectra in this bin
-            mask = bin_num == bin_id
-            indices = np.where(mask)[0]
-            
-            if len(indices) == 0:
-                logger.warning(f"Bin {bin_id} contains no pixels, using nearest bin instead")
-                # 如果这个bin没有像素，使用最近的非空bin的数据
-                non_empty_bins = [b for b in valid_bins if np.any(bin_num == b)]
-                if non_empty_bins:
-                    closest_bin = non_empty_bins[0]
-                    indices = np.where(bin_num == closest_bin)[0]
-                else:
-                    # 如果所有bin都是空的，使用所有有效数据点
-                    indices = np.where(valid_mask)[0]
-            
-            bin_indices.append(indices)
-            
-            # Combine spectra
-            bin_spectra_list = []
-            
-            for idx in indices:
-                # 确保索引在有效范围内
-                if idx >= len(cube._spectra[0]):
-                    logger.warning(f"Index {idx} out of range for cube spectra, skipping")
-                    continue
-                    
-                # Get spectrum并应用wavelength截取
-                full_spectrum = cube._spectra[:, idx] 
-                spectrum = full_spectrum[wave_mask]
-                
-                # 跳过无效光谱
-                if not np.any(np.isfinite(spectrum)):
-                    continue
-                
-                # Apply velocity correction if available
-                if velocity_field is not None:
-                    # Convert 1D index to 2D position
-                    row = idx // cube._n_x
-                    col = idx % cube._n_x
-                    
-                    # Check if position is valid
-                    if (row < velocity_field.shape[0] and col < velocity_field.shape[1] and 
-                        np.isfinite(velocity_field[row, col])):
-                        vel = velocity_field[row, col]
-                        spectrum = apply_velocity_shift(spectrum, wavelength, vel)
-                
-                bin_spectra_list.append(spectrum)
-            
-            # Combine spectra (median)
-            if bin_spectra_list:
-                bin_spectra[:, i] = np.nanmedian(np.array(bin_spectra_list), axis=0)
-            else:
-                # 如果没有有效光谱，填充NaN
-                bin_spectra[:, i] = np.nan
-                logger.warning(f"Bin {bin_id} has no valid spectra")
-        
-        # 创建元数据字典
+        # Create metadata dictionary
         metadata = {
-            'x_gen': x_gen,
-            'y_gen': y_gen,
+            'nx': cube._n_x,
+            'ny': cube._n_y,
+            'target_snr': target_snr,
+            'actual_target_snr': safe_target_snr,
+            'min_snr': min_snr,
+            'time': time.time(),
+            'galaxy_name': galaxy_name,
             'sn': sn,
             'n_pixels': n_pixels,
             'scale': scale,
-            'target_snr': target_snr
+            'x_gen': x_gen,
+            'y_gen': y_gen,
+            'analysis_type': 'VNB',
+            'pixelsize_x': cube._pxl_size_x,
+            'pixelsize_y': cube._pxl_size_y
         }
-        
-        # 如果p2p_results中有距离信息，添加到元数据
-        if p2p_results is not None and 'distance' in p2p_results:
-            # 为每个bin计算平均距离
-            if 'field' in p2p_results['distance']:
-                distance_field = p2p_results['distance']['field']
-                bin_distances = []
-                
-                for i, bin_id in enumerate(valid_bins):
-                    mask = bin_num == bin_id
-                    if np.any(mask):
-                        # 获取此bin中点的线性索引
-                        indices = np.where(mask)[0]
-                        
-                        # 转换为2D索引
-                        rows = indices // cube._n_x
-                        cols = indices % cube._n_x
-                        
-                        # 计算平均距离
-                        valid_dist = []
-                        for r, c in zip(rows, cols):
-                            if (r < distance_field.shape[0] and c < distance_field.shape[1] and 
-                                np.isfinite(distance_field[r, c])):
-                                valid_dist.append(distance_field[r, c])
-                        
-                        if valid_dist:
-                            bin_distances.append(np.mean(valid_dist))
-                        else:
-                            bin_distances.append(np.nan)
-                    else:
-                        bin_distances.append(np.nan)
-                
-                metadata['bin_distances'] = np.array(bin_distances)
         
         # Create VoronoiBinnedData object
         binned_data = VoronoiBinnedData(
-            bin_num=bin_num,
+            bin_num=full_bin_num,
             bin_indices=bin_indices,
-            spectra=bin_spectra,
-            wavelength=wavelength,  # 使用截取后的波长
+            spectra=binned_spectra,
+            wavelength=wavelength,
             metadata=metadata
         )
         
-        # Save binned data
-        binned_data.save(output_dir / f"{galaxy_name}_VNB_binned_data.npz")
-        logger.info(f"Saved binned data to {galaxy_name}_VNB_binned_data.npz")
+        # Run analysis on binned spectra (template fitting, etc.)
+        vnb_results = run_analysis_on_binned_data(args, binned_data, cube, p2p_results)
         
-        # 创建可视化图表
-        binned_data.create_visualization_plots(output_dir, galaxy_name)
-        
-        # Create additional bin visualization
+        # Create visualization plots
         if not args.no_plots:
-            fig = plot_binned_map(
-                x, y, bin_num, title=f"{galaxy_name} - Voronoi Bins (SNR={target_snr})",
-                equal_aspect=args.equal_aspect if hasattr(args, 'equal_aspect') else True,
-                savefile=plots_dir / f"{galaxy_name}_VNB_bins.png"
-            )
-            plt.close(fig)
-            
-            # SNR map
-            fig = plot_binned_map(
-                x, y, bin_num, values=sn, title=f"{galaxy_name} - Bin S/N",
-                cmap='viridis', savefile=plots_dir / f"{galaxy_name}_VNB_snr.png"
-            )
-            plt.close(fig)
-            
-        # return binned_data
-
-    except Exception as e:
-        logger.error(f"Error in Voronoi binning: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        raise
-    
-    # Step 3: Create pseudo-cube for processing #
-    # --------------------------------------- #
-    try:
-        # Convert binned data to P2P-compatible format
-        pseudo_cube = binned_data.to_p2p_compatible(cube)
+            create_vnb_plots(args, binned_data, vnb_results, galaxy_name, plots_dir)
         
-        # Process with stellar fitting code
-        logger.info("Fitting stellar components to binned spectra...")
-        stellar_fit_result = pseudo_cube.fit_spectra(
-            template_filename=args.template,
-            ppxf_vel_init=args.vel_init,
-            ppxf_vel_disp_init=args.sigma_init,
-            ppxf_deg=args.poly_degree if hasattr(args, 'poly_degree') else 3,
-            n_jobs=args.n_jobs
-        )
-        
-        stellar_velocity_field, stellar_dispersion_field, bestfit_field, optimal_tmpls, poly_coeffs = stellar_fit_result
-        
-        logger.info(f"Stellar component fitting completed in {time.time() - start_time:.1f} seconds")
-        
-        # Fit emission lines
-        emission_result = None
-        if not args.no_emission:
-            start_time_em = time.time()
-            emission_result = pseudo_cube.fit_emission_lines(
-                template_filename=args.template,
-                ppxf_vel_init=stellar_velocity_field,  # Use stellar velocity field as initial guess
-                ppxf_sig_init=args.sigma_init,
-                ppxf_deg=2,  # Simpler polynomial for emission lines
-                n_jobs=args.n_jobs
-            )
-            logger.info(f"Emission line fitting completed in {time.time() - start_time_em:.1f} seconds")
-        
-        # Calculate spectral indices
-        indices_result = None
-        if not args.no_indices:
-            start_time_ind = time.time()
-            indices_result = pseudo_cube.calculate_spectral_indices(
-                n_jobs=args.n_jobs
-            )
-            logger.info(f"Spectral indices calculation completed in {time.time() - start_time_ind:.1f} seconds")
-    except Exception as e:
-        logger.error(f"Error in spectral fitting: {e}")
-        raise
-    
-    # Step 4: Process stellar population parameters
-    # -------------------------------------------
-    stellar_pop_params = None
-    try:
-        if hasattr(pseudo_cube, '_template_weights') and pseudo_cube._template_weights is not None:
-            logger.info("Extracting stellar population parameters...")
-            start_time_sp = time.time()
-            
-            # Initialize weight parser
-            from stellar_population import WeightParser
-            weight_parser = WeightParser(args.template)
-            
-            # Prepare arrays for physical parameters
-            n_y, n_x = 1, n_bins  # Pseudo-cube dimensions
-            stellar_pop_params = {
-                'log_age': np.full((n_y, n_x), np.nan),
-                'age': np.full((n_y, n_x), np.nan),
-                'metallicity': np.full((n_y, n_x), np.nan)
-            }
-            
-            # Process weights
-            weights = pseudo_cube._template_weights
-            
-            if len(weights.shape) == 3:  # [n_templates, n_y, n_x]
-                for x in range(n_x):
-                    try:
-                        pixel_weights = weights[:, 0, x]  # Using y=0 always
-                        if np.sum(pixel_weights) > 0:
-                            params = weight_parser.get_physical_params(pixel_weights)
-                            for param_name, value in params.items():
-                                stellar_pop_params[param_name][0, x] = value
-                    except Exception as e:
-                        logger.debug(f"Error calculating stellar params for bin {x}: {e}")
-            
-            logger.info(f"Stellar population parameters extracted in {time.time() - start_time_sp:.1f} seconds")
-    except Exception as e:
-        logger.error(f"Failed to extract stellar population parameters: {e}")
-    
-    # Step 5: Prepare results
-    # ---------------------
-    
-    # Calculate radial distance for each bin
-    bin_distances = np.sqrt(x_gen**2 + y_gen**2) * cube._pxl_size_x
-    
-    # Create results dictionary
-    vnb_results = {
-        # Bin information
-        'bin_info': {
-            'bin_num': bin_num,
+        # Prepare output dictionary with all results
+        result_dict = {
+            'analysis_type': 'VNB',
+            'bin_num': full_bin_num,
             'bin_indices': bin_indices,
-            'x_gen': x_gen,
-            'y_gen': y_gen,
-            'sn': sn,
-            'n_pixels': n_pixels
-        },
-        
-        # Distance information
-        'distance': {
-            'bin_distances': bin_distances,
-            'pixelsize_x': cube._pxl_size_x,
-            'pixelsize_y': cube._pxl_size_y
-        },
-        
-        # Stellar kinematics
-        'stellar_kinematics': {
-            'velocity_field': stellar_velocity_field.reshape(1, n_bins),
-            'dispersion_field': stellar_dispersion_field.reshape(1, n_bins),
-            'velocity': stellar_velocity_field,  # 1D array for easy access
-            'dispersion': stellar_dispersion_field  # 1D array for easy access
+            'bin_coordinates': {
+                'x': x_gen,
+                'y': y_gen
+            },
+            'bin_statistics': {
+                'sn': sn,
+                'n_pixels': n_pixels,
+                'scale': scale
+            },
+            'parameters': {
+                'target_snr': target_snr,
+                'actual_target_snr': safe_target_snr,
+                'min_snr': min_snr,
+                'cvt': use_cvt
+            }
         }
-    }
-    
-    # Add stellar population parameters if available
-    if stellar_pop_params is not None:
-        # Extract 1D arrays from 2D maps (pseudo-cube has shape [1, n_bins])
-        vnb_results['stellar_population'] = {
-            'log_age': stellar_pop_params['log_age'][0, :],
-            'age': stellar_pop_params['age'][0, :],
-            'metallicity': stellar_pop_params['metallicity'][0, :]
+        
+        # Add analysis results
+        result_dict.update(vnb_results)
+        
+        # Save results
+        save_standardized_results(galaxy_name, 'VNB', result_dict, output_dir)
+        
+        logger.info(f"VNB analysis completed in {time.time() - start_time:.1f} seconds")
+        
+        return result_dict
+        
+    except Exception as e:
+        logger.error(f"Error in VNB analysis: {str(e)}")
+        logger.error(traceback.format_exc())
+        # Return empty results dictionary
+        return {
+            'analysis_type': 'VNB',
+            'status': 'error',
+            'error': str(e)
         }
+
+def combine_spectra_with_velocity_correction(spectra, wavelength, bin_indices, velocity_field=None, n_x=None, n_y=None):
+    """
+    Combine spectra within bins with improved velocity correction.
+    This implementation is inspired by the Spectrum_ReSMP function in the notebook.
     
-    # Add emission line results if available
-    if emission_result is not None:
-        emission_params = {}
+    Parameters
+    ----------
+    spectra : numpy.ndarray
+        Array of spectra [n_wave, n_spectra]
+    wavelength : numpy.ndarray
+        Wavelength array
+    bin_indices : list
+        List of arrays with indices for each bin
+    velocity_field : numpy.ndarray, optional
+        Velocity field for correction
+    n_x : int, optional
+        Number of pixels in x direction
+    n_y : int, optional
+        Number of pixels in y direction
         
-        # Add velocity and dispersion fields if available
-        if 'emission_vel' in emission_result:
-            for line_name, vel_map in emission_result['emission_vel'].items():
-                if not np.all(np.isnan(vel_map)):
-                    emission_params['velocity_field'] = vel_map.reshape(1, n_bins)
-                    emission_params['velocity'] = vel_map  # 1D array
-                    break
+    Returns
+    -------
+    numpy.ndarray
+        Combined bin spectra array [n_wave, n_bins]
+    """
+    n_wave = len(wavelength)
+    n_bins = len(bin_indices)
+    c = 299792.458  # Speed of light in km/s
+    
+    # Initialize output array
+    bin_spectra = np.zeros((n_wave, n_bins))
+    
+    # Check if velocity correction is requested and available
+    do_correction = velocity_field is not None and n_x is not None
+    
+    # Process each bin
+    for i, indices in enumerate(bin_indices):
+        # Skip empty bins
+        if len(indices) == 0:
+            bin_spectra[:, i] = np.nan
+            continue
         
-        if 'emission_sig' in emission_result:
-            for line_name, disp_map in emission_result['emission_sig'].items():
-                if not np.all(np.isnan(disp_map)):
-                    emission_params['dispersion_field'] = disp_map.reshape(1, n_bins)
-                    emission_params['dispersion'] = disp_map  # 1D array
-                    break
-        
-        # Add emission line fluxes
-        if 'emission_flux' in emission_result:
-            for line_name, flux_map in emission_result['emission_flux'].items():
-                emission_params[f'flux_{line_name}'] = flux_map
-        
-        # Calculate line ratios
         try:
-            line_ratios = {}
-            
-            # Check if Hbeta and [OIII]5007 are available
-            hb_key = None
-            oiii_key = None
-            
-            for key in emission_params.keys():
-                if 'flux_Hbeta' in key:
-                    hb_key = key
-                elif 'flux_[OIII]5007' in key or 'flux_OIII_5007' in key:
-                    oiii_key = key
-            
-            if hb_key is not None and oiii_key is not None:
-                hb_flux = emission_params[hb_key]
-                oiii_flux = emission_params[oiii_key]
+            # Extract velocities for this bin if available
+            if do_correction:
+                # Calculate median velocity for this bin
+                bin_velocities = []
+                for idx in indices:
+                    row = idx // n_x
+                    col = idx % n_x
+                    if row < n_y and col < n_x:
+                        if velocity_field is not None and row < velocity_field.shape[0] and col < velocity_field.shape[1]:
+                            vel = velocity_field[row, col]
+                            if np.isfinite(vel):
+                                bin_velocities.append(vel)
                 
-                # Calculate ratio, ensuring division by zero is handled
-                valid_mask = ~np.isnan(hb_flux) & ~np.isnan(oiii_flux) & (hb_flux > 0)
-                
-                if np.any(valid_mask):
-                    oiii_hb = np.full_like(hb_flux, np.nan)
-                    oiii_hb[valid_mask] = oiii_flux[valid_mask] / hb_flux[valid_mask]
-                    line_ratios['OIII_Hb'] = oiii_hb
-                    logger.info("Calculated OIII/Hb line ratio")
+                # Apply velocity correction if we have valid velocities
+                if bin_velocities:
+                    median_velocity = np.median(bin_velocities)
+                    
+                    # Only apply correction for non-negligible velocities
+                    if abs(median_velocity) > 1.0:  # Minimum 1 km/s to apply correction
+                        # Following the notebook approach:
+                        # 1. Collect spectra for each spaxel
+                        corrected_spectra = []
+                        
+                        for idx in indices:
+                            spec = spectra[:, idx]
+                            if not np.all(~np.isfinite(spec)):
+                                # Get velocity for this spaxel
+                                row = idx // n_x
+                                col = idx % n_x
+                                
+                                if row < velocity_field.shape[0] and col < velocity_field.shape[1]:
+                                    vel = velocity_field[row, col]
+                                    
+                                    # Check for outlier velocities within the bin
+                                    vel_limit = 300  # km/s, from notebook
+                                    if abs(vel - median_velocity) > vel_limit:
+                                        vel = median_velocity
+                                    
+                                    if abs(vel) > 300:  # Skip extreme velocities
+                                        vel = 0
+                                    
+                                    # Apply velocity shift to wavelength grid
+                                    lam_shifted = wavelength / (1 + (vel/c))
+                                    
+                                    # Resample spectrum to original wavelength grid
+                                    try:
+                                        corrected_spec = spectres(wavelength, lam_shifted, spec)
+                                        corrected_spectra.append(corrected_spec)
+                                    except:
+                                        # Fallback to original spectrum if resampling fails
+                                        corrected_spectra.append(spec)
+                                else:
+                                    corrected_spectra.append(spec)
+                        
+                        # Combine corrected spectra
+                        if corrected_spectra:
+                            # Take median of all corrected spectra
+                            bin_spectra[:, i] = np.nanmedian(np.array(corrected_spectra), axis=0)
+                        else:
+                            bin_spectra[:, i] = np.nan
+                            
+                        continue  # Skip remaining processing for this bin
             
-            if line_ratios:
-                emission_params['line_ratios'] = line_ratios
+            # If we get here, either no velocity correction was applied or it wasn't needed
+            # Simply combine original spectra
+            bin_data = []
+            for idx in indices:
+                spec = spectra[:, idx]
+                if not np.all(~np.isfinite(spec)):
+                    bin_data.append(spec)
+            
+            if bin_data:
+                bin_spectra[:, i] = np.nanmedian(np.array(bin_data), axis=0)
+            else:
+                bin_spectra[:, i] = np.nan
                 
         except Exception as e:
-            logger.warning(f"Could not calculate line ratios: {e}")
+            logger.error(f"Error combining spectra for bin {i}: {e}")
+            bin_spectra[:, i] = np.nan
+    
+    return bin_spectra
+
+def create_grid_binning(x, y, signal, noise, nx=4, ny=4, xmin=None, xmax=None, ymin=None, ymax=None):
+    """
+    Create a grid-based binning scheme as a fallback when Voronoi binning fails
+    
+    Parameters
+    ----------
+    x : numpy.ndarray
+        X coordinates of pixels
+    y : numpy.ndarray
+        Y coordinates of pixels
+    signal : numpy.ndarray
+        Signal values for each pixel
+    noise : numpy.ndarray
+        Noise values for each pixel
+    nx : int, default=4
+        Number of bins in x direction
+    ny : int, default=4
+        Number of bins in y direction
+    xmin, xmax, ymin, ymax : float, optional
+        Bounds of the grid
         
-        # Only add emission key if we have valid data
-        if emission_params:
-            vnb_results['emission'] = emission_params
-    
-    # Add spectral indices if available
-    if indices_result is not None:
-        vnb_results['indices'] = indices_result
-    
-    # Save results
-    save_results_to_npz(
-        output_file=output_dir / f"{galaxy_name}_VNB_results.npz",
-        data_dict=vnb_results
-    )
-    
-    # Save legacy format CSV file
+    Returns
+    -------
+    tuple
+        (bin_num, x_gen, y_gen, sn, n_pixels, scale)
+    """
     try:
-        legacy_df = pd.DataFrame()
+        # Set bounds if not provided
+        if xmin is None:
+            xmin = np.min(x)
+        if xmax is None:
+            xmax = np.max(x)
+        if ymin is None:
+            ymin = np.min(y)
+        if ymax is None:
+            ymax = np.max(y)
         
-        # Format bin indices for compatibility with older code
-        bin_indices_str = []
-        for indices in bin_indices:
-            bin_indices_str.append(str(indices.tolist()).replace(',', ''))
+        # Create grid
+        x_edges = np.linspace(xmin, xmax, nx + 1)
+        y_edges = np.linspace(ymin, ymax, ny + 1)
         
-        # Prepare velocity and dispersion columns
-        if 'stellar_kinematics' in vnb_results:
-            vel = vnb_results['stellar_kinematics']['velocity']
-            disp = vnb_results['stellar_kinematics']['dispersion']
-            component_sol = [f'[{v}, {d}]' for v, d in zip(vel, disp)]
-        else:
-            component_sol = ['[0, 0]'] * n_bins
+        # Initialize bin numbers
+        bin_num = np.full(x.shape, -1, dtype=int)
         
-        # Add emission line fluxes if available
-        h_beta_el_value = np.full(n_bins, np.nan)
-        h_beta_el_anr = np.full(n_bins, np.nan)
-        o3_5007_el_value = np.full(n_bins, np.nan)
-        o3_5007_el_anr = np.full(n_bins, np.nan)
+        # Assign bin numbers based on grid position
+        bin_count = 0
+        x_gen = []
+        y_gen = []
+        sn_values = []
+        n_pixels_values = []
         
-        if 'emission' in vnb_results:
-            emission = vnb_results['emission']
+        for i in range(nx):
+            for j in range(ny):
+                # Define bin edges
+                x_min, x_max = x_edges[i], x_edges[i + 1]
+                y_min, y_max = y_edges[j], y_edges[j + 1]
+                
+                # Select pixels in this bin
+                mask = ((x >= x_min) & (x < x_max) & 
+                        (y >= y_min) & (y < y_max))
+                
+                if np.sum(mask) > 0:
+                    bin_num[mask] = bin_count
+                    x_gen.append(np.mean(x[mask]))
+                    y_gen.append(np.mean(y[mask]))
+                    
+                    # Calculate SNR for this bin
+                    this_signal = np.sum(signal[mask])
+                    this_noise = np.sqrt(np.sum(noise[mask]**2))
+                    # Ensure SNR is at least 1
+                    this_snr = max(1.0, this_signal / this_noise if this_noise > 0 else 1.0)
+                    
+                    sn_values.append(this_snr)
+                    n_pixels_values.append(np.sum(mask))
+                    
+                    bin_count += 1
+        
+        if bin_count == 0:
+            logger.error("Grid binning failed: no bins created")
+            return None
+        
+        # Convert to arrays
+        x_gen = np.array(x_gen)
+        y_gen = np.array(y_gen)
+        sn_values = np.array(sn_values)
+        n_pixels_values = np.array(n_pixels_values)
+        
+        # Create scale value (not really meaningful for grid binning)
+        scale = 1.0
+        
+        return (bin_num, x_gen, y_gen, sn_values, n_pixels_values, scale)
+    
+    except Exception as e:
+        logger.error(f"Error in grid binning: {e}")
+        return None
+
+def calculate_wavelength_intersection(wavelength, velocity_field, n_x):
+    """
+    Calculate common wavelength range accounting for velocity shifts.
+    
+    Parameters
+    ----------
+    wavelength : numpy.ndarray
+        Original wavelength array
+    velocity_field : numpy.ndarray
+        Velocity field (2D array)
+    n_x : int
+        Number of pixels in x direction
+        
+    Returns
+    -------
+    tuple
+        (mask, min_wave, max_wave)
+    """
+    c = 299792.458  # Speed of light in km/s
+    
+    # Find minimum and maximum velocities
+    valid_velocities = velocity_field[np.isfinite(velocity_field)]
+    if len(valid_velocities) == 0:
+        # No valid velocities, return full range
+        return np.ones_like(wavelength, dtype=bool), np.min(wavelength), np.max(wavelength)
+    
+    min_vel = np.min(valid_velocities)
+    max_vel = np.max(valid_velocities)
+    
+    # Calculate wavelength limits
+    # For redshifted spectra, the maximum wavelength becomes larger
+    # For blueshifted spectra, the minimum wavelength becomes smaller
+    min_factor = 1 + min_vel/c
+    max_factor = 1 + max_vel/c
+    
+    # The observed range must be adjusted to account for all possible velocity shifts
+    # This ensures that after shifting, all spectra cover the same rest-frame range
+    rest_min = np.min(wavelength) / min(min_factor, max_factor)
+    rest_max = np.max(wavelength) / max(min_factor, max_factor)
+    
+    # Get intersection range with some margin (1%)
+    margin = 0.01 * (rest_max - rest_min)
+    min_wave = rest_min + margin
+    max_wave = rest_max - margin
+    
+    # Create mask for wavelength range
+    mask = (wavelength >= min_wave) & (wavelength <= max_wave)
+    
+    # Ensure we have some valid wavelengths left
+    if np.sum(mask) < 10:
+        # If almost no wavelength points left, use most of the original range
+        logger.warning("Velocity range too wide for wavelength intersection, using 80% of original range")
+        wlen = len(wavelength)
+        start_idx = int(wlen * 0.1)
+        end_idx = int(wlen * 0.9)
+        mask = np.zeros_like(wavelength, dtype=bool)
+        mask[start_idx:end_idx] = True
+        min_wave = wavelength[start_idx]
+        max_wave = wavelength[end_idx-1]
+    
+    return mask, min_wave, max_wave
+
+def run_analysis_on_binned_data(args, binned_data, cube, p2p_results=None):
+    """
+    Run additional analysis on binned data (stellar population, emission lines, etc.)
+    
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Command line arguments
+    binned_data : VoronoiBinnedData
+        Binned data object
+    cube : MUSECube
+        Original MUSE cube
+    p2p_results : dict, optional
+        P2P analysis results
+        
+    Returns
+    -------
+    dict
+        Analysis results
+    """
+    try:
+        logger.info("Running analysis on binned data...")
+        
+        # Import required modules
+        from p2p_adapter import create_p2p_processor, BinnedDataAdapter, extract_bin_results
+        from analysis.p2p import run_p2p_analysis
+        
+        # Create P2P processor
+        p2p_processor = create_p2p_processor(run_p2p_analysis)
+        
+        # Run P2P analysis on binned data
+        bin_p2p_results = p2p_processor(args, binned_data, p2p_results)
+        
+        # Extract bin results
+        bin_adapter = BinnedDataAdapter(binned_data)
+        results = extract_bin_results(bin_p2p_results, bin_adapter, result_type='vnb')
+        
+        # Format results for consistency with VNB output
+        formatted_results = {
+            'stellar_kinematics': {
+                'velocity': bin_p2p_results.get('velocity_field', None),
+                'dispersion': bin_p2p_results.get('dispersion_field', None)
+            },
+            'distance': {
+                'bin_distances': np.sqrt(bin_adapter.x**2 + bin_adapter.y**2),
+                'pixelsize_x': cube._pxl_size_x,
+                'pixelsize_y': cube._pxl_size_y
+            }
+        }
+        
+        # Add emission line results if available
+        if 'emission' in bin_p2p_results:
+            formatted_results['emission'] = {}
             
-            # Look for Hbeta flux
-            for key in emission:
-                if key.startswith('flux_') and 'Hbeta' in key:
-                    h_beta_el_value = emission[key]
-                    break
-            
-            # Look for OIII flux
-            for key in emission:
-                if key.startswith('flux_') and ('[OIII]5007' in key or 'OIII_5007' in key):
-                    o3_5007_el_value = emission[key]
-                    break
+            # Process each emission line parameter
+            for key, value in bin_p2p_results['emission'].items():
+                if isinstance(value, np.ndarray) and value.shape == (cube._n_y, cube._n_x):
+                    # Extract values at bin centers
+                    bin_values = []
+                    for i, (x, y) in enumerate(zip(bin_adapter.x, bin_adapter.y)):
+                        # Find closest pixel
+                        x_idx = min(max(int(x / cube._pxl_size_x + cube._n_x / 2), 0), cube._n_x - 1)
+                        y_idx = min(max(int(y / cube._pxl_size_y + cube._n_y / 2), 0), cube._n_y - 1)
+                        bin_values.append(value[y_idx, x_idx])
+                    
+                    formatted_results['emission'][key] = np.array(bin_values)
+                else:
+                    formatted_results['emission'][key] = value
         
         # Add spectral indices if available
-        h_beta_si = np.full(n_bins, np.nan)
-        mg_b_si = np.full(n_bins, np.nan)
-        fe_5015_si = np.full(n_bins, np.nan)
-        
-        if 'indices' in vnb_results:
-            indices = vnb_results['indices']
+        if 'indices' in bin_p2p_results:
+            formatted_results['indices'] = {}
             
-            if 'Hbeta' in indices:
-                h_beta_si = indices['Hbeta']
-            
-            if 'Mgb' in indices:
-                mg_b_si = indices['Mgb']
-            
-            if 'Fe5015' in indices:
-                fe_5015_si = indices['Fe5015']
+            # Process each index
+            for index_name, index_map in bin_p2p_results['indices'].items():
+                if isinstance(index_map, np.ndarray) and index_map.shape == (cube._n_y, cube._n_x):
+                    # Extract values at bin centers
+                    bin_values = []
+                    for i, (x, y) in enumerate(zip(bin_adapter.x, bin_adapter.y)):
+                        # Find closest pixel
+                        x_idx = min(max(int(x / cube._pxl_size_x + cube._n_x / 2), 0), cube._n_x - 1)
+                        y_idx = min(max(int(y / cube._pxl_size_y + cube._n_y / 2), 0), cube._n_y - 1)
+                        bin_values.append(index_map[y_idx, x_idx])
+                    
+                    formatted_results['indices'][index_name] = np.array(bin_values)
+                else:
+                    formatted_results['indices'][index_name] = index_map
         
-        # Create final dataframe
-        legacy_df = pd.DataFrame({
-            'H_beta_EL_value': h_beta_el_value.flatten() if hasattr(h_beta_el_value, 'flatten') else h_beta_el_value,
-            'H_beta_EL_ANR': h_beta_el_anr.flatten() if hasattr(h_beta_el_anr, 'flatten') else h_beta_el_anr,
-            'O_3_5007_EL_value': o3_5007_el_value.flatten() if hasattr(o3_5007_el_value, 'flatten') else o3_5007_el_value,
-            'O_3_5007_EL_ANR': o3_5007_el_anr.flatten() if hasattr(o3_5007_el_anr, 'flatten') else o3_5007_el_anr,
-            'Component_Sol': component_sol,
-            'H_beta_SI': h_beta_si.flatten() if hasattr(h_beta_si, 'flatten') else h_beta_si,
-            'Mg_b_SI': mg_b_si.flatten() if hasattr(mg_b_si, 'flatten') else mg_b_si,
-            'Fe_5015_SI': fe_5015_si.flatten() if hasattr(fe_5015_si, 'flatten') else fe_5015_si,
-            'SNR': sn.flatten() if hasattr(sn, 'flatten') else sn,
-            'K_index': bin_indices_str
-        })
+        # Add stellar population parameters if available
+        if 'stellar_population' in bin_p2p_results:
+            formatted_results['stellar_population'] = {}
+            
+            # Process each parameter
+            for param_name, param_map in bin_p2p_results['stellar_population'].items():
+                if isinstance(param_map, np.ndarray) and param_map.shape == (cube._n_y, cube._n_x):
+                    # Extract values at bin centers
+                    bin_values = []
+                    for i, (x, y) in enumerate(zip(bin_adapter.x, bin_adapter.y)):
+                        # Find closest pixel
+                        x_idx = min(max(int(x / cube._pxl_size_x + cube._n_x / 2), 0), cube._n_x - 1)
+                        y_idx = min(max(int(y / cube._pxl_size_y + cube._n_y / 2), 0), cube._n_y - 1)
+                        bin_values.append(param_map[y_idx, x_idx])
+                    
+                    formatted_results['stellar_population'][param_name] = np.array(bin_values)
+                else:
+                    formatted_results['stellar_population'][param_name] = param_map
         
-        # Save to CSV
-        legacy_df.to_csv(output_dir / f"{galaxy_name}_VNB_SFR.csv", index=False)
-        logger.info(f"Saved legacy format results to {galaxy_name}_VNB_SFR.csv")
-    except Exception as e:
-        logger.error(f"Error saving legacy format: {e}")
+        return formatted_results
     
-    # Step 6: Create visualizations
-    # ---------------------------
-    if not args.no_plots:
-        try:
-            # Create kinematics plots
-            if 'stellar_kinematics' in vnb_results:
-                velocity_field = vnb_results['stellar_kinematics']['velocity']
-                dispersion_field = vnb_results['stellar_kinematics']['dispersion']
-                
-                # Create 2D maps using bin positions
-                fig = plot_binned_map(
-                    x_gen, y_gen, np.arange(n_bins), values=velocity_field,
-                    title=f"{galaxy_name} - Stellar Velocity",
-                    cmap='RdBu_r', 
-                    vmin=-100, vmax=100,
-                    equal_aspect=args.equal_aspect if hasattr(args, 'equal_aspect') else True,
-                    savefile=plots_dir / f"{galaxy_name}_VNB_velocity.png"
-                )
-                plt.close(fig)
-                
-                fig = plot_binned_map(
-                    x_gen, y_gen, np.arange(n_bins), values=dispersion_field,
-                    title=f"{galaxy_name} - Stellar Dispersion",
-                    cmap='viridis',
-                    vmin=0, vmax=200,
-                    equal_aspect=args.equal_aspect if hasattr(args, 'equal_aspect') else True,
-                    savefile=plots_dir / f"{galaxy_name}_VNB_dispersion.png"
-                )
-                plt.close(fig)
-                
-                # Create radial profiles
-                fig = plot_radial_profile(
-                    bin_distances, velocity_field,
-                    title=f"{galaxy_name} - Stellar Velocity Profile",
-                    xlabel="Radius (arcsec)",
-                    ylabel="Velocity (km/s)",
-                    savefile=plots_dir / f"{galaxy_name}_VNB_velocity_profile.png"
-                )
-                plt.close(fig)
-                
-                fig = plot_radial_profile(
-                    bin_distances, dispersion_field,
-                    title=f"{galaxy_name} - Stellar Dispersion Profile",
-                    xlabel="Radius (arcsec)",
-                    ylabel="Dispersion (km/s)",
-                    savefile=plots_dir / f"{galaxy_name}_VNB_dispersion_profile.png"
-                )
-                plt.close(fig)
+    except Exception as e:
+        logger.error(f"Error in analysis on binned data: {str(e)}")
+        logger.error(traceback.format_exc())
+        return {}
+
+def create_vnb_plots(args, binned_data, vnb_results, galaxy_name, plots_dir):
+    """
+    Create visualization plots for VNB analysis
+    
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Command line arguments
+    binned_data : VoronoiBinnedData
+        Binned data object
+    vnb_results : dict
+        VNB analysis results
+    galaxy_name : str
+        Galaxy name
+    plots_dir : Path
+        Directory to save plots
+    """
+    try:
+        # Create basic binning plots
+        create_binning_plots(binned_data, plots_dir, galaxy_name)
+        
+        # Create stellar kinematics plots
+        if 'stellar_kinematics' in vnb_results:
+            velocity = vnb_results['stellar_kinematics'].get('velocity', None)
+            dispersion = vnb_results['stellar_kinematics'].get('dispersion', None)
             
-            # Create stellar population plots
-            if 'stellar_population' in vnb_results:
-                for param, values in vnb_results['stellar_population'].items():
-                    if param == 'age':
-                        # Convert to Gyr for plotting
-                        values_gyr = values * 1e-9
-                        title = f"{galaxy_name} - Stellar Age (Gyr)"
+            if velocity is not None and dispersion is not None:
+                try:
+                    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+                    
+                    # Get bin centers
+                    x_gen = binned_data.metadata.get('x_gen', None)
+                    y_gen = binned_data.metadata.get('y_gen', None)
+                    
+                    if x_gen is None or y_gen is None:
+                        # Reconstruct bin centers from bin map
+                        x_centers = []
+                        y_centers = []
+                        bin_map = binned_data.bin_num.reshape(binned_data.metadata['ny'], binned_data.metadata['nx'])
+                        for i in range(len(velocity)):
+                            mask = bin_map == i
+                            if np.any(mask):
+                                y_indices, x_indices = np.where(mask)
+                                x_centers.append(np.mean(x_indices))
+                                y_centers.append(np.mean(y_indices))
+                        x_gen = np.array(x_centers)
+                        y_gen = np.array(y_centers)
+                    
+                    # Plot velocity field
+                    sc0 = axes[0].scatter(x_gen, y_gen, c=velocity, cmap='coolwarm', 
+                                        s=50, edgecolor='k')
+                    plt.colorbar(sc0, ax=axes[0], label='Velocity (km/s)')
+                    axes[0].set_title('Stellar Velocity')
+                    
+                    # Plot dispersion field
+                    sc1 = axes[1].scatter(x_gen, y_gen, c=dispersion, cmap='viridis', 
+                                        s=50, edgecolor='k')
+                    plt.colorbar(sc1, ax=axes[1], label='Dispersion (km/s)')
+                    axes[1].set_title('Stellar Velocity Dispersion')
+                    
+                    # Save figure
+                    plt.tight_layout()
+                    plt.savefig(plots_dir / f"{galaxy_name}_vnb_kinematics.png", dpi=150)
+                    plt.close(fig)
+                except Exception as e:
+                    logger.warning(f"Error creating kinematics plots: {str(e)}")
+        
+        # Create stellar population plots
+        if 'stellar_population' in vnb_results:
+            try:
+                params = vnb_results['stellar_population']
+                param_names = list(params.keys())
+                
+                if param_names:
+                    fig, axes = plt.subplots(1, len(param_names), figsize=(4 * len(param_names), 4))
+                    if len(param_names) == 1:
+                        axes = [axes]
+                    
+                    x_gen = binned_data.metadata.get('x_gen', None)
+                    y_gen = binned_data.metadata.get('y_gen', None)
+                    
+                    for i, param_name in enumerate(param_names):
+                        param_values = params[param_name]
                         
-                        fig = plot_binned_map(
-                            x_gen, y_gen, np.arange(n_bins), values=values_gyr,
-                            title=title, cmap='plasma',
-                            equal_aspect=args.equal_aspect if hasattr(args, 'equal_aspect') else True,
-                            savefile=plots_dir / f"{galaxy_name}_VNB_{param}.png"
-                        )
-                        plt.close(fig)
+                        # Adjust display for age
+                        if param_name == 'age':
+                            param_values = param_values * 1e-9  # Convert to Gyr
+                            label = 'Age (Gyr)'
+                        elif param_name == 'log_age':
+                            label = 'Log Age (yr)'
+                        elif param_name == 'metallicity':
+                            label = 'Metallicity [Z/H]'
+                        else:
+                            label = param_name
                         
-                        fig = plot_radial_profile(
-                            bin_distances, values_gyr,
-                            title=f"{galaxy_name} - Stellar Age Profile",
-                            xlabel="Radius (arcsec)",
-                            ylabel="Age (Gyr)",
-                            savefile=plots_dir / f"{galaxy_name}_VNB_{param}_profile.png"
-                        )
-                        plt.close(fig)
-                    else:
-                        title = f"{galaxy_name} - Stellar {param.capitalize()}"
-                        
-                        fig = plot_binned_map(
-                            x_gen, y_gen, np.arange(n_bins), values=values,
-                            title=title, cmap='viridis',
-                            equal_aspect=args.equal_aspect if hasattr(args, 'equal_aspect') else True,
-                            savefile=plots_dir / f"{galaxy_name}_VNB_{param}.png"
-                        )
-                        plt.close(fig)
-                        
-                        fig = plot_radial_profile(
-                            bin_distances, values,
-                            title=f"{galaxy_name} - Stellar {param.capitalize()} Profile",
-                            xlabel="Radius (arcsec)",
-                            ylabel=param.capitalize(),
-                            savefile=plots_dir / f"{galaxy_name}_VNB_{param}_profile.png"
-                        )
-                        plt.close(fig)
-            
-            # Create emission line plots
-            if 'emission' in vnb_results:
+                        sc = axes[i].scatter(x_gen, y_gen, c=param_values, cmap='plasma', 
+                                          s=50, edgecolor='k')
+                        plt.colorbar(sc, ax=axes[i], label=label)
+                        axes[i].set_title(f'Stellar {label}')
+                    
+                    # Save figure
+                    plt.tight_layout()
+                    plt.savefig(plots_dir / f"{galaxy_name}_vnb_stellar_pop.png", dpi=150)
+                    plt.close(fig)
+            except Exception as e:
+                logger.warning(f"Error creating stellar population plots: {str(e)}")
+        
+        # Create emission line plots
+        if 'emission' in vnb_results:
+            try:
                 emission = vnb_results['emission']
                 
-                # Plot emission line velocities if available
-                if 'velocity' in emission:
-                    fig = plot_binned_map(
-                        x_gen, y_gen, np.arange(n_bins), values=emission['velocity'],
-                        title=f"{galaxy_name} - Gas Velocity",
-                        cmap='RdBu_r',
-                        vmin=-100, vmax=100,
-                        equal_aspect=args.equal_aspect if hasattr(args, 'equal_aspect') else True,
-                        savefile=plots_dir / f"{galaxy_name}_VNB_gas_velocity.png"
-                    )
-                    plt.close(fig)
-                    
-                    fig = plot_radial_profile(
-                        bin_distances, emission['velocity'],
-                        title=f"{galaxy_name} - Gas Velocity Profile",
-                        xlabel="Radius (arcsec)",
-                        ylabel="Velocity (km/s)",
-                        savefile=plots_dir / f"{galaxy_name}_VNB_gas_velocity_profile.png"
-                    )
-                    plt.close(fig)
-                
-                # Plot emission line fluxes
-                for key, values in emission.items():
-                    if key.startswith('flux_'):
+                # Find flux maps
+                flux_maps = {}
+                for key, value in emission.items():
+                    if key.startswith('flux_') and isinstance(value, np.ndarray):
                         line_name = key[5:]  # Remove 'flux_' prefix
-                        
-                        # Only plot if we have valid values
-                        if np.any(~np.isnan(values)):
-                            fig = plot_binned_map(
-                                x_gen, y_gen, np.arange(n_bins), values=values,
-                                title=f"{galaxy_name} - {line_name} Flux",
-                                cmap='inferno',
-                                equal_aspect=args.equal_aspect if hasattr(args, 'equal_aspect') else True,
-                                savefile=plots_dir / f"{galaxy_name}_VNB_{line_name}_flux.png"
-                            )
-                            plt.close(fig)
-                            
-                            fig = plot_radial_profile(
-                                bin_distances, values,
-                                title=f"{galaxy_name} - {line_name} Flux Profile",
-                                xlabel="Radius (arcsec)",
-                                ylabel="Flux",
-                                savefile=plots_dir / f"{galaxy_name}_VNB_{line_name}_flux_profile.png"
-                            )
-                            plt.close(fig)
+                        flux_maps[line_name] = value
                 
-                # Plot line ratios
-                if 'line_ratios' in emission:
-                    for ratio_name, values in emission['line_ratios'].items():
-                        if np.any(~np.isnan(values)):
-                            fig = plot_binned_map(
-                                x_gen, y_gen, np.arange(n_bins), values=values,
-                                title=f"{galaxy_name} - {ratio_name} Ratio",
-                                cmap='viridis',
-                                equal_aspect=args.equal_aspect if hasattr(args, 'equal_aspect') else True,
-                                savefile=plots_dir / f"{galaxy_name}_VNB_{ratio_name}_ratio.png"
-                            )
-                            plt.close(fig)
+                if flux_maps:
+                    n_lines = min(len(flux_maps), 6)  # Show at most 6 lines
+                    fig, axes = plt.subplots(1, n_lines, figsize=(4 * n_lines, 4))
+                    if n_lines == 1:
+                        axes = [axes]
+                    
+                    x_gen = binned_data.metadata.get('x_gen', None)
+                    y_gen = binned_data.metadata.get('y_gen', None)
+                    
+                    for i, (line_name, flux) in enumerate(list(flux_maps.items())[:n_lines]):
+                        # Use log scale for better visualization
+                        with np.errstate(divide='ignore', invalid='ignore'):
+                            log_flux = np.log10(flux)
+                        
+                        valid_mask = np.isfinite(log_flux)
+                        if np.any(valid_mask):
+                            vmin = np.nanpercentile(log_flux[valid_mask], 5)
+                            vmax = np.nanpercentile(log_flux[valid_mask], 95)
                             
-                            fig = plot_radial_profile(
-                                bin_distances, values,
-                                title=f"{galaxy_name} - {ratio_name} Ratio Profile",
-                                xlabel="Radius (arcsec)",
-                                ylabel="Ratio",
-                                savefile=plots_dir / f"{galaxy_name}_VNB_{ratio_name}_ratio_profile.png"
-                            )
-                            plt.close(fig)
-            
-            # Create spectral indices plots
-            if 'indices' in vnb_results:
+                            sc = axes[i].scatter(x_gen, y_gen, c=log_flux, cmap='inferno', 
+                                              s=50, edgecolor='k', vmin=vmin, vmax=vmax)
+                            plt.colorbar(sc, ax=axes[i], label='Log Flux')
+                        else:
+                            axes[i].scatter(x_gen, y_gen, c='gray', s=50, edgecolor='k')
+                        
+                        axes[i].set_title(f'{line_name} Flux')
+                    
+                    # Save figure
+                    plt.tight_layout()
+                    plt.savefig(plots_dir / f"{galaxy_name}_vnb_emission.png", dpi=150)
+                    plt.close(fig)
+            except Exception as e:
+                logger.warning(f"Error creating emission line plots: {str(e)}")
+        
+        # Create spectral indices plots
+        if 'indices' in vnb_results:
+            try:
                 indices = vnb_results['indices']
+                index_names = list(indices.keys())
                 
-                for index_name, values in indices.items():
-                    # Only plot if we have valid values
-                    if np.any(~np.isnan(values)):
-                        fig = plot_binned_map(
-                            x_gen, y_gen, np.arange(n_bins), values=values,
-                            title=f"{galaxy_name} - {index_name} Index",
-                            cmap='viridis',
-                            equal_aspect=args.equal_aspect if hasattr(args, 'equal_aspect') else True,
-                            savefile=plots_dir / f"{galaxy_name}_VNB_{index_name}_index.png"
-                        )
-                        plt.close(fig)
+                if index_names:
+                    n_indices = min(len(index_names), 6)  # Show at most 6 indices
+                    fig, axes = plt.subplots(1, n_indices, figsize=(4 * n_indices, 4))
+                    if n_indices == 1:
+                        axes = [axes]
+                    
+                    x_gen = binned_data.metadata.get('x_gen', None)
+                    y_gen = binned_data.metadata.get('y_gen', None)
+                    
+                    for i, index_name in enumerate(index_names[:n_indices]):
+                        index_values = indices[index_name]
                         
-                        fig = plot_radial_profile(
-                            bin_distances, values,
-                            title=f"{galaxy_name} - {index_name} Index Profile",
-                            xlabel="Radius (arcsec)",
-                            ylabel=f"{index_name} Index",
-                            savefile=plots_dir / f"{galaxy_name}_VNB_{index_name}_index_profile.png"
-                        )
-                        plt.close(fig)
-            
-            logger.info("Generated visualization plots")
-        except Exception as e:
-            logger.error(f"Error creating plots: {e}")
+                        valid_mask = np.isfinite(index_values)
+                        if np.any(valid_mask):
+                            vmin = np.nanpercentile(index_values[valid_mask], 5)
+                            vmax = np.nanpercentile(index_values[valid_mask], 95)
+                            
+                            sc = axes[i].scatter(x_gen, y_gen, c=index_values, cmap='viridis', 
+                                              s=50, edgecolor='k', vmin=vmin, vmax=vmax)
+                            plt.colorbar(sc, ax=axes[i], label='Index Value')
+                        else:
+                            axes[i].scatter(x_gen, y_gen, c='gray', s=50, edgecolor='k')
+                        
+                        axes[i].set_title(f'{index_name} Index')
+                    
+                    # Save figure
+                    plt.tight_layout()
+                    plt.savefig(plots_dir / f"{galaxy_name}_vnb_indices.png", dpi=150)
+                    plt.close(fig)
+            except Exception as e:
+                logger.warning(f"Error creating spectral indices plots: {str(e)}")
+        
+    except Exception as e:
+        logger.error(f"Error creating VNB plots: {str(e)}")
+        logger.error(traceback.format_exc())
+
+def create_binning_plots(binned_data, plots_dir, galaxy_name):
+    """
+    Create basic binning visualization plots
     
-    logger.info(f"Voronoi binning analysis completed in {time.time() - start_time:.1f} seconds")
-    return vnb_results
+    Parameters
+    ----------
+    binned_data : VoronoiBinnedData
+        Binned data object
+    plots_dir : Path
+        Directory to save plots
+    galaxy_name : str
+        Galaxy name
+    """
+    try:
+        # Create Voronoi bin map
+        fig, ax = plt.subplots(figsize=(10, 8))
+        
+        # Get bin centers and SNR values
+        x_gen = binned_data.metadata.get('x_gen', None)
+        y_gen = binned_data.metadata.get('y_gen', None)
+        sn = binned_data.metadata.get('sn', None)
+        
+        # Create a bin map image
+        n_y = binned_data.metadata['ny']
+        n_x = binned_data.metadata['nx']
+        bin_map = np.full((n_y, n_x), -1)
+        
+        # Get unique bin numbers
+        unique_bins = np.unique(binned_data.bin_num)
+        unique_bins = unique_bins[unique_bins >= 0]  # Remove negative values
+        
+        # Fill bin map with bin numbers
+        for i in unique_bins:
+            mask = binned_data.bin_num == i
+            if np.any(mask):
+                bin_map[mask.reshape(n_y, n_x)] = i
+        
+        # Create random colors for each bin
+        n_bins = len(x_gen)
+        cmap = plt.cm.get_cmap('tab20', n_bins)
+        colors = [cmap(i) for i in range(n_bins)]
+        
+        # Create colored bin map
+        rgba_colors = np.zeros((n_y, n_x, 4))
+        for i, color in enumerate(colors):
+            mask = bin_map == i
+            if np.any(mask):
+                rgba_colors[mask] = color
+        
+        # Show bin map
+        ax.imshow(rgba_colors, origin='lower', aspect='equal')
+        
+        # Plot bin centers
+        for i, (x, y) in enumerate(zip(x_gen, y_gen)):
+            ax.text(x, y, str(i), color='black', fontsize=8, 
+                   ha='center', va='center', backgroundcolor='white')
+        
+        # Add colorbar for SNR
+        if sn is not None:
+            # Create a scatter plot with SNR values
+            sc = ax.scatter(x_gen, y_gen, c=sn, cmap='viridis', 
+                           s=10, alpha=0.7)
+            plt.colorbar(sc, ax=ax, label='Signal-to-Noise Ratio')
+        
+        ax.set_title(f'Voronoi Binning Map - {galaxy_name}')
+        ax.set_xlabel('X (pixels)')
+        ax.set_ylabel('Y (pixels)')
+        
+        # Save figure
+        plt.tight_layout()
+        plt.savefig(plots_dir / f"{galaxy_name}_vnb_binning_map.png", dpi=150)
+        plt.close(fig)
+        
+        # Create bin SNR histogram
+        if sn is not None:
+            fig, ax = plt.subplots(figsize=(8, 6))
+            
+            # Plot histogram of SNR values
+            ax.hist(sn, bins=20, color='skyblue', edgecolor='black')
+            
+            # Add target SNR line
+            target_snr = binned_data.metadata.get('target_snr', None)
+            if target_snr is not None:
+                ax.axvline(x=target_snr, color='red', linestyle='--', 
+                          label=f'Target SNR = {target_snr:.1f}')
+            
+            # Add median SNR line
+            median_snr = np.median(sn)
+            ax.axvline(x=median_snr, color='green', linestyle='-', 
+                      label=f'Median SNR = {median_snr:.1f}')
+            
+            ax.set_title(f'Bin SNR Distribution - {galaxy_name}')
+            ax.set_xlabel('Signal-to-Noise Ratio')
+            ax.set_ylabel('Number of Bins')
+            ax.legend()
+            
+            # Save figure
+            plt.tight_layout()
+            plt.savefig(plots_dir / f"{galaxy_name}_vnb_snr_histogram.png", dpi=150)
+            plt.close(fig)
+        
+        # Create bin size histogram
+        n_pixels = binned_data.metadata.get('n_pixels', None)
+        if n_pixels is not None:
+            fig, ax = plt.subplots(figsize=(8, 6))
+            
+            # Plot histogram of bin sizes
+            ax.hist(n_pixels, bins=20, color='lightgreen', edgecolor='black')
+            
+            # Add median bin size line
+            median_pixels = np.median(n_pixels)
+            ax.axvline(x=median_pixels, color='red', linestyle='-', 
+                      label=f'Median Size = {median_pixels:.1f} pixels')
+            
+            ax.set_title(f'Bin Size Distribution - {galaxy_name}')
+            ax.set_xlabel('Number of Pixels per Bin')
+            ax.set_ylabel('Number of Bins')
+            ax.legend()
+            
+            # Save figure
+            plt.tight_layout()
+            plt.savefig(plots_dir / f"{galaxy_name}_vnb_binsize_histogram.png", dpi=150)
+            plt.close(fig)
+    
+    except Exception as e:
+        logger.error(f"Error creating binning plots: {str(e)}")
+        logger.error(traceback.format_exc())
