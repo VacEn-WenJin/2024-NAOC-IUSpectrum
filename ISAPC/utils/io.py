@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 def save_results_to_npz(output_file: Union[str, Path], data_dict: Dict[str, Any]) -> None:
     """
-    Save results dictionary to NPZ file.
+    Save results dictionary to NPZ file with enhanced handling of variable-length arrays.
     
     Parameters
     ----------
@@ -34,6 +34,13 @@ def save_results_to_npz(output_file: Union[str, Path], data_dict: Dict[str, Any]
             # Convert pandas DataFrame to dictionary
             if hasattr(value, 'to_dict'):
                 filtered_dict[key] = value.to_dict()
+            # Handle lists of arrays (like bin_indices) that can cause issues
+            elif key == 'bin_indices' and isinstance(value, list):
+                # For bin_indices, store as object array to handle variable lengths
+                indices_array = np.empty(len(value), dtype=object)
+                for i, indices in enumerate(value):
+                    indices_array[i] = indices
+                filtered_dict[key] = indices_array
             # Process nested dictionaries
             elif isinstance(value, dict):
                 nested_dict = {}
@@ -53,6 +60,14 @@ def save_results_to_npz(output_file: Union[str, Path], data_dict: Dict[str, Any]
         logger.info(f"Saved results to {output_file}")
     except Exception as e:
         logger.error(f"Error saving results to {output_file}: {e}")
+        
+        # Try to save with pickle protocol for object arrays (fallback method)
+        try:
+            # Use allow_pickle=True explicitly
+            np.savez(output_file, allow_pickle=True, **filtered_dict)
+            logger.info(f"Saved results to {output_file} using pickle protocol")
+        except Exception as e2:
+            logger.error(f"Error saving results even with pickle: {e2}")
 
 
 def load_results_from_npz(input_file: Union[str, Path]) -> Dict[str, Any]:
@@ -251,3 +266,6 @@ def save_standardized_results(galaxy_name, analysis_type, results, base_dir):
         save_results_to_npz(binning_file, results['bin_info'])
     
     logger.info(f"Saved standardized {analysis_type} results for {galaxy_name}")
+
+
+

@@ -10,6 +10,8 @@ from matplotlib.patches import Ellipse
 import warnings
 from scipy.ndimage import gaussian_filter
 
+import logging
+logger = logging.getLogger(__name__)
 
 def plot_spectrum(wavelength, flux, ax=None, title='Spectrum', xlabel='Wavelength (Å)', 
                  ylabel='Flux', color='k', linewidth=1, alpha=1, label=None):
@@ -598,11 +600,230 @@ def plot_rotation_model(velocity_field, mask=None, center_x=None, center_y=None,
     
     return ax
 
+def plot_parameter_map(data, bin_map, ax=None, title=None, cmap='viridis', 
+                      label=None, vmin=None, vmax=None, equal_aspect=True):
+    """
+    Plot parameter map with robust handling of different array dimensions
+    
+    Parameters
+    ----------
+    data : ndarray
+        Parameter values (can be 1D or 2D)
+    bin_map : ndarray
+        2D bin map
+    ax : matplotlib.axes.Axes, optional
+        Axis to plot on
+    title : str, optional
+        Plot title
+    cmap : str, default='viridis'
+        Colormap to use
+    label : str, optional
+        Colorbar label
+    vmin, vmax : float, optional
+        Minimum and maximum values for colorbar
+    equal_aspect : bool, default=True
+        Whether to use equal aspect ratio
+        
+    Returns
+    -------
+    matplotlib.axes.Axes
+        Axis with the plot
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, 7))
+    
+    try:
+        # Create parameter map
+        param_map = np.full_like(bin_map, np.nan, dtype=float)
+        
+        # Check if data is 1D or 2D
+        if isinstance(data, np.ndarray):
+            if len(data.shape) == 1:
+                # For each bin, fill map with corresponding value
+                for i, value in enumerate(data):
+                    if i < len(data) and np.isfinite(value):
+                        param_map[bin_map == i] = value
+            elif len(data.shape) == 2:
+                # Check if shapes match
+                if data.shape == bin_map.shape:
+                    # Direct 2D array, just copy where bin_map is valid
+                    valid_mask = (bin_map >= 0)
+                    param_map[valid_mask] = data[valid_mask]
+                else:
+                    # Reshape if possible, otherwise just fill where we can
+                    try:
+                        data_reshaped = data.reshape(bin_map.shape)
+                        valid_mask = (bin_map >= 0)
+                        param_map[valid_mask] = data_reshaped[valid_mask]
+                    except:
+                        # Go back to bin-based filling
+                        for i in range(np.max(bin_map) + 1):
+                            mask = (bin_map == i)
+                            if np.any(mask) and i < data.size:
+                                param_map[mask] = data.flat[i]
+            else:
+                # Higher dimensional - try to flatten and use what we can
+                flat_data = data.ravel()
+                for i in range(min(np.max(bin_map) + 1, len(flat_data))):
+                    mask = (bin_map == i)
+                    if np.any(mask) and i < len(flat_data):
+                        param_map[mask] = flat_data[i]
+        
+        # Plot parameter map
+        valid_param = param_map[np.isfinite(param_map)]
+        if len(valid_param) > 0:
+            # Determine color scale
+            if vmin is None:
+                vmin = np.nanpercentile(valid_param, 5)
+            if vmax is None:
+                vmax = np.nanpercentile(valid_param, 95)
+            
+            # Ensure valid range
+            if vmin >= vmax:
+                vmin = np.nanmin(valid_param)
+                vmax = np.nanmax(valid_param)
+                # If still invalid, use default range
+                if vmin >= vmax:
+                    vmin, vmax = 0, 1
+            
+            # Create masked array for better visualization
+            masked_param = np.ma.array(param_map, mask=~np.isfinite(param_map))
+            
+            # Plot the map
+            im = ax.imshow(masked_param, origin='lower', cmap=cmap, 
+                          vmin=vmin, vmax=vmax, aspect='equal' if equal_aspect else 'auto')
+            
+            # Add colorbar
+            cbar = plt.colorbar(im, ax=ax)
+            if label:
+                cbar.set_label(label)
+        else:
+            ax.text(0.5, 0.5, "No valid data", ha='center', va='center', transform=ax.transAxes)
+        
+        if title:
+            ax.set_title(title)
+        
+        # Set equal aspect ratio if requested
+        if equal_aspect:
+            ax.set_aspect('equal')
+            
+        # Add grid for reference
+        ax.grid(True, alpha=0.3)
+        
+        return ax
+    
+    except Exception as e:
+        logger.warning(f"Error plotting parameter map: {e}")
+        ax.text(0.5, 0.5, f"Error plotting parameter: {str(e)}", 
+               ha='center', va='center', transform=ax.transAxes)
+        if title:
+            ax.set_title(title)
+        return ax
+
+def safe_plot_array(data, bin_map, ax=None, title=None, cmap='viridis', label=None):
+    """
+    Plot array data safely handling different dimensions and shapes
+    
+    Parameters
+    ----------
+    data : ndarray or list
+        Data to plot (1D, 2D, or other)
+    bin_map : ndarray
+        Bin map with bin numbers
+    ax : matplotlib.axes.Axes, optional
+        Axis to plot on
+    title : str, optional
+        Plot title
+    cmap : str, default='viridis'
+        Colormap name
+    label : str, optional
+        Colorbar label
+        
+    Returns
+    -------
+    matplotlib.axes.Axes
+        Axis with plot
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, 6))
+    
+    try:
+        # Convert to numpy array if not already
+        if not isinstance(data, np.ndarray):
+            data = np.array(data)
+        
+        # Create parameter map
+        param_map = np.full_like(bin_map, np.nan, dtype=float)
+        
+        # Different approaches based on data dimensions
+        if data.ndim == 0:  # Scalar
+            # Use scalar value for all valid bins
+            param_map[bin_map >= 0] = float(data)
+            
+        elif data.ndim == 1:  # 1D array
+            # Map each value to corresponding bin
+            for i, val in enumerate(data):
+                if np.isfinite(val):
+                    param_map[bin_map == i] = val
+            
+        elif data.ndim == 2 and data.shape == bin_map.shape:  # Matching 2D array
+            # Direct copy to valid bins
+            valid = (bin_map >= 0)
+            param_map[valid] = data[valid]
+            
+        else:  # Other dimensions or shapes
+            # Try to flatten and use what we can
+            flat_data = data.flatten()
+            for i in range(min(np.max(bin_map) + 1, len(flat_data))):
+                mask = (bin_map == i)
+                if np.any(mask):
+                    param_map[mask] = flat_data[i]
+        
+        # Check if we have valid data
+        valid_data = param_map[np.isfinite(param_map)]
+        if len(valid_data) > 0:
+            # Calculate color scale
+            vmin = np.nanpercentile(valid_data, 5)
+            vmax = np.nanpercentile(valid_data, 95)
+            
+            # Handle equal values
+            if vmin >= vmax:
+                vmin = np.nanmin(valid_data) - 0.1
+                vmax = np.nanmax(valid_data) + 0.1
+            
+            # Plot with imshow
+            im = ax.imshow(param_map, origin='lower', cmap=cmap, 
+                         vmin=vmin, vmax=vmax, aspect='equal')
+            
+            # Add colorbar
+            cbar = plt.colorbar(im, ax=ax)
+            if label:
+                cbar.set_label(label)
+        else:
+            ax.text(0.5, 0.5, "No valid data to plot", 
+                  ha='center', va='center', transform=ax.transAxes)
+        
+        # Add title
+        if title:
+            ax.set_title(title)
+            
+        # Add grid
+        ax.grid(True, alpha=0.3)
+            
+    except Exception as e:
+        logger.warning(f"Error in safe_plot_array: {e}")
+        ax.text(0.5, 0.5, f"Error plotting: {str(e)}", 
+              ha='center', va='center', transform=ax.transAxes)
+        if title:
+            ax.set_title(title)
+    
+    return ax
+# In galaxy_params.py
 
 def plot_kinematics_summary(velocity_field, dispersion_field, bin_map=None, 
                           rotation_curve=None, params=None, equal_aspect=False):
     """
-    Create a summary plot of kinematic analysis.
+    Create a summary plot of kinematic analysis with robust error handling.
     
     Parameters
     ----------
@@ -631,74 +852,170 @@ def plot_kinematics_summary(velocity_field, dispersion_field, bin_map=None,
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
         ax3 = None
     
-    # Create mask for bad values
-    mask = ~np.isfinite(velocity_field) | ~np.isfinite(dispersion_field)
-    
-    # If bin_map provided, add to mask
-    if bin_map is not None:
-        mask = mask | (bin_map < 0)
-    
-    # Plot velocity field
-    plot_velocity_field(velocity_field, mask=mask, ax=ax1, 
-                      title='Velocity Field', equal_aspect=equal_aspect)
-    
-    # Add model contours if parameters provided
-    if params is not None and 'vmax' in params and 'pa' in params:
-        # Extract parameters
-        center_x = params.get('center_x', velocity_field.shape[1] // 2)
-        center_y = params.get('center_y', velocity_field.shape[0] // 2)
-        pa = params.get('pa', 0)
+    try:
+        # Create mask for bad values
+        mask = ~np.isfinite(velocity_field) | ~np.isfinite(dispersion_field)
         
-        # Check parameter validity
-        if np.isfinite(center_x) and np.isfinite(center_y) and np.isfinite(pa):
-            # Add rotation center and axis
-            add_rotation_markers(
-                ax1, center_x, center_y, pa, 
-                radius=min(velocity_field.shape) // 3
-            )
-    
-    # Plot dispersion field
-    plot_dispersion_field(dispersion_field, mask=mask, ax=ax2, 
-                        title='Velocity Dispersion', equal_aspect=equal_aspect)
-    
-    # Plot rotation curve if provided
-    if rotation_curve is not None and ax3 is not None and np.any(np.isfinite(rotation_curve)):
+        # If bin_map provided, add to mask
+        if bin_map is not None:
+            mask = mask | (bin_map < 0)
+        
+        # Plot velocity field with error handling
         try:
-            plot_rotation_curve(
-                rotation_curve, 
-                plot_model=params is not None, 
-                vmax=params.get('vmax', None) if params else None,
-                pa=params.get('pa', None) if params else None,
-                title='Rotation Curve',
-                ax=ax3
-            )
-            
-            # Add parameters if provided
-            if params is not None:
-                # Format parameter values as text
-                param_text = []
-                if 'vmax' in params and np.isfinite(params['vmax']):
-                    param_text.append(f"$V_{{max}}$ = {params['vmax']:.1f} km/s")
-                if 'pa' in params and np.isfinite(params['pa']):
-                    param_text.append(f"PA = {params['pa']:.1f}°")
-                if 'vsys' in params and np.isfinite(params['vsys']):
-                    param_text.append(f"$V_{{sys}}$ = {params['vsys']:.1f} km/s")
-                if 'center_x' in params and 'center_y' in params:
-                    if np.isfinite(params['center_x']) and np.isfinite(params['center_y']):
-                        param_text.append(f"Center = ({params['center_x']:.1f}, {params['center_y']:.1f})")
-                if 'sigma_mean' in params and np.isfinite(params['sigma_mean']):
-                    param_text.append(f"$\\sigma_{{mean}}$ = {params['sigma_mean']:.1f} km/s")
+            # Check shape of velocity field
+            if len(velocity_field.shape) == 2:
+                # Regular 2D velocity field
+                valid_vel = velocity_field[~mask]
+                if len(valid_vel) > 0:
+                    vmin = np.nanpercentile(valid_vel, 5)
+                    vmax = np.nanpercentile(valid_vel, 95)
+                    
+                    # For velocity, use symmetric color scale
+                    vabs = max(abs(vmin), abs(vmax))
+                    if vmin < 0 and vmax > 0:
+                        vmin, vmax = -vabs, vabs
+                    
+                    im1 = ax1.imshow(
+                        np.ma.array(velocity_field, mask=mask),
+                        origin='lower',
+                        cmap='coolwarm',
+                        vmin=vmin,
+                        vmax=vmax,
+                        aspect='equal' if equal_aspect else 'auto'
+                    )
+                    plt.colorbar(im1, ax=ax1, label='Velocity (km/s)')
+                else:
+                    ax1.text(0.5, 0.5, "No valid velocity data",
+                           ha='center', va='center', transform=ax1.transAxes)
+            elif velocity_field.shape[0] == 1:
+                # Special case for 1D adapter - create a simple colored plot
+                ax1.text(0.5, 0.5, "Binned velocity data (non-spatial)",
+                       ha='center', va='center', transform=ax1.transAxes)
                 
-                # Add text box
-                if param_text:
-                    ax3.text(0.05, 0.05, '\n'.join(param_text), 
-                           transform=ax3.transAxes, fontsize=10,
-                           verticalalignment='bottom', horizontalalignment='left',
-                           bbox=dict(facecolor='white', alpha=0.7))
+                # Create a simple bar plot of velocity values
+                bin_indices = np.arange(velocity_field.shape[1])
+                ax1.bar(bin_indices, velocity_field[0], color='blue', alpha=0.7)
+                ax1.set_xlabel('Bin Index')
+                ax1.set_ylabel('Velocity (km/s)')
+            else:
+                ax1.text(0.5, 0.5, "Incompatible velocity field shape",
+                       ha='center', va='center', transform=ax1.transAxes)
         except Exception as e:
-            warnings.warn(f"Error plotting rotation curve: {str(e)}")
-            ax3.text(0.5, 0.5, "Error plotting rotation curve", 
-                    ha='center', va='center', transform=ax3.transAxes)
+            logger.error(f"Error plotting velocity field: {e}")
+            ax1.text(0.5, 0.5, "Error plotting velocity field",
+                   ha='center', va='center', transform=ax1.transAxes)
+        
+        ax1.set_title('Velocity Field')
+        
+        # Plot dispersion field with error handling
+        try:
+            # Check shape of dispersion field
+            if len(dispersion_field.shape) == 2:
+                # Regular 2D dispersion field
+                valid_disp = dispersion_field[~mask]
+                if len(valid_disp) > 0:
+                    vmin = np.nanpercentile(valid_disp, 5)
+                    vmax = np.nanpercentile(valid_disp, 95)
+                    
+                    im2 = ax2.imshow(
+                        np.ma.array(dispersion_field, mask=mask),
+                        origin='lower',
+                        cmap='viridis',
+                        vmin=vmin,
+                        vmax=vmax,
+                        aspect='equal' if equal_aspect else 'auto'
+                    )
+                    plt.colorbar(im2, ax=ax2, label='Dispersion (km/s)')
+                else:
+                    ax2.text(0.5, 0.5, "No valid dispersion data",
+                           ha='center', va='center', transform=ax2.transAxes)
+            elif dispersion_field.shape[0] == 1:
+                # Special case for 1D adapter - create a simple colored plot
+                ax2.text(0.5, 0.5, "Binned dispersion data (non-spatial)",
+                       ha='center', va='center', transform=ax2.transAxes)
+                
+                # Create a simple bar plot of dispersion values
+                bin_indices = np.arange(dispersion_field.shape[1])
+                ax2.bar(bin_indices, dispersion_field[0], color='green', alpha=0.7)
+                ax2.set_xlabel('Bin Index')
+                ax2.set_ylabel('Dispersion (km/s)')
+            else:
+                ax2.text(0.5, 0.5, "Incompatible dispersion field shape",
+                       ha='center', va='center', transform=ax2.transAxes)
+        except Exception as e:
+            logger.error(f"Error plotting dispersion field: {e}")
+            ax2.text(0.5, 0.5, "Error plotting dispersion field",
+                   ha='center', va='center', transform=ax2.transAxes)
+        
+        ax2.set_title('Velocity Dispersion')
+        
+        # Add model contours and rotation parameters if available
+        if params is not None:
+            try:
+                # Extract parameters
+                center_x = params.get('center_x', None)
+                center_y = params.get('center_y', None)
+                pa = params.get('pa', None)
+                
+                # Check parameter validity
+                if (center_x is not None and center_y is not None and pa is not None and
+                    np.isfinite(center_x) and np.isfinite(center_y) and np.isfinite(pa)):
+                    
+                    # Add rotation center and axis to velocity plot
+                    add_rotation_markers(
+                        ax1, center_x, center_y, pa, 
+                        radius=min(velocity_field.shape) // 3
+                    )
+            except Exception as e:
+                logger.warning(f"Error adding rotation markers: {e}")
+        
+        # Plot rotation curve if provided in the third panel
+        if rotation_curve is not None and ax3 is not None:
+            try:
+                plot_rotation_curve(
+                    rotation_curve, 
+                    plot_model=params is not None, 
+                    vmax=params.get('vmax', None) if params else None,
+                    pa=params.get('pa', None) if params else None,
+                    title='Rotation Curve',
+                    ax=ax3
+                )
+                
+                # Add parameters if provided
+                if params is not None:
+                    # Format parameter values as text
+                    param_text = []
+                    if 'vmax' in params and np.isfinite(params['vmax']):
+                        param_text.append(f"$V_{{max}}$ = {params['vmax']:.1f} km/s")
+                    if 'pa' in params and np.isfinite(params['pa']):
+                        param_text.append(f"PA = {params['pa']:.1f}°")
+                    if 'vsys' in params and np.isfinite(params['vsys']):
+                        param_text.append(f"$V_{{sys}}$ = {params['vsys']:.1f} km/s")
+                    if 'center_x' in params and 'center_y' in params:
+                        if np.isfinite(params['center_x']) and np.isfinite(params['center_y']):
+                            param_text.append(f"Center = ({params['center_x']:.1f}, {params['center_y']:.1f})")
+                    if 'sigma_mean' in params and np.isfinite(params['sigma_mean']):
+                        param_text.append(f"$\\sigma_{{mean}}$ = {params['sigma_mean']:.1f} km/s")
+                    
+                    # Add text box
+                    if param_text:
+                        ax3.text(0.05, 0.05, '\n'.join(param_text), 
+                               transform=ax3.transAxes, fontsize=10,
+                               verticalalignment='bottom', horizontalalignment='left',
+                               bbox=dict(facecolor='white', alpha=0.7))
+            except Exception as e:
+                logger.warning(f"Error plotting rotation curve: {e}")
+                if ax3:
+                    ax3.text(0.5, 0.5, "Error plotting rotation curve", 
+                           ha='center', va='center', transform=ax3.transAxes)
+    
+    except Exception as e:
+        logger.error(f"Error in plot_kinematics_summary: {e}")
+        # Ensure we still return a figure even after error
+        for ax in [ax1, ax2, ax3]:
+            if ax:
+                ax.text(0.5, 0.5, "Error generating plot", 
+                       ha='center', va='center', transform=ax.transAxes)
     
     # Adjust layout
     plt.tight_layout()

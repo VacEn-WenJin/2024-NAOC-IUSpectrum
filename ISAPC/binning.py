@@ -14,7 +14,6 @@ from joblib import Parallel, delayed
 from scipy.ndimage import gaussian_filter
 from scipy.spatial import distance
 from scipy.interpolate import interp1d
-
 # Import utilities
 from utils.calc import apply_velocity_shift, spectres
 
@@ -23,6 +22,57 @@ logger = logging.getLogger(__name__)
 # Speed of light in km/s
 C_KMS = 299792.458
 
+def to_p2p_compatible(self, original_cube=None):
+    """Convert binned data to p2p compatible format with proper velocity scale"""
+    # Get dimensions
+    n_wave = len(self.wavelength)
+    n_bins = len(self.bin_indices)
+    
+    # Create pseudo-cube with shape [n_wave, 1, n_bins]
+    pseudo_cube = np.zeros((n_wave, 1, n_bins))
+    for i in range(n_bins):
+        pseudo_cube[:, 0, i] = self.spectra[:, i]
+    
+    # Create variance cube (simple estimate)
+    pseudo_variance = np.ones_like(pseudo_cube) * 0.01
+    
+    # Create x, y coordinates (just bin indices)
+    x = np.arange(n_bins)
+    y = np.zeros(n_bins)
+    
+    # Properly calculate velocity scale (matching ppxf requirements)
+    c = 299792.458  # Speed of light in km/s
+    ln_lambda = np.log(self.wavelength)
+    dln_lambda = np.diff(ln_lambda)
+    if len(dln_lambda) > 0:
+        # Use median to be robust
+        velscale = c * np.median(dln_lambda)
+    else:
+        # Fallback
+        velscale = 50.0
+    
+    # Create result dict with all necessary cube attributes
+    result = {
+        'cube': pseudo_cube,
+        'variance': pseudo_variance,
+        'wavelength': self.wavelength,
+        'bin_num': self.bin_num,
+        'bin_indices': self.bin_indices,
+        'x': x,
+        'y': y,
+        'metadata': self.metadata,
+        'velscale': velscale  # Add the properly calculated velscale
+    }
+    
+    # Add useful information from original cube if available
+    if original_cube is not None:
+        if hasattr(original_cube, '_redshift'):
+            result['redshift'] = original_cube._redshift
+        if hasattr(original_cube, '_pxl_size_x'):
+            result['pxl_size_x'] = original_cube._pxl_size_x
+            result['pxl_size_y'] = original_cube._pxl_size_y
+    
+    return result
 
 @dataclass
 class BinnedSpectra:
@@ -251,7 +301,7 @@ class RadialBinnedData(BinnedSpectra):
     bin_radii: np.ndarray        # Radius of each bin
     
     def create_visualization_plots(self, output_dir, galaxy_name):
-        """Create radial specific visualization plots"""
+        """Create radial specific visualization plots with physical coordinates"""
         # Call parent method first
         super().create_visualization_plots(output_dir, galaxy_name)
         
@@ -260,26 +310,35 @@ class RadialBinnedData(BinnedSpectra):
         
         # Add radial specific plots
         try:
+            # Get pixel size for coordinate conversion
+            pixel_size_x = self.metadata.get('pixelsize_x', 1.0)
+            pixel_size_y = self.metadata.get('pixelsize_y', 1.0)
+            
             # Plot radius vs. bin number
             fig, ax = plt.subplots(figsize=(10, 6))
             ax.plot(np.arange(len(self.bin_radii)), self.bin_radii, 'o-')
             ax.set_xlabel('Bin Number')
             ax.set_ylabel('Radius (arcsec)')
             ax.set_title(f"{galaxy_name} - Radial Bin Distribution")
+            ax.grid(True, alpha=0.3)
             
             # Save
             plt.tight_layout()
             plt.savefig(plots_dir / f"{galaxy_name}_radial_bins.png")
             plt.close(fig)
             
-            # Plot bin map with circles representing bins
+            # Plot bin map with circles representing bins using physical coordinates
             try:
                 # Get dimensions from bin_num
                 if 'ny' in self.metadata and 'nx' in self.metadata:
                     ny, nx = self.metadata['ny'], self.metadata['nx']
                 else:
                     # Estimate from bin_num shape
-                    ny, nx = self.bin_num.shape if hasattr(self.bin_num, 'shape') else (1, len(self.bin_num))
+                    bin_shape = getattr(self.bin_num, 'shape', None)
+                    if bin_shape is not None:
+                        ny, nx = bin_shape
+                    else:
+                        ny, nx = 1, len(self.bin_num)
                 
                 # Create 2D bin map
                 bin_map_2d = self.bin_num.reshape(ny, nx)
@@ -292,51 +351,165 @@ class RadialBinnedData(BinnedSpectra):
                 ellipticity = self.metadata.get('ellipticity', 0)
                 pa = self.metadata.get('pa', 0)
                 
+                # Create physical coordinate grid
+                y_coords, x_coords = np.indices((ny, nx))
+                
+                # Convert to physical units (arcseconds)
+                # Center coordinates based on image center
+                x_physical = (x_coords - nx/2) * pixel_size_x
+                y_physical = (y_coords - ny/2) * pixel_size_y
+                
+                # Convert center to physical units relative to center
+                center_x_phys = (center_x - nx/2) * pixel_size_x
+                center_y_phys = (center_y - ny/2) * pixel_size_y
+                
                 # Create plot
                 fig, ax = plt.subplots(figsize=(10, 10))
-                im = ax.imshow(bin_map_2d, cmap='tab20', interpolation='nearest')
-                plt.colorbar(im, ax=ax, label='Bin number')
+                
+                # Create colored bin map
+                unique_bins = np.unique(bin_map_2d)
+                unique_bins = unique_bins[unique_bins >= 0]  # Remove negative values
+                cmap = plt.cm.get_cmap('tab20', len(unique_bins))
+                
+                # Plot each bin with proper physical coordinates
+                for i in unique_bins:
+                    mask = bin_map_2d == i
+                    color = cmap(i % 20)  # Cycle through colors
+                    x_bin = x_physical[mask]
+                    y_bin = y_physical[mask]
+                    
+                    if len(x_bin) > 0:
+                        # Use scatter for visualization
+                        ax.scatter(x_bin, y_bin, color=color, s=10, alpha=0.7, label=f'Bin {i}')
                 
                 # Add center marker
-                ax.plot(center_x, center_y, 'r+', markersize=10)
+                ax.plot(center_x_phys, center_y_phys, 'r+', markersize=10, label='Center')
                 
-                # Add rings representing bin edges
+                # Add rings representing bin edges in physical coordinates
                 if 'bin_edges' in self.metadata:
                     bin_edges = self.metadata['bin_edges']
-                    pixelsize = self.metadata.get('pixelsize_x', 1)
                     
                     for radius in bin_edges:
-                        # Convert radius from arcsec to pixels
-                        radius_px = radius / pixelsize
-                        
-                        # Draw circle or ellipse
-                        if ellipticity == 0:
+                        # Draw circle or ellipse in physical coordinates
+                        if ellipticity == 0 or not np.isfinite(ellipticity):
                             # Draw circle
-                            circle = plt.Circle((center_x, center_y), radius_px,
-                                            fill=False, color='white', linestyle='--', alpha=0.5)
-                            ax.add_artist(circle)
+                            circle = plt.Circle(
+                                (center_x_phys, center_y_phys), 
+                                radius,  # Already in arcsec
+                                fill=False, 
+                                color='white', 
+                                linestyle='--', 
+                                alpha=0.7
+                            )
+                            ax.add_patch(circle)
                         else:
                             # Draw ellipse
                             from matplotlib.patches import Ellipse
-                            width = 2 * radius_px
-                            height = 2 * radius_px * (1 - ellipticity)
-                            ellipse = Ellipse((center_x, center_y), width, height,
-                                            angle=pa, fill=False, color='white', 
-                                            linestyle='--', alpha=0.5)
-                            ax.add_artist(ellipse)
+                            width = 2 * radius
+                            height = 2 * radius * (1 - ellipticity)
+                            ellipse = Ellipse(
+                                (center_x_phys, center_y_phys), 
+                                width, 
+                                height,
+                                angle=pa, 
+                                fill=False, 
+                                color='white', 
+                                linestyle='--', 
+                                alpha=0.7
+                            )
+                            ax.add_patch(ellipse)
                 
-                ax.set_title(f"{galaxy_name} - Radial Bin Map")
+                # Add ring labels
+                if 'bin_radii' in dir(self):
+                    for i, radius in enumerate(self.bin_radii):
+                        # Label position along positive x-axis
+                        label_x = center_x_phys + radius * np.cos(np.radians(pa))
+                        label_y = center_y_phys + radius * np.sin(np.radians(pa))
+                        
+                        ax.text(
+                            label_x, 
+                            label_y, 
+                            f'{i}', 
+                            color='white', 
+                            fontsize=8,
+                            bbox=dict(facecolor='black', alpha=0.5, boxstyle='round,pad=0.2')
+                        )
+                
+                # Set axis labels with physical units
+                ax.set_xlabel('X (arcsec)')
+                ax.set_ylabel('Y (arcsec)')
+                ax.set_aspect('equal')
+                ax.grid(True, alpha=0.3)
+                
+                # Set title
+                ax.set_title(f"{galaxy_name} - Radial Bin Map (PA={pa:.1f}°, e={ellipticity:.2f})")
+                
+                # Create legend for first few bins
+                if len(unique_bins) > 0:
+                    max_legend = min(5, len(unique_bins))
+                    handles, labels = ax.get_legend_handles_labels()
+                    # Filter to show only first few bins and center
+                    center_idx = labels.index('Center') if 'Center' in labels else -1
+                    bin_indices = [i for i, label in enumerate(labels) if label.startswith('Bin') and int(label.split()[1]) < max_legend]
+                    
+                    if center_idx >= 0:
+                        bin_indices.append(center_idx)
+                    
+                    filtered_handles = [handles[i] for i in bin_indices]
+                    filtered_labels = [labels[i] for i in bin_indices]
+                    
+                    ax.legend(
+                        filtered_handles, 
+                        filtered_labels, 
+                        loc='upper right', 
+                        fontsize='small'
+                    )
                 
                 # Save
                 plt.tight_layout()
-                plt.savefig(plots_dir / f"{galaxy_name}_radial_bin_map.png")
+                plt.savefig(plots_dir / f"{galaxy_name}_radial_bin_map.png", dpi=150)
                 plt.close(fig)
+                
+                # Plot radial bin profile with areas
+                try:
+                    # Calculate bin areas
+                    bin_areas = []
+                    for i, radius in enumerate(self.bin_radii):
+                        if i == 0:
+                            inner_edge = 0
+                        else:
+                            inner_edge = self.bin_radii[i-1]
+                        
+                        # Area of annular region, accounting for ellipticity
+                        area = np.pi * (radius**2 - inner_edge**2)
+                        if ellipticity > 0 and ellipticity < 1:
+                            area *= (1 - ellipticity)
+                            
+                        bin_areas.append(area)
+                    
+                    # Plot bin radius vs. area
+                    fig, ax = plt.subplots(figsize=(8, 6))
+                    ax.plot(self.bin_radii, bin_areas, 'o-')
+                    ax.set_xlabel('Radius (arcsec)')
+                    ax.set_ylabel('Bin Area (arcsec²)')
+                    ax.set_title(f"{galaxy_name} - Radial Bin Areas")
+                    ax.grid(True, alpha=0.3)
+                    
+                    # Save
+                    plt.tight_layout()
+                    plt.savefig(plots_dir / f"{galaxy_name}_radial_bin_areas.png", dpi=150)
+                    plt.close(fig)
+                except Exception as e:
+                    logger.warning(f"Error creating bin area plot: {e}")
+                    plt.close('all')
+                
             except Exception as e:
                 logger.warning(f"Failed to create radial bin map: {e}")
+                plt.close('all')
             
         except Exception as e:
             logger.warning(f"Failed to create radial visualization: {e}")
-
+            plt.close('all')
 
 def calculate_wavelength_intersection(wavelength, velocity_field, n_x):
     """

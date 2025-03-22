@@ -33,6 +33,8 @@ logger = logging.getLogger(__name__)
 # Speed of light in km/s
 C_KMS = 299792.458
 
+# In voronoi.py, modify run_vnb_analysis function
+
 def run_vnb_analysis(args, cube, p2p_results=None):
     """
     Run Voronoi binning analysis on MUSE data cube with improved SNR targeting
@@ -793,6 +795,130 @@ def combine_spectra_with_velocity_correction(spectra, wavelength, bin_indices, v
     
     return bin_spectra
 
+def combine_spectra_with_velocity_correction(spectra, wavelength, bin_indices, velocity_field, n_x, n_y):
+    """
+    Combine spectra within bins with velocity correction.
+    
+    Parameters
+    ----------
+    spectra : numpy.ndarray
+        Array of spectra [n_wave, n_spectra]
+    wavelength : numpy.ndarray
+        Wavelength array
+    bin_indices : list
+        List of arrays with indices for each bin
+    velocity_field : numpy.ndarray
+        Velocity field for correction
+    n_x : int
+        Number of pixels in x direction
+    n_y : int
+        Number of pixels in y direction
+        
+    Returns
+    -------
+    numpy.ndarray
+        Combined bin spectra array [n_wave, n_bins]
+    """
+    n_wave = len(wavelength)
+    n_bins = len(bin_indices)
+    c = 299792.458  # Speed of light in km/s
+    
+    # Initialize output array
+    bin_spectra = np.zeros((n_wave, n_bins))
+    
+    # Set velocity limits for outlier correction
+    vel_limit = 300  # Maximum velocity difference from median (km/s)
+    max_velocity = 300  # Maximum absolute velocity (km/s)
+    
+    # Process each bin
+    for i, indices in enumerate(bin_indices):
+        # Skip empty bins
+        if len(indices) == 0:
+            bin_spectra[:, i] = np.nan
+            continue
+        
+        try:
+            # Extract velocities for this bin
+            bin_velocities = []
+            for idx in indices:
+                row = idx // n_x
+                col = idx % n_x
+                if row < n_y and col < n_x:
+                    if velocity_field is not None and row < velocity_field.shape[0] and col < velocity_field.shape[1]:
+                        vel = velocity_field[row, col]
+                        if np.isfinite(vel):
+                            bin_velocities.append(vel)
+            
+            # Calculate median velocity for this bin
+            median_velocity = np.median(bin_velocities) if bin_velocities else 0
+            
+            # Collect velocity-corrected spectra
+            corrected_spectra = []
+            
+            for idx in indices:
+                spec = spectra[:, idx]
+                if not np.all(~np.isfinite(spec)):
+                    # Get velocity for this pixel
+                    vel = 0
+                    
+                    if velocity_field is not None:
+                        row = idx // n_x
+                        col = idx % n_x
+                        if row < velocity_field.shape[0] and col < velocity_field.shape[1]:
+                            pixel_vel = velocity_field[row, col]
+                            
+                            # Apply velocity limits as mentioned in your code snippet
+                            if np.isfinite(pixel_vel):
+                                # Check for outliers compared to bin median
+                                if abs(pixel_vel - median_velocity) > vel_limit:
+                                    vel = median_velocity
+                                    logger.debug(f"Velocity outlier in bin {i}: pixel_vel={pixel_vel:.1f}, median={median_velocity:.1f}")
+                                # Check for extreme velocities
+                                elif abs(pixel_vel) > max_velocity:
+                                    vel = 0
+                                    logger.debug(f"Extreme velocity in bin {i}: pixel_vel={pixel_vel:.1f}")
+                                else:
+                                    vel = pixel_vel
+                    
+                    # Apply velocity shift
+                    if abs(vel) > 1.0:  # Only apply for non-negligible velocities
+                        try:
+                            # Shift wavelength in opposite direction of velocity
+                            # For redshift (v > 0), we need a bluer template, so divide lambda
+                            # For blueshift (v < 0), we need a redder template, so multiply lambda
+                            lam_shifted = wavelength / (1 + vel/c)
+                            
+                            # Use spectres for resampling
+                            from utils.calc import spectres
+                            corrected_spec = spectres(wavelength, lam_shifted, spec)
+                            corrected_spectra.append(corrected_spec)
+                        except Exception as e:
+                            logger.debug(f"Error in velocity correction for bin {i}, pixel {idx}: {e}")
+                            corrected_spectra.append(spec)  # Add original as fallback
+                    else:
+                        corrected_spectra.append(spec)
+            
+            # Combine spectra if any valid
+            if corrected_spectra:
+                # Convert to array for easier operations
+                spectra_array = np.array(corrected_spectra)
+                
+                # Compute median spectrum - more robust than mean
+                bin_spectra[:, i] = np.nanmedian(spectra_array, axis=0)
+                
+                # Set all-NaN wavelengths to NaN in result
+                all_nan = np.all(~np.isfinite(spectra_array), axis=0)
+                bin_spectra[all_nan, i] = np.nan
+            else:
+                # No valid spectra
+                bin_spectra[:, i] = np.nan
+                
+        except Exception as e:
+            logger.error(f"Error combining spectra for bin {i}: {e}")
+            bin_spectra[:, i] = np.nan
+    
+    return bin_spectra
+
 def create_grid_binning(x, y, signal, noise, nx=4, ny=4, xmin=None, xmax=None, ymin=None, ymax=None):
     """
     Create a grid-based binning scheme as a fallback when Voronoi binning fails
@@ -1065,7 +1191,7 @@ def run_analysis_on_binned_data(args, binned_data, cube, p2p_results=None):
 
 def create_vnb_plots(args, binned_data, vnb_results, galaxy_name, plots_dir):
     """
-    Create visualization plots for VNB analysis
+    Create visualization plots for VNB analysis using physical coordinates
     
     Parameters
     ----------
@@ -1082,7 +1208,35 @@ def create_vnb_plots(args, binned_data, vnb_results, galaxy_name, plots_dir):
     """
     try:
         # Create basic binning plots
-        create_binning_plots(binned_data, plots_dir, galaxy_name)
+        create_robust_binning_plots(binned_data, plots_dir, galaxy_name)
+        
+        # Import the parameter map plotting function
+        from visualization import plot_parameter_map
+        
+        # Get pixel scale for coordinate conversion
+        pixel_size_x = binned_data.metadata.get('pixelsize_x', 1.0)
+        pixel_size_y = binned_data.metadata.get('pixelsize_y', 1.0)
+        
+        # Get bin centers
+        x_gen = binned_data.metadata.get('x_gen', None)
+        y_gen = binned_data.metadata.get('y_gen', None)
+        
+        # Get dimensions
+        n_y = binned_data.metadata['ny']
+        n_x = binned_data.metadata['nx']
+        
+        # Create 2D bin map
+        try:
+            bin_map = binned_data.bin_num.reshape(n_y, n_x)
+        except:
+            # If reshaping fails, create a simple bin map
+            bin_map = np.full((n_y, n_x), -1)
+            for i, indices in enumerate(binned_data.bin_indices):
+                for idx in indices:
+                    y = idx // n_x
+                    x = idx % n_x
+                    if 0 <= y < n_y and 0 <= x < n_x:
+                        bin_map[y, x] = i
         
         # Create stellar kinematics plots
         if 'stellar_kinematics' in vnb_results:
@@ -1090,48 +1244,309 @@ def create_vnb_plots(args, binned_data, vnb_results, galaxy_name, plots_dir):
             dispersion = vnb_results['stellar_kinematics'].get('dispersion', None)
             
             if velocity is not None and dispersion is not None:
-                try:
-                    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-                    
-                    # Get bin centers
-                    x_gen = binned_data.metadata.get('x_gen', None)
-                    y_gen = binned_data.metadata.get('y_gen', None)
-                    
-                    if x_gen is None or y_gen is None:
-                        # Reconstruct bin centers from bin map
-                        x_centers = []
-                        y_centers = []
-                        bin_map = binned_data.bin_num.reshape(binned_data.metadata['ny'], binned_data.metadata['nx'])
-                        for i in range(len(velocity)):
-                            mask = bin_map == i
-                            if np.any(mask):
-                                y_indices, x_indices = np.where(mask)
-                                x_centers.append(np.mean(x_indices))
-                                y_centers.append(np.mean(y_indices))
-                        x_gen = np.array(x_centers)
-                        y_gen = np.array(y_centers)
-                    
-                    # Plot velocity field
-                    sc0 = axes[0].scatter(x_gen, y_gen, c=velocity, cmap='coolwarm', 
-                                        s=50, edgecolor='k')
-                    plt.colorbar(sc0, ax=axes[0], label='Velocity (km/s)')
-                    axes[0].set_title('Stellar Velocity')
-                    
-                    # Plot dispersion field
-                    sc1 = axes[1].scatter(x_gen, y_gen, c=dispersion, cmap='viridis', 
-                                        s=50, edgecolor='k')
-                    plt.colorbar(sc1, ax=axes[1], label='Dispersion (km/s)')
-                    axes[1].set_title('Stellar Velocity Dispersion')
-                    
-                    # Save figure
-                    plt.tight_layout()
-                    plt.savefig(plots_dir / f"{galaxy_name}_vnb_kinematics.png", dpi=150)
-                    plt.close(fig)
-                except Exception as e:
-                    logger.warning(f"Error creating kinematics plots: {str(e)}")
+                fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+                
+                # Plot velocity field
+                plot_parameter_map(
+                    velocity, bin_map, ax=axes[0], 
+                    title='Stellar Velocity', cmap='coolwarm',
+                    label='Velocity (km/s)'
+                )
+                
+                # Plot dispersion field
+                plot_parameter_map(
+                    dispersion, bin_map, ax=axes[1], 
+                    title='Stellar Dispersion', cmap='viridis',
+                    label='Dispersion (km/s)'
+                )
+                
+                plt.tight_layout()
+                plt.savefig(plots_dir / f"{galaxy_name}_vnb_kinematics.png", dpi=150)
+                plt.close(fig)
         
         # Create stellar population plots
         if 'stellar_population' in vnb_results:
+            params = vnb_results['stellar_population']
+            param_names = list(params.keys())
+            
+            if param_names:
+                fig, axes = plt.subplots(1, len(param_names), figsize=(4 * len(param_names), 4))
+                if len(param_names) == 1:
+                    axes = [axes]
+                
+                for i, param_name in enumerate(param_names):
+                    param_values = params[param_name]
+                    
+                    # Determine label and prepare values
+                    if param_name == 'age':
+                        if isinstance(param_values, np.ndarray):
+                            param_values = param_values * 1e-9  # Convert to Gyr
+                        label = 'Age (Gyr)'
+                    elif param_name == 'log_age':
+                        label = 'Log Age (yr)'
+                    elif param_name == 'metallicity':
+                        label = 'Metallicity [Z/H]'
+                    else:
+                        label = param_name
+                    
+                    # Plot parameter map
+                    plot_parameter_map(
+                        param_values, bin_map, ax=axes[i], 
+                        title=f'Stellar {label}', cmap='plasma',
+                        label=label
+                    )
+                
+                plt.tight_layout()
+                plt.savefig(plots_dir / f"{galaxy_name}_vnb_stellar_pop.png", dpi=150)
+                plt.close(fig)
+        
+        # Create emission line plots if available
+        if 'emission' in vnb_results:
+            # Find all flux maps
+            flux_maps = {}
+            for key, value in vnb_results['emission'].items():
+                if key.startswith('flux_') and isinstance(value, np.ndarray):
+                    line_name = key[5:]  # Remove 'flux_' prefix
+                    flux_maps[line_name] = value
+            
+            if flux_maps:
+                n_plots = min(len(flux_maps), 3)  # Show at most 3 lines
+                fig, axes = plt.subplots(1, n_plots, figsize=(4 * n_plots, 4))
+                if n_plots == 1:
+                    axes = [axes]
+                
+                for i, (line_name, flux) in enumerate(list(flux_maps.items())[:n_plots]):
+                    # Use log scale for flux maps with positive values
+                    if isinstance(flux, np.ndarray) and np.any(np.isfinite(flux)) and np.nanmin(flux[np.isfinite(flux)]) > 0:
+                        with np.errstate(divide='ignore', invalid='ignore'):
+                            log_flux = np.log10(flux)
+                        plot_parameter_map(
+                            log_flux, bin_map, ax=axes[i], 
+                            title=f'{line_name} Flux', cmap='inferno',
+                            label='Log Flux'
+                        )
+                    else:
+                        plot_parameter_map(
+                            flux, bin_map, ax=axes[i], 
+                            title=f'{line_name} Flux', cmap='inferno',
+                            label='Flux'
+                        )
+                
+                plt.tight_layout()
+                plt.savefig(plots_dir / f"{galaxy_name}_vnb_emission.png", dpi=150)
+                plt.close(fig)
+        
+        # Create spectral indices plots if available
+        if 'indices' in vnb_results:
+            indices = vnb_results['indices']
+            index_names = list(indices.keys())
+            
+            if index_names:
+                n_plots = min(len(index_names), 3)  # Show at most 3 indices
+                fig, axes = plt.subplots(1, n_plots, figsize=(4 * n_plots, 4))
+                if n_plots == 1:
+                    axes = [axes]
+                
+                for i, index_name in enumerate(index_names[:n_plots]):
+                    index_values = indices[index_name]
+                    plot_parameter_map(
+                        index_values, bin_map, ax=axes[i], 
+                        title=f'{index_name} Index', cmap='viridis',
+                        label='Index Value'
+                    )
+                
+                plt.tight_layout()
+                plt.savefig(plots_dir / f"{galaxy_name}_vnb_indices.png", dpi=150)
+                plt.close(fig)
+                
+    except Exception as e:
+        logger.error(f"Error creating VNB plots: {str(e)}")
+        logger.error(traceback.format_exc())
+    """
+    Create visualization plots for VNB analysis using physical coordinates
+    
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Command line arguments
+    binned_data : VoronoiBinnedData
+        Binned data object
+    vnb_results : dict
+        VNB analysis results
+    galaxy_name : str
+        Galaxy name
+    plots_dir : Path
+        Directory to save plots
+    """
+    try:
+        # Create basic binning plots
+        create_robust_binning_plots(binned_data, plots_dir, galaxy_name)
+        
+        # Get pixel scale for coordinate conversion
+        pixel_size_x = binned_data.metadata.get('pixelsize_x', 1.0)
+        pixel_size_y = binned_data.metadata.get('pixelsize_y', 1.0)
+        
+        # Get bin centers
+        x_gen = binned_data.metadata.get('x_gen', None)
+        y_gen = binned_data.metadata.get('y_gen', None)
+        
+        # Get dimensions
+        n_y = binned_data.metadata['ny']
+        n_x = binned_data.metadata['nx']
+        
+        # Convert bin centers to physical units (arcsec)
+        if x_gen is not None and y_gen is not None:
+            x_gen_physical = (x_gen - n_x/2) * pixel_size_x
+            y_gen_physical = (y_gen - n_y/2) * pixel_size_y
+        else:
+            # If bin centers not available, recreate from bin map
+            x_gen_physical = []
+            y_gen_physical = []
+            try:
+                bin_map = binned_data.bin_num.reshape(n_y, n_x)
+                for i in range(np.max(bin_map) + 1):
+                    mask = bin_map == i
+                    if np.any(mask):
+                        y_indices, x_indices = np.where(mask)
+                        x_center = np.mean(x_indices)
+                        y_center = np.mean(y_indices)
+                        x_gen_physical.append((x_center - n_x/2) * pixel_size_x)
+                        y_gen_physical.append((y_center - n_y/2) * pixel_size_y)
+                x_gen_physical = np.array(x_gen_physical)
+                y_gen_physical = np.array(y_gen_physical)
+            except Exception as e:
+                logger.warning(f"Could not recreate bin centers: {e}")
+                x_gen_physical = np.array([])
+                y_gen_physical = np.array([])
+        
+        
+        # Create stellar kinematics plots
+        if 'stellar_kinematics' in vnb_results and len(x_gen_physical) > 0:
+            velocity = vnb_results['stellar_kinematics'].get('velocity', None)
+            dispersion = vnb_results['stellar_kinematics'].get('dispersion', None)
+            
+            if velocity is not None and dispersion is not None:
+                try:
+                    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+                    
+                    # Plot velocity field
+                    valid_mask = np.isfinite(velocity)
+                    if np.any(valid_mask):
+                        # Get percentile range for color scale
+                        vmin = np.percentile(velocity[valid_mask], 5)
+                        vmax = np.percentile(velocity[valid_mask], 95)
+                        
+                        # For velocity, use symmetric color scale if appropriate
+                        vabs = max(abs(vmin), abs(vmax))
+                        if vmin < 0 and vmax > 0:
+                            vmin, vmax = -vabs, vabs
+                        
+                        sc0 = axes[0].scatter(
+                            x_gen_physical[valid_mask], 
+                            y_gen_physical[valid_mask], 
+                            c=velocity[valid_mask], 
+                            cmap='coolwarm', 
+                            s=50, 
+                            edgecolor='k',
+                            vmin=vmin,
+                            vmax=vmax
+                        )
+                        cbar0 = plt.colorbar(sc0, ax=axes[0], label='Velocity (km/s)')
+                        cbar0.ax.tick_params(labelsize=8)
+                    else:
+                        axes[0].text(0.5, 0.5, "No valid velocity data", 
+                                   ha='center', va='center', transform=axes[0].transAxes)
+                    
+                    axes[0].set_xlabel('X (arcsec)')
+                    axes[0].set_ylabel('Y (arcsec)')
+                    axes[0].set_title('Stellar Velocity')
+                    axes[0].set_aspect('equal')
+                    axes[0].grid(True, alpha=0.3)
+                    
+                    # Plot dispersion field
+                    valid_mask = np.isfinite(dispersion)
+                    if np.any(valid_mask):
+                        # Get percentile range for color scale
+                        vmin = np.percentile(dispersion[valid_mask], 5)
+                        vmax = np.percentile(dispersion[valid_mask], 95)
+                        
+                        sc1 = axes[1].scatter(
+                            x_gen_physical[valid_mask], 
+                            y_gen_physical[valid_mask], 
+                            c=dispersion[valid_mask], 
+                            cmap='viridis', 
+                            s=50, 
+                            edgecolor='k',
+                            vmin=vmin,
+                            vmax=vmax
+                        )
+                        cbar1 = plt.colorbar(sc1, ax=axes[1], label='Dispersion (km/s)')
+                        cbar1.ax.tick_params(labelsize=8)
+                    else:
+                        axes[1].text(0.5, 0.5, "No valid dispersion data", 
+                                   ha='center', va='center', transform=axes[1].transAxes)
+                    
+                    axes[1].set_xlabel('X (arcsec)')
+                    axes[1].set_ylabel('Y (arcsec)')
+                    axes[1].set_title('Stellar Velocity Dispersion')
+                    axes[1].set_aspect('equal')
+                    axes[1].grid(True, alpha=0.3)
+                    
+                    # Add overall title
+                    plt.suptitle(f'Stellar Kinematics - {galaxy_name}', fontsize=14)
+                    
+                    # Save figure
+                    plt.tight_layout(rect=[0, 0, 1, 0.95])  # Make room for suptitle
+                    plt.savefig(plots_dir / f"{galaxy_name}_vnb_kinematics.png", dpi=150)
+                    plt.close(fig)
+                    
+                    # Create v/sigma map (useful kinematic indicator)
+                    try:
+                        fig, ax = plt.subplots(figsize=(8, 7))
+                        
+                        # Calculate v/sigma
+                        valid_mask = np.isfinite(velocity) & np.isfinite(dispersion) & (dispersion > 0)
+                        if np.any(valid_mask):
+                            v_sigma = np.abs(velocity[valid_mask]) / dispersion[valid_mask]
+                            
+                            # Determine sensible scale
+                            vmin = 0
+                            vmax = min(2.0, np.percentile(v_sigma, 95))
+                            
+                            sc = ax.scatter(
+                                x_gen_physical[valid_mask], 
+                                y_gen_physical[valid_mask], 
+                                c=v_sigma, 
+                                cmap='magma', 
+                                s=50, 
+                                edgecolor='k',
+                                vmin=vmin,
+                                vmax=vmax
+                            )
+                            plt.colorbar(sc, ax=ax, label='|V|/σ')
+                            
+                            ax.set_xlabel('X (arcsec)')
+                            ax.set_ylabel('Y (arcsec)')
+                            ax.set_title(f'Rotational Support (|V|/σ) - {galaxy_name}')
+                            ax.set_aspect('equal')
+                            ax.grid(True, alpha=0.3)
+                            
+                            # Save figure
+                            plt.tight_layout()
+                            plt.savefig(plots_dir / f"{galaxy_name}_vnb_v_sigma.png", dpi=150)
+                        else:
+                            logger.warning("Insufficient data for v/sigma map")
+                        plt.close(fig)
+                    except Exception as e:
+                        logger.warning(f"Error creating v/sigma map: {e}")
+                        plt.close('all')
+                except Exception as e:
+                    logger.warning(f"Error creating kinematics plots: {str(e)}")
+                    plt.close('all')
+        
+                    
+        # Create stellar population plots
+        if 'stellar_population' in vnb_results and len(x_gen_physical) > 0:
             try:
                 params = vnb_results['stellar_population']
                 param_names = list(params.keys())
@@ -1140,9 +1555,6 @@ def create_vnb_plots(args, binned_data, vnb_results, galaxy_name, plots_dir):
                     fig, axes = plt.subplots(1, len(param_names), figsize=(4 * len(param_names), 4))
                     if len(param_names) == 1:
                         axes = [axes]
-                    
-                    x_gen = binned_data.metadata.get('x_gen', None)
-                    y_gen = binned_data.metadata.get('y_gen', None)
                     
                     for i, param_name in enumerate(param_names):
                         param_values = params[param_name]
@@ -1158,113 +1570,56 @@ def create_vnb_plots(args, binned_data, vnb_results, galaxy_name, plots_dir):
                         else:
                             label = param_name
                         
-                        sc = axes[i].scatter(x_gen, y_gen, c=param_values, cmap='plasma', 
-                                          s=50, edgecolor='k')
-                        plt.colorbar(sc, ax=axes[i], label=label)
+                        valid_mask = np.isfinite(param_values)
+                        if np.any(valid_mask):
+                            # Get appropriate range for color scale
+                            vmin = np.percentile(param_values[valid_mask], 5)
+                            vmax = np.percentile(param_values[valid_mask], 95)
+                            
+                            sc = axes[i].scatter(
+                                x_gen_physical[valid_mask], 
+                                y_gen_physical[valid_mask], 
+                                c=param_values[valid_mask], 
+                                cmap='plasma', 
+                                s=50, 
+                                edgecolor='k',
+                                vmin=vmin, 
+                                vmax=vmax
+                            )
+                            cbar = plt.colorbar(sc, ax=axes[i], label=label)
+                            cbar.ax.tick_params(labelsize=8)
+                        else:
+                            axes[i].text(0.5, 0.5, f"No valid {param_name} data", 
+                                       ha='center', va='center', transform=axes[i].transAxes)
+                        
+                        axes[i].set_xlabel('X (arcsec)')
+                        axes[i].set_ylabel('Y (arcsec)')
                         axes[i].set_title(f'Stellar {label}')
+                        axes[i].set_aspect('equal')
+                        axes[i].grid(True, alpha=0.3)
+                    
+                    # Add overall title
+                    plt.suptitle(f'Stellar Population - {galaxy_name}', fontsize=14)
                     
                     # Save figure
-                    plt.tight_layout()
+                    plt.tight_layout(rect=[0, 0, 1, 0.95])  # Make room for suptitle
                     plt.savefig(plots_dir / f"{galaxy_name}_vnb_stellar_pop.png", dpi=150)
                     plt.close(fig)
             except Exception as e:
                 logger.warning(f"Error creating stellar population plots: {str(e)}")
-        
-        # Create emission line plots
-        if 'emission' in vnb_results:
-            try:
-                emission = vnb_results['emission']
-                
-                # Find flux maps
-                flux_maps = {}
-                for key, value in emission.items():
-                    if key.startswith('flux_') and isinstance(value, np.ndarray):
-                        line_name = key[5:]  # Remove 'flux_' prefix
-                        flux_maps[line_name] = value
-                
-                if flux_maps:
-                    n_lines = min(len(flux_maps), 6)  # Show at most 6 lines
-                    fig, axes = plt.subplots(1, n_lines, figsize=(4 * n_lines, 4))
-                    if n_lines == 1:
-                        axes = [axes]
-                    
-                    x_gen = binned_data.metadata.get('x_gen', None)
-                    y_gen = binned_data.metadata.get('y_gen', None)
-                    
-                    for i, (line_name, flux) in enumerate(list(flux_maps.items())[:n_lines]):
-                        # Use log scale for better visualization
-                        with np.errstate(divide='ignore', invalid='ignore'):
-                            log_flux = np.log10(flux)
-                        
-                        valid_mask = np.isfinite(log_flux)
-                        if np.any(valid_mask):
-                            vmin = np.nanpercentile(log_flux[valid_mask], 5)
-                            vmax = np.nanpercentile(log_flux[valid_mask], 95)
-                            
-                            sc = axes[i].scatter(x_gen, y_gen, c=log_flux, cmap='inferno', 
-                                              s=50, edgecolor='k', vmin=vmin, vmax=vmax)
-                            plt.colorbar(sc, ax=axes[i], label='Log Flux')
-                        else:
-                            axes[i].scatter(x_gen, y_gen, c='gray', s=50, edgecolor='k')
-                        
-                        axes[i].set_title(f'{line_name} Flux')
-                    
-                    # Save figure
-                    plt.tight_layout()
-                    plt.savefig(plots_dir / f"{galaxy_name}_vnb_emission.png", dpi=150)
-                    plt.close(fig)
-            except Exception as e:
-                logger.warning(f"Error creating emission line plots: {str(e)}")
-        
-        # Create spectral indices plots
-        if 'indices' in vnb_results:
-            try:
-                indices = vnb_results['indices']
-                index_names = list(indices.keys())
-                
-                if index_names:
-                    n_indices = min(len(index_names), 6)  # Show at most 6 indices
-                    fig, axes = plt.subplots(1, n_indices, figsize=(4 * n_indices, 4))
-                    if n_indices == 1:
-                        axes = [axes]
-                    
-                    x_gen = binned_data.metadata.get('x_gen', None)
-                    y_gen = binned_data.metadata.get('y_gen', None)
-                    
-                    for i, index_name in enumerate(index_names[:n_indices]):
-                        index_values = indices[index_name]
-                        
-                        valid_mask = np.isfinite(index_values)
-                        if np.any(valid_mask):
-                            vmin = np.nanpercentile(index_values[valid_mask], 5)
-                            vmax = np.nanpercentile(index_values[valid_mask], 95)
-                            
-                            sc = axes[i].scatter(x_gen, y_gen, c=index_values, cmap='viridis', 
-                                              s=50, edgecolor='k', vmin=vmin, vmax=vmax)
-                            plt.colorbar(sc, ax=axes[i], label='Index Value')
-                        else:
-                            axes[i].scatter(x_gen, y_gen, c='gray', s=50, edgecolor='k')
-                        
-                        axes[i].set_title(f'{index_name} Index')
-                    
-                    # Save figure
-                    plt.tight_layout()
-                    plt.savefig(plots_dir / f"{galaxy_name}_vnb_indices.png", dpi=150)
-                    plt.close(fig)
-            except Exception as e:
-                logger.warning(f"Error creating spectral indices plots: {str(e)}")
-        
+                plt.close('all')
     except Exception as e:
-        logger.error(f"Error creating VNB plots: {str(e)}")
-        logger.error(traceback.format_exc())
+                logger.warning(f"Error creating stellar population plots: {str(e)}")
+                plt.close('all')
+
 
 def create_binning_plots(binned_data, plots_dir, galaxy_name):
     """
-    Create basic binning visualization plots
+    Create basic binning visualization plots with real physical coordinates
     
     Parameters
     ----------
-    binned_data : VoronoiBinnedData
+    binned_data : BinnedSpectra
         Binned data object
     plots_dir : Path
         Directory to save plots
@@ -1272,15 +1627,651 @@ def create_binning_plots(binned_data, plots_dir, galaxy_name):
         Galaxy name
     """
     try:
-        # Create Voronoi bin map
-        fig, ax = plt.subplots(figsize=(10, 8))
+        # Get pixel scale for coordinate conversion
+        pixel_size_x = binned_data.metadata.get('pixelsize_x', 1.0)
+        pixel_size_y = binned_data.metadata.get('pixelsize_y', 1.0)
         
         # Get bin centers and SNR values
         x_gen = binned_data.metadata.get('x_gen', None)
         y_gen = binned_data.metadata.get('y_gen', None)
         sn = binned_data.metadata.get('sn', None)
         
-        # Create a bin map image
+        # Get dimensions from metadata
+        n_y = binned_data.metadata.get('ny', 1)
+        n_x = binned_data.metadata.get('nx', 1)
+        
+        # Handle different bin_num formats
+        bin_num = binned_data.bin_num
+        
+        # Create figure
+        fig, ax = plt.subplots(figsize=(10, 8))
+        
+        # Create a mapping from bin numbers to pixels
+        x_coords = []
+        y_coords = []
+        bins = []
+        
+        # Check if we can reshape bin_num to 2D
+        try:
+            bin_map = bin_num.reshape(n_y, n_x)
+            # Convert to physical coordinates using meshgrid
+            y_indices, x_indices = np.indices((n_y, n_x))
+            x_phys = (x_indices - n_x/2) * pixel_size_x
+            y_phys = (y_indices - n_y/2) * pixel_size_y
+            
+            # Find all valid bins
+            for bin_id in range(np.max(bin_map) + 1):
+                mask = bin_map == bin_id
+                if np.any(mask):
+                    y_idx, x_idx = np.where(mask)
+                    for i in range(len(y_idx)):
+                        y_coords.append(y_phys[y_idx[i], x_idx[i]])
+                        x_coords.append(x_phys[y_idx[i], x_idx[i]])
+                        bins.append(bin_id)
+        except:
+            # If reshaping fails, try to get pixels from bin_indices
+            if hasattr(binned_data, 'bin_indices') and binned_data.bin_indices:
+                for bin_id, indices in enumerate(binned_data.bin_indices):
+                    for idx in indices:
+                        # Convert linear index to 2D coordinates
+                        y = idx // n_x
+                        x = idx % n_x
+                        if 0 <= y < n_y and 0 <= x < n_x:
+                            # Convert to physical coordinates
+                            x_phys = (x - n_x/2) * pixel_size_x
+                            y_phys = (y - n_y/2) * pixel_size_y
+                            x_coords.append(x_phys)
+                            y_coords.append(y_phys)
+                            bins.append(bin_id)
+            else:
+                # No binning information, plot a placeholder
+                ax.text(0.5, 0.5, "No valid binning data available", 
+                       ha='center', va='center', transform=ax.transAxes)
+                ax.set_title(f'Binning Map - {galaxy_name}')
+                
+                # Save figure and return
+                plt.tight_layout()
+                plt.savefig(plots_dir / f"{galaxy_name}_binning_map.png", dpi=150)
+                plt.close(fig)
+                return
+        
+        # Convert lists to arrays
+        x_coords = np.array(x_coords)
+        y_coords = np.array(y_coords)
+        bins = np.array(bins)
+        
+        # Check if we have any valid bins
+        if len(bins) == 0:
+            ax.text(0.5, 0.5, "No valid binning data available", 
+                   ha='center', va='center', transform=ax.transAxes)
+            ax.set_title(f'Binning Map - {galaxy_name}')
+                
+            # Save figure and return
+            plt.tight_layout()
+            plt.savefig(plots_dir / f"{galaxy_name}_binning_map.png", dpi=150)
+            plt.close(fig)
+            return
+        
+        # Use scatter plot instead of pcolormesh
+        cmap = plt.cm.get_cmap('tab20', max(20, np.max(bins)+1))
+        unique_bins = np.unique(bins)
+        
+        # Plot each bin with a separate call to scatter for proper legend
+        for bin_id in unique_bins:
+            mask = bins == bin_id
+            ax.scatter(x_coords[mask], y_coords[mask], 
+                     color=cmap(bin_id % 20), s=15, alpha=0.7,
+                     label=f'Bin {bin_id}' if bin_id < 5 else None)
+        
+        # Add bin centers if available
+        if x_gen is not None and y_gen is not None:
+            # Convert to physical coordinates
+            x_gen_phys = [(x - n_x/2) * pixel_size_x for x in x_gen]
+            y_gen_phys = [(y - n_y/2) * pixel_size_y for y in y_gen]
+            
+            # Plot bin centers with numbers
+            for i, (x, y) in enumerate(zip(x_gen_phys, y_gen_phys)):
+                if i < len(unique_bins):
+                    ax.plot(x, y, 'ko', markersize=8)
+                    ax.text(x, y, str(i), color='white', fontsize=8, 
+                           ha='center', va='center',
+                           bbox=dict(facecolor='black', alpha=0.7, boxstyle='round,pad=0.1'))
+        
+        # Add SNR values if available
+        if sn is not None and x_gen is not None and y_gen is not None:
+            # Create a separate scatter plot for SNR
+            try:
+                limit = min(len(x_gen_phys), len(y_gen_phys), len(sn))
+                sc = ax.scatter(
+                    x_gen_phys[:limit], 
+                    y_gen_phys[:limit], 
+                    c=sn[:limit], 
+                    cmap='viridis', 
+                    s=30, 
+                    alpha=0.5,
+                    edgecolor='k'
+                )
+                plt.colorbar(sc, ax=ax, label='Signal-to-Noise Ratio')
+            except Exception as e:
+                logger.warning(f"Error adding SNR colorbar: {e}")
+        
+        # Set labels and grid
+        ax.set_xlabel('X (arcsec)')
+        ax.set_ylabel('Y (arcsec)')
+        ax.set_aspect('equal')
+        ax.grid(True, alpha=0.3)
+        ax.set_title(f'Binning Map - {galaxy_name}')
+        
+        # Add legend for first few bins
+        if len(unique_bins) > 0:
+            handles, labels = ax.get_legend_handles_labels()
+            if handles:
+                ax.legend(
+                    handles[:min(5, len(handles))],
+                    labels[:min(5, len(labels))],
+                    loc='upper right', 
+                    fontsize='small'
+                )
+        
+        # Save figure
+        plt.tight_layout()
+        plt.savefig(plots_dir / f"{galaxy_name}_binning_map.png", dpi=150)
+        plt.close(fig)
+        
+        # Create histograms for bin properties
+        # SNR histogram
+        if sn is not None:
+            fig, ax = plt.subplots(figsize=(8, 6))
+            ax.hist(sn, bins=20, color='skyblue', edgecolor='black')
+            
+            # Add target SNR line if available
+            target_snr = binned_data.metadata.get('target_snr', None)
+            if target_snr is not None:
+                ax.axvline(x=target_snr, color='red', linestyle='--', 
+                          label=f'Target SNR = {target_snr:.1f}')
+            
+            # Add median SNR line
+            median_snr = np.nanmedian(sn)
+            ax.axvline(x=median_snr, color='green', linestyle='-', 
+                      label=f'Median SNR = {median_snr:.1f}')
+            
+            ax.set_title(f'Bin SNR Distribution - {galaxy_name}')
+            ax.set_xlabel('Signal-to-Noise Ratio')
+            ax.set_ylabel('Number of Bins')
+            ax.legend()
+            
+            plt.tight_layout()
+            plt.savefig(plots_dir / f"{galaxy_name}_snr_histogram.png", dpi=150)
+            plt.close(fig)
+        
+        # Bin size histogram
+        n_pixels = binned_data.metadata.get('n_pixels', None)
+        if n_pixels is not None:
+            fig, ax = plt.subplots(figsize=(8, 6))
+            ax.hist(n_pixels, bins=20, color='lightgreen', edgecolor='black')
+            
+            median_pixels = np.nanmedian(n_pixels)
+            ax.axvline(x=median_pixels, color='red', linestyle='-', 
+                      label=f'Median Size = {median_pixels:.1f} pixels')
+            
+            ax.set_title(f'Bin Size Distribution - {galaxy_name}')
+            ax.set_xlabel('Number of Pixels per Bin')
+            ax.set_ylabel('Number of Bins')
+            ax.legend()
+            
+            plt.tight_layout()
+            plt.savefig(plots_dir / f"{galaxy_name}_binsize_histogram.png", dpi=150)
+            plt.close(fig)
+        
+        # Bin area in physical units
+        if n_pixels is not None and pixel_size_x > 0:
+            fig, ax = plt.subplots(figsize=(8, 6))
+            
+            bin_areas = n_pixels * (pixel_size_x * pixel_size_y)  # arcsec²
+            ax.hist(bin_areas, bins=20, color='salmon', edgecolor='black')
+            
+            median_area = np.nanmedian(bin_areas)
+            ax.axvline(x=median_area, color='red', linestyle='-', 
+                      label=f'Median Area = {median_area:.2f} arcsec²')
+            
+            ax.set_title(f'Bin Area Distribution - {galaxy_name}')
+            ax.set_xlabel('Area (arcsec²)')
+            ax.set_ylabel('Number of Bins')
+            ax.legend()
+            
+            plt.tight_layout()
+            plt.savefig(plots_dir / f"{galaxy_name}_binsize_histogram.png", dpi=150)
+            plt.close(fig)
+            
+    except Exception as e:
+        logger.error(f"Error creating binning plots: {str(e)}")
+        logger.error(traceback.format_exc())
+    """
+    Create basic binning visualization plots with real physical coordinates
+    
+    Parameters
+    ----------
+    binned_data : BinnedSpectra
+        Binned data object
+    plots_dir : Path
+        Directory to save plots
+    galaxy_name : str
+        Galaxy name
+    """
+    try:
+        # Get pixel scale for coordinate conversion
+        pixel_size_x = binned_data.metadata.get('pixelsize_x', 1.0)
+        pixel_size_y = binned_data.metadata.get('pixelsize_y', 1.0)
+        
+        # Get bin centers and SNR values
+        x_gen = binned_data.metadata.get('x_gen', None)
+        y_gen = binned_data.metadata.get('y_gen', None)
+        sn = binned_data.metadata.get('sn', None)
+        
+        # Get dimensions from metadata
+        n_y = binned_data.metadata.get('ny', 1)
+        n_x = binned_data.metadata.get('nx', 1)
+        
+        # Create figure
+        fig, ax = plt.subplots(figsize=(10, 8))
+        
+        # Handle different bin_num formats
+        bin_num = binned_data.bin_num
+        
+        # Convert bin_num to appropriate dimensions
+        if isinstance(bin_num, np.ndarray):
+            if len(bin_num.shape) == 1:
+                # 1D array
+                if len(bin_num) == n_y * n_x:
+                    # Can reshape to 2D
+                    bin_map = bin_num.reshape(n_y, n_x)
+                else:
+                    # Can't reshape, create empty map
+                    bin_map = np.full((n_y, n_x), -1)
+                    
+                    # Fill with bin numbers where possible
+                    for bin_id in np.unique(bin_num):
+                        if bin_id >= 0:
+                            idx_list = np.where(bin_num == bin_id)[0]
+                            for idx in idx_list:
+                                if idx < n_y * n_x:
+                                    row = idx // n_x
+                                    col = idx % n_x
+                                    if 0 <= row < n_y and 0 <= col < n_x:
+                                        bin_map[row, col] = bin_id
+            else:
+                # Already 2D
+                bin_map = bin_num
+        else:
+            # Not an array, create empty map
+            bin_map = np.full((n_y, n_x), -1)
+        
+        # Create physical coordinate grid
+        y_coords, x_coords = np.indices((n_y, n_x))
+        x_physical = (x_coords - n_x/2) * pixel_size_x
+        y_physical = (y_coords - n_y/2) * pixel_size_y
+        
+        # Plot bins using scatter plot instead of pcolormesh
+        # Get unique bin numbers
+        unique_bins = np.unique(bin_map)
+        unique_bins = unique_bins[unique_bins >= 0]
+        
+        # Create colormap
+        cmap = plt.cm.get_cmap('tab20', max(20, len(unique_bins)))
+        
+        for i, bin_id in enumerate(unique_bins):
+            mask = bin_map == bin_id
+            if np.any(mask):
+                y_idx, x_idx = np.where(mask)
+                x_vals = x_physical[y_idx, x_idx]
+                y_vals = y_physical[y_idx, x_idx]
+                color = cmap(i % 20)
+                ax.scatter(x_vals, y_vals, color=color, s=15, alpha=0.7,
+                          label=f'Bin {bin_id}' if i < 5 else None)
+        
+        # Add bin centers if available
+        if x_gen is not None and y_gen is not None:
+            x_gen_phys = np.array([(x - n_x/2) * pixel_size_x for x in x_gen])
+            y_gen_phys = np.array([(y - n_y/2) * pixel_size_y for y in y_gen])
+            
+            # Plot centers with numbers
+            for i, (x, y) in enumerate(zip(x_gen_phys, y_gen_phys)):
+                if i < len(unique_bins):
+                    ax.plot(x, y, 'ko', markersize=5)
+                    ax.text(x, y, str(i), color='white', fontsize=8, ha='center', va='center',
+                           bbox=dict(facecolor='black', alpha=0.7, boxstyle='round,pad=0.1'))
+        
+        # Add SNR colorbar if available
+        if sn is not None and x_gen is not None and y_gen is not None:
+            # Create separate scatter points for SNR values
+            try:
+                limit = min(len(x_gen_phys), len(y_gen_phys), len(sn))
+                sc = ax.scatter(
+                    x_gen_phys[:limit], 
+                    y_gen_phys[:limit], 
+                    c=sn[:limit], 
+                    cmap='viridis', 
+                    s=20, 
+                    alpha=0.5,
+                    edgecolor='k'
+                )
+                plt.colorbar(sc, ax=ax, label='Signal-to-Noise Ratio')
+            except Exception as e:
+                logger.warning(f"Error adding SNR colorbar: {e}")
+        
+        # Set labels and grid
+        ax.set_xlabel('X (arcsec)')
+        ax.set_ylabel('Y (arcsec)')
+        ax.set_aspect('equal')
+        ax.grid(True, alpha=0.3)
+        ax.set_title(f'Binning Map - {galaxy_name}')
+        
+        # Add legend for first few bins
+        if len(unique_bins) > 0:
+            handles, labels = ax.get_legend_handles_labels()
+            if handles:
+                ax.legend(
+                    handles[:min(5, len(handles))],
+                    labels[:min(5, len(labels))],
+                    loc='upper right',
+                    fontsize='small'
+                )
+        
+        # Save figure
+        plt.tight_layout()
+        plt.savefig(plots_dir / f"{galaxy_name}_binning_map.png", dpi=150)
+        plt.close(fig)
+        
+        # Create histograms for bin properties
+        # SNR histogram
+        if sn is not None:
+            fig, ax = plt.subplots(figsize=(8, 6))
+            ax.hist(sn, bins=20, color='skyblue', edgecolor='black')
+            
+            # Add target SNR line if available
+            target_snr = binned_data.metadata.get('target_snr', None)
+            if target_snr is not None:
+                ax.axvline(x=target_snr, color='red', linestyle='--', 
+                          label=f'Target SNR = {target_snr:.1f}')
+            
+            # Add median SNR line
+            median_snr = np.nanmedian(sn)
+            ax.axvline(x=median_snr, color='green', linestyle='-', 
+                      label=f'Median SNR = {median_snr:.1f}')
+            
+            ax.set_title(f'Bin SNR Distribution - {galaxy_name}')
+            ax.set_xlabel('Signal-to-Noise Ratio')
+            ax.set_ylabel('Number of Bins')
+            ax.legend()
+            
+            plt.tight_layout()
+            plt.savefig(plots_dir / f"{galaxy_name}_snr_histogram.png", dpi=150)
+            plt.close(fig)
+        
+        # Bin size histogram
+        n_pixels = binned_data.metadata.get('n_pixels', None)
+        if n_pixels is not None:
+            fig, ax = plt.subplots(figsize=(8, 6))
+            ax.hist(n_pixels, bins=20, color='lightgreen', edgecolor='black')
+            
+            median_pixels = np.nanmedian(n_pixels)
+            ax.axvline(x=median_pixels, color='red', linestyle='-', 
+                      label=f'Median Size = {median_pixels:.1f} pixels')
+            
+            ax.set_title(f'Bin Size Distribution - {galaxy_name}')
+            ax.set_xlabel('Number of Pixels per Bin')
+            ax.set_ylabel('Number of Bins')
+            ax.legend()
+            
+            plt.tight_layout()
+            plt.savefig(plots_dir / f"{galaxy_name}_binsize_histogram.png", dpi=150)
+            plt.close(fig)
+        
+        # Bin area in physical units
+        if n_pixels is not None and pixel_size_x > 0:
+            fig, ax = plt.subplots(figsize=(8, 6))
+            
+            bin_areas = n_pixels * (pixel_size_x * pixel_size_y)  # arcsec²
+            ax.hist(bin_areas, bins=20, color='salmon', edgecolor='black')
+            
+            median_area = np.nanmedian(bin_areas)
+            ax.axvline(x=median_area, color='red', linestyle='-', 
+                      label=f'Median Area = {median_area:.2f} arcsec²')
+            
+            ax.set_title(f'Bin Area Distribution - {galaxy_name}')
+            ax.set_xlabel('Area (arcsec²)')
+            ax.set_ylabel('Number of Bins')
+            ax.legend()
+            
+            plt.tight_layout()
+            plt.savefig(plots_dir / f"{galaxy_name}_bin_area.png", dpi=150)
+            plt.close(fig)
+            
+    except Exception as e:
+        logger.error(f"Error creating binning plots: {str(e)}")
+        logger.error(traceback.format_exc())
+    """
+    Create basic binning visualization plots with real physical coordinates
+    
+    Parameters
+    ----------
+    binned_data : BinnedSpectra
+        Binned data object
+    plots_dir : Path
+        Directory to save plots
+    galaxy_name : str
+        Galaxy name
+    """
+    try:
+        # Get pixel scale for coordinate conversion
+        pixel_size_x = binned_data.metadata.get('pixelsize_x', 1.0)
+        pixel_size_y = binned_data.metadata.get('pixelsize_y', 1.0)
+        
+        # Get bin centers and SNR values
+        x_gen = binned_data.metadata.get('x_gen', None)
+        y_gen = binned_data.metadata.get('y_gen', None)
+        sn = binned_data.metadata.get('sn', None)
+        
+        # Get dimensions from metadata
+        n_y = binned_data.metadata.get('ny', 1)
+        n_x = binned_data.metadata.get('nx', 1)
+        
+        # Check if bin_num is 1D or 2D and reshape accordingly
+        bin_num = binned_data.bin_num
+        if len(bin_num.shape) == 1 and len(bin_num) == n_y * n_x:
+            # Reshape 1D bin_num to 2D
+            bin_map = bin_num.reshape(n_y, n_x)
+        else:
+            # Already 2D or incompatible shape
+            try:
+                bin_map = bin_num.reshape(n_y, n_x)
+            except:
+                # Create a simple bin map if we can't reshape
+                bin_map = np.full((n_y, n_x), -1)
+                # Fill with available bin numbers
+                for bin_id in np.unique(bin_num):
+                    if bin_id >= 0:
+                        bin_indices = np.where(bin_num == bin_id)[0]
+                        for idx in bin_indices:
+                            row = idx // n_x if idx < n_y * n_x else 0
+                            col = idx % n_x if idx < n_y * n_x else 0
+                            if 0 <= row < n_y and 0 <= col < n_x:
+                                bin_map[row, col] = bin_id
+        
+        # Create figure
+        fig, ax = plt.subplots(figsize=(10, 8))
+        
+        # Get physical coordinates for each pixel
+        y_coords, x_coords = np.indices((n_y, n_x))
+        x_physical = (x_coords - n_x/2) * pixel_size_x
+        y_physical = (y_coords - n_y/2) * pixel_size_y
+        
+        # Get unique bins
+        unique_bins = np.unique(bin_map)
+        unique_bins = unique_bins[unique_bins >= 0]
+        n_bins = len(unique_bins)
+        
+        # Create colormap
+        cmap = plt.cm.get_cmap('tab20', max(20, n_bins))
+        
+        # Plot each bin using scatter plot
+        for i, bin_id in enumerate(unique_bins):
+            mask = bin_map == bin_id
+            if np.any(mask):
+                y_idx, x_idx = np.where(mask)
+                
+                # Get physical coordinates for this bin
+                x_vals = x_physical[y_idx, x_idx]
+                y_vals = y_physical[y_idx, x_idx]
+                
+                # Plot bin points
+                color = cmap(i % 20)
+                ax.scatter(x_vals, y_vals, color=color, s=15, alpha=0.7,
+                          label=f'Bin {bin_id}' if i < 5 else None)
+        
+        # Add bin centers if available
+        if x_gen is not None and y_gen is not None:
+            # Convert to physical coordinates
+            x_gen_phys = np.array([(x - n_x/2) * pixel_size_x for x in x_gen])
+            y_gen_phys = np.array([(y - n_y/2) * pixel_size_y for y in y_gen])
+            
+            # Plot centers with numbers
+            for i, (x, y) in enumerate(zip(x_gen_phys, y_gen_phys)):
+                if i < len(unique_bins):
+                    ax.plot(x, y, 'ko', markersize=5)
+                    ax.text(x, y, str(i), color='white', fontsize=8, ha='center', va='center',
+                           bbox=dict(facecolor='black', alpha=0.7, boxstyle='round,pad=0.1'))
+        
+        # Add SNR colorbar if available
+        if sn is not None and x_gen is not None and y_gen is not None:
+            # Create separate scatter points for SNR values
+            sc = ax.scatter(
+                x_gen_phys[:len(sn)], 
+                y_gen_phys[:len(sn)], 
+                c=sn, 
+                cmap='viridis', 
+                s=20, 
+                alpha=0.5,
+                edgecolor='k'
+            )
+            plt.colorbar(sc, ax=ax, label='Signal-to-Noise Ratio')
+        
+        # Set labels and grid
+        ax.set_xlabel('X (arcsec)')
+        ax.set_ylabel('Y (arcsec)')
+        ax.set_aspect('equal')
+        ax.grid(True, alpha=0.3)
+        
+        # Add title
+        ax.set_title(f'Binning Map - {galaxy_name}')
+        
+        # Add legend for first few bins
+        if n_bins > 0:
+            handles, labels = ax.get_legend_handles_labels()
+            if handles:
+                ax.legend(
+                    handles[:min(5, len(handles))],  # Show up to 5 bins
+                    labels[:min(5, len(labels))],
+                    loc='upper right',
+                    fontsize='small'
+                )
+        
+        # Save figure
+        plt.tight_layout()
+        plt.savefig(plots_dir / f"{galaxy_name}_binning_map.png", dpi=150)
+        plt.close(fig)
+        
+        # Create histograms for bin properties
+        # SNR histogram
+        if sn is not None:
+            fig, ax = plt.subplots(figsize=(8, 6))
+            ax.hist(sn, bins=20, color='skyblue', edgecolor='black')
+            
+            # Add target SNR line if available
+            target_snr = binned_data.metadata.get('target_snr', None)
+            if target_snr is not None:
+                ax.axvline(x=target_snr, color='red', linestyle='--', 
+                          label=f'Target SNR = {target_snr:.1f}')
+            
+            # Add median SNR line
+            median_snr = np.nanmedian(sn)
+            ax.axvline(x=median_snr, color='green', linestyle='-', 
+                      label=f'Median SNR = {median_snr:.1f}')
+            
+            ax.set_title(f'Bin SNR Distribution - {galaxy_name}')
+            ax.set_xlabel('Signal-to-Noise Ratio')
+            ax.set_ylabel('Number of Bins')
+            ax.legend()
+            
+            plt.tight_layout()
+            plt.savefig(plots_dir / f"{galaxy_name}_snr_histogram.png", dpi=150)
+            plt.close(fig)
+        
+        # Bin size histogram
+        n_pixels = binned_data.metadata.get('n_pixels', None)
+        if n_pixels is not None:
+            fig, ax = plt.subplots(figsize=(8, 6))
+            ax.hist(n_pixels, bins=20, color='lightgreen', edgecolor='black')
+            
+            median_pixels = np.nanmedian(n_pixels)
+            ax.axvline(x=median_pixels, color='red', linestyle='-', 
+                      label=f'Median Size = {median_pixels:.1f} pixels')
+            
+            ax.set_title(f'Bin Size Distribution - {galaxy_name}')
+            ax.set_xlabel('Number of Pixels per Bin')
+            ax.set_ylabel('Number of Bins')
+            ax.legend()
+            
+            plt.tight_layout()
+            plt.savefig(plots_dir / f"{galaxy_name}_binsize_histogram.png", dpi=150)
+            plt.close(fig)
+        
+        # Bin area in physical units
+        if n_pixels is not None and pixel_size_x > 0:
+            fig, ax = plt.subplots(figsize=(8, 6))
+            
+            bin_areas = n_pixels * (pixel_size_x * pixel_size_y)  # arcsec²
+            ax.hist(bin_areas, bins=20, color='salmon', edgecolor='black')
+            
+            median_area = np.nanmedian(bin_areas)
+            ax.axvline(x=median_area, color='red', linestyle='-', 
+                      label=f'Median Area = {median_area:.2f} arcsec²')
+            
+            ax.set_title(f'Bin Area Distribution - {galaxy_name}')
+            ax.set_xlabel('Area (arcsec²)')
+            ax.set_ylabel('Number of Bins')
+            ax.legend()
+            
+            plt.tight_layout()
+            plt.savefig(plots_dir / f"{galaxy_name}_bin_area.png", dpi=150)
+            plt.close(fig)
+            
+    except Exception as e:
+        logger.error(f"Error creating binning plots: {str(e)}")
+        logger.error(traceback.format_exc())
+    """
+    Create basic binning visualization plots with real physical coordinates
+    
+    Parameters
+    ----------
+    binned_data : BinnedSpectra
+        Binned data object
+    plots_dir : Path
+        Directory to save plots
+    galaxy_name : str
+        Galaxy name
+    """
+    try:
+        # Get pixel scale for coordinate conversion
+        pixel_size_x = binned_data.metadata.get('pixelsize_x', 1.0)
+        pixel_size_y = binned_data.metadata.get('pixelsize_y', 1.0)
+        
+        # Get bin centers and SNR values
+        x_gen = binned_data.metadata.get('x_gen', None)
+        y_gen = binned_data.metadata.get('y_gen', None)
+        sn = binned_data.metadata.get('sn', None)
+        
+        # Create bin map
         n_y = binned_data.metadata['ny']
         n_x = binned_data.metadata['nx']
         bin_map = np.full((n_y, n_x), -1)
@@ -1293,38 +2284,95 @@ def create_binning_plots(binned_data, plots_dir, galaxy_name):
         for i in unique_bins:
             mask = binned_data.bin_num == i
             if np.any(mask):
-                bin_map[mask.reshape(n_y, n_x)] = i
+                # We need to ensure mask is 2D if bin_num is 1D
+                if len(mask.shape) == 1 and mask.shape[0] == n_y * n_x:
+                    mask = mask.reshape(n_y, n_x)
+                bin_map[mask] = i
         
-        # Create random colors for each bin
-        n_bins = len(x_gen)
-        cmap = plt.cm.get_cmap('tab20', n_bins)
-        colors = [cmap(i) for i in range(n_bins)]
+        # Create figure
+        fig, ax = plt.subplots(figsize=(10, 8))
+        
+        # Create physical coordinate grid for display
+        y_coords, x_coords = np.indices((n_y, n_x))
+        
+        # Convert to physical units (arcseconds)
+        # Center the coordinates (center at 0,0)
+        x_physical = (x_coords - n_x/2) * pixel_size_x
+        y_physical = (y_coords - n_y/2) * pixel_size_y
         
         # Create colored bin map
-        rgba_colors = np.zeros((n_y, n_x, 4))
-        for i, color in enumerate(colors):
+        n_bins = len(unique_bins)
+        cmap = plt.cm.get_cmap('tab20', max(20, n_bins))
+        
+        # Plot each bin using scatter plot
+        for i in unique_bins:
             mask = bin_map == i
             if np.any(mask):
-                rgba_colors[mask] = color
+                color = cmap(i % 20)  # Cycle through colors if more than 20 bins
+                
+                # Use scatter for plot - extract the coordinates
+                y_idx, x_idx = np.where(mask)
+                ax.scatter(
+                    x_physical[y_idx, x_idx], 
+                    y_physical[y_idx, x_idx], 
+                    color=color, 
+                    s=15, 
+                    alpha=0.7,
+                    label=f'Bin {i}' if i < 5 else None  # Only label first few bins
+                )
         
-        # Show bin map
-        ax.imshow(rgba_colors, origin='lower', aspect='equal')
+        # Plot bin centers with bin numbers
+        if x_gen is not None and y_gen is not None:
+            # Convert bin centers to physical coordinates
+            x_gen_physical = (x_gen - n_x/2) * pixel_size_x
+            y_gen_physical = (y_gen - n_y/2) * pixel_size_y
+            
+            for i, (x, y) in enumerate(zip(x_gen_physical, y_gen_physical)):
+                ax.text(x, y, str(i), color='black', fontsize=8, 
+                       ha='center', va='center', backgroundcolor='white')
+            
+            # Also show bin centers as points
+            ax.scatter(x_gen_physical, y_gen_physical, color='black', s=20, alpha=0.5)
         
-        # Plot bin centers
-        for i, (x, y) in enumerate(zip(x_gen, y_gen)):
-            ax.text(x, y, str(i), color='black', fontsize=8, 
-                   ha='center', va='center', backgroundcolor='white')
+        # Add colorbar for SNR if available
+        if sn is not None and x_gen is not None and y_gen is not None:
+            # Create a separate scattered points with SNR values
+            sc = ax.scatter(
+                x_gen_physical, 
+                y_gen_physical, 
+                c=sn, 
+                cmap='viridis', 
+                s=30, 
+                alpha=0.7,
+                edgecolor='k'
+            )
+            cbar = plt.colorbar(sc, ax=ax, label='Signal-to-Noise Ratio')
+            # Add colorbar ticks
+            cbar.ax.tick_params(labelsize=8)
         
-        # Add colorbar for SNR
-        if sn is not None:
-            # Create a scatter plot with SNR values
-            sc = ax.scatter(x_gen, y_gen, c=sn, cmap='viridis', 
-                           s=10, alpha=0.7)
-            plt.colorbar(sc, ax=ax, label='Signal-to-Noise Ratio')
+        # Set axis labels with physical units
+        ax.set_xlabel('X (arcsec)')
+        ax.set_ylabel('Y (arcsec)')
         
+        # Set equal aspect ratio for proper spatial representation
+        ax.set_aspect('equal')
+        
+        # Add grid for reference
+        ax.grid(True, alpha=0.3)
+        
+        # Add title
         ax.set_title(f'Voronoi Binning Map - {galaxy_name}')
-        ax.set_xlabel('X (pixels)')
-        ax.set_ylabel('Y (pixels)')
+        
+        # Add legend for first few bins
+        if n_bins > 0:
+            handles, labels = ax.get_legend_handles_labels()
+            if handles:
+                ax.legend(
+                    handles[:5],  # Only show first 5 bins in legend
+                    labels[:5],
+                    loc='upper right',
+                    fontsize='small'
+                )
         
         # Save figure
         plt.tight_layout()
@@ -1381,7 +2429,625 @@ def create_binning_plots(binned_data, plots_dir, galaxy_name):
             plt.tight_layout()
             plt.savefig(plots_dir / f"{galaxy_name}_vnb_binsize_histogram.png", dpi=150)
             plt.close(fig)
+            
+        # Create bin spatial coverage
+        if n_pixels is not None and pixel_size_x > 0:
+            # Calculate physical area of each bin in square arcseconds
+            bin_areas = n_pixels * (pixel_size_x * pixel_size_y)
+            
+            fig, ax = plt.subplots(figsize=(8, 6))
+            
+            # Plot histogram of bin areas
+            ax.hist(bin_areas, bins=20, color='salmon', edgecolor='black')
+            
+            # Add median area line
+            median_area = np.median(bin_areas)
+            ax.axvline(x=median_area, color='red', linestyle='-', 
+                      label=f'Median Area = {median_area:.2f} arcsec²')
+            
+            ax.set_title(f'Bin Area Distribution - {galaxy_name}')
+            ax.set_xlabel('Area (arcsec²)')
+            ax.set_ylabel('Number of Bins')
+            ax.legend()
+            
+            # Save figure
+            plt.tight_layout()
+            plt.savefig(plots_dir / f"{galaxy_name}_vnb_bin_area.png", dpi=150)
+            plt.close(fig)
     
     except Exception as e:
         logger.error(f"Error creating binning plots: {str(e)}")
+        logger.error(traceback.format_exc())
+    """
+    Create basic binning visualization plots with real physical coordinates
+    
+    Parameters
+    ----------
+    binned_data : BinnedSpectra
+        Binned data object
+    plots_dir : Path
+        Directory to save plots
+    galaxy_name : str
+        Galaxy name
+    """
+    try:
+        # Get pixel scale for coordinate conversion
+        pixel_size_x = binned_data.metadata.get('pixelsize_x', 1.0)
+        pixel_size_y = binned_data.metadata.get('pixelsize_y', 1.0)
+        
+        # Get bin centers and SNR values
+        x_gen = binned_data.metadata.get('x_gen', None)
+        y_gen = binned_data.metadata.get('y_gen', None)
+        sn = binned_data.metadata.get('sn', None)
+        
+        # Create bin map
+        n_y = binned_data.metadata['ny']
+        n_x = binned_data.metadata['nx']
+        bin_map = np.full((n_y, n_x), -1)
+        
+        # Get unique bin numbers
+        unique_bins = np.unique(binned_data.bin_num)
+        unique_bins = unique_bins[unique_bins >= 0]  # Remove negative values
+        
+        # Fill bin map with bin numbers
+        for i in unique_bins:
+            mask = binned_data.bin_num == i
+            if np.any(mask):
+                bin_map[mask.reshape(n_y, n_x)] = i
+        
+        # Create figure
+        fig, ax = plt.subplots(figsize=(10, 8))
+        
+        # Create physical coordinate grid for display
+        y_coords, x_coords = np.indices((n_y, n_x))
+        
+        # Convert to physical units (arcseconds)
+        # Center the coordinates (center at 0,0)
+        x_physical = (x_coords - n_x/2) * pixel_size_x
+        y_physical = (y_coords - n_y/2) * pixel_size_y
+        
+        # Create colored bin map
+        n_bins = len(unique_bins)
+        cmap = plt.cm.get_cmap('tab20', n_bins)
+        
+        # Plot each bin with proper physical coordinates
+        for i in unique_bins:
+            mask = bin_map == i
+            if np.any(mask):
+                color = cmap(i % 20)  # Cycle through colors if more than 20 bins
+                
+                # Use scatter instead of pcolormesh for simplicity and compatibility
+                y_idx, x_idx = np.where(mask)
+                x_vals = x_physical[y_idx, x_idx]
+                y_vals = y_physical[y_idx, x_idx]
+                
+                ax.scatter(x_vals, y_vals, color=color, s=15, alpha=0.7)
+        
+        # Plot bin centers with bin numbers
+        if x_gen is not None and y_gen is not None:
+            # Convert bin centers to physical coordinates
+            x_gen_physical = (x_gen - n_x/2) * pixel_size_x
+            y_gen_physical = (y_gen - n_y/2) * pixel_size_y
+            
+            for i, (x, y) in enumerate(zip(x_gen_physical, y_gen_physical)):
+                ax.text(x, y, str(i), color='black', fontsize=8, 
+                       ha='center', va='center', backgroundcolor='white')
+        
+        # Add colorbar for SNR if available
+        if sn is not None and x_gen is not None and y_gen is not None:
+            sc = ax.scatter(x_gen_physical, y_gen_physical, c=sn, 
+                          cmap='viridis', s=30, alpha=0.7)
+            cbar = plt.colorbar(sc, ax=ax, label='Signal-to-Noise Ratio')
+            # Add colorbar ticks
+            cbar.ax.tick_params(labelsize=8)
+        
+        # Set axis labels with physical units
+        ax.set_xlabel('X (arcsec)')
+        ax.set_ylabel('Y (arcsec)')
+        
+        # Set equal aspect ratio for proper spatial representation
+        ax.set_aspect('equal')
+        
+        # Add grid for reference
+        ax.grid(True, alpha=0.3)
+        
+        # Add title
+        ax.set_title(f'Voronoi Binning Map - {galaxy_name}')
+        
+        # Save figure
+        plt.tight_layout()
+        plt.savefig(plots_dir / f"{galaxy_name}_vnb_binning_map.png", dpi=150)
+        plt.close(fig)
+        
+        # Create bin SNR histogram
+        if sn is not None:
+            fig, ax = plt.subplots(figsize=(8, 6))
+            
+            # Plot histogram of SNR values
+            ax.hist(sn, bins=20, color='skyblue', edgecolor='black')
+            
+            # Add target SNR line
+            target_snr = binned_data.metadata.get('target_snr', None)
+            if target_snr is not None:
+                ax.axvline(x=target_snr, color='red', linestyle='--', 
+                          label=f'Target SNR = {target_snr:.1f}')
+            
+            # Add median SNR line
+            median_snr = np.median(sn)
+            ax.axvline(x=median_snr, color='green', linestyle='-', 
+                      label=f'Median SNR = {median_snr:.1f}')
+            
+            ax.set_title(f'Bin SNR Distribution - {galaxy_name}')
+            ax.set_xlabel('Signal-to-Noise Ratio')
+            ax.set_ylabel('Number of Bins')
+            ax.legend()
+            
+            # Save figure
+            plt.tight_layout()
+            plt.savefig(plots_dir / f"{galaxy_name}_vnb_snr_histogram.png", dpi=150)
+            plt.close(fig)
+        
+        # Create bin size histogram
+        n_pixels = binned_data.metadata.get('n_pixels', None)
+        if n_pixels is not None:
+            fig, ax = plt.subplots(figsize=(8, 6))
+            
+            # Plot histogram of bin sizes
+            ax.hist(n_pixels, bins=20, color='lightgreen', edgecolor='black')
+            
+            # Add median bin size line
+            median_pixels = np.median(n_pixels)
+            ax.axvline(x=median_pixels, color='red', linestyle='-', 
+                      label=f'Median Size = {median_pixels:.1f} pixels')
+            
+            ax.set_title(f'Bin Size Distribution - {galaxy_name}')
+            ax.set_xlabel('Number of Pixels per Bin')
+            ax.set_ylabel('Number of Bins')
+            ax.legend()
+            
+            # Save figure
+            plt.tight_layout()
+            plt.savefig(plots_dir / f"{galaxy_name}_vnb_binsize_histogram.png", dpi=150)
+            plt.close(fig)
+            
+        # Create bin spatial coverage
+        if n_pixels is not None and pixel_size_x > 0:
+            # Calculate physical area of each bin in square arcseconds
+            bin_areas = n_pixels * (pixel_size_x * pixel_size_y)
+            
+            fig, ax = plt.subplots(figsize=(8, 6))
+            
+            # Plot histogram of bin areas
+            ax.hist(bin_areas, bins=20, color='salmon', edgecolor='black')
+            
+            # Add median area line
+            median_area = np.median(bin_areas)
+            ax.axvline(x=median_area, color='red', linestyle='-', 
+                      label=f'Median Area = {median_area:.2f} arcsec²')
+            
+            ax.set_title(f'Bin Area Distribution - {galaxy_name}')
+            ax.set_xlabel('Area (arcsec²)')
+            ax.set_ylabel('Number of Bins')
+            ax.legend()
+            
+            # Save figure
+            plt.tight_layout()
+            plt.savefig(plots_dir / f"{galaxy_name}_vnb_bin_area.png", dpi=150)
+            plt.close(fig)
+    
+    except Exception as e:
+        logger.error(f"Error creating binning plots: {str(e)}")
+        logger.error(traceback.format_exc())
+    """
+    Create basic binning visualization plots with real physical coordinates
+    
+    Parameters
+    ----------
+    binned_data : BinnedSpectra
+        Binned data object
+    plots_dir : Path
+        Directory to save plots
+    galaxy_name : str
+        Galaxy name
+    """
+    try:
+        # Get pixel scale for coordinate conversion
+        pixel_size_x = binned_data.metadata.get('pixelsize_x', 1.0)
+        pixel_size_y = binned_data.metadata.get('pixelsize_y', 1.0)
+        
+        # Get bin centers and SNR values
+        x_gen = binned_data.metadata.get('x_gen', None)
+        y_gen = binned_data.metadata.get('y_gen', None)
+        sn = binned_data.metadata.get('sn', None)
+        
+        # Create bin map
+        n_y = binned_data.metadata['ny']
+        n_x = binned_data.metadata['nx']
+        bin_map = np.full((n_y, n_x), -1)
+        
+        # Get unique bin numbers
+        unique_bins = np.unique(binned_data.bin_num)
+        unique_bins = unique_bins[unique_bins >= 0]  # Remove negative values
+        
+        # Fill bin map with bin numbers
+        for i in unique_bins:
+            mask = binned_data.bin_num == i
+            if np.any(mask):
+                bin_map[mask.reshape(n_y, n_x)] = i
+        
+        # Create figure
+        fig, ax = plt.subplots(figsize=(10, 8))
+        
+        # Create physical coordinate grid for display
+        y_coords, x_coords = np.indices((n_y, n_x))
+        
+        # Convert to physical units (arcseconds)
+        # Center the coordinates (center at 0,0)
+        x_physical = (x_coords - n_x/2) * pixel_size_x
+        y_physical = (y_coords - n_y/2) * pixel_size_y
+        
+        # Create colored bin map
+        n_bins = len(unique_bins)
+        cmap = plt.cm.get_cmap('tab20', n_bins)
+        
+        # Plot each bin with proper physical coordinates
+        for i in unique_bins:
+            mask = bin_map == i
+            if np.any(mask):
+                color = cmap(i % 20)  # Cycle through colors if more than 20 bins
+                # Use pcolormesh for exact coordinate mapping
+                ax.pcolormesh(
+                    x_physical[mask], 
+                    y_physical[mask], 
+                    np.ones_like(x_physical[mask]),
+                    color=color, edgecolor='k', linewidth=0.1
+                )
+        
+        # Plot bin centers with bin numbers
+        if x_gen is not None and y_gen is not None:
+            # Convert bin centers to physical coordinates
+            x_gen_physical = (x_gen - n_x/2) * pixel_size_x
+            y_gen_physical = (y_gen - n_y/2) * pixel_size_y
+            
+            for i, (x, y) in enumerate(zip(x_gen_physical, y_gen_physical)):
+                ax.text(x, y, str(i), color='black', fontsize=8, 
+                       ha='center', va='center', backgroundcolor='white')
+        
+        # Add colorbar for SNR if available
+        if sn is not None and x_gen is not None and y_gen is not None:
+            sc = ax.scatter(x_gen_physical, y_gen_physical, c=sn, 
+                          cmap='viridis', s=30, alpha=0.7)
+            cbar = plt.colorbar(sc, ax=ax, label='Signal-to-Noise Ratio')
+            # Add colorbar ticks
+            cbar.ax.tick_params(labelsize=8)
+        
+        # Set axis labels with physical units
+        ax.set_xlabel('X (arcsec)')
+        ax.set_ylabel('Y (arcsec)')
+        
+        # Set equal aspect ratio for proper spatial representation
+        ax.set_aspect('equal')
+        
+        # Add grid for reference
+        ax.grid(True, alpha=0.3)
+        
+        # Add title
+        ax.set_title(f'Voronoi Binning Map - {galaxy_name}')
+        
+        # Save figure
+        plt.tight_layout()
+        plt.savefig(plots_dir / f"{galaxy_name}_vnb_binning_map.png", dpi=150)
+        plt.close(fig)
+        
+        # Create bin SNR histogram
+        if sn is not None:
+            fig, ax = plt.subplots(figsize=(8, 6))
+            
+            # Plot histogram of SNR values
+            ax.hist(sn, bins=20, color='skyblue', edgecolor='black')
+            
+            # Add target SNR line
+            target_snr = binned_data.metadata.get('target_snr', None)
+            if target_snr is not None:
+                ax.axvline(x=target_snr, color='red', linestyle='--', 
+                          label=f'Target SNR = {target_snr:.1f}')
+            
+            # Add median SNR line
+            median_snr = np.median(sn)
+            ax.axvline(x=median_snr, color='green', linestyle='-', 
+                      label=f'Median SNR = {median_snr:.1f}')
+            
+            ax.set_title(f'Bin SNR Distribution - {galaxy_name}')
+            ax.set_xlabel('Signal-to-Noise Ratio')
+            ax.set_ylabel('Number of Bins')
+            ax.legend()
+            
+            # Save figure
+            plt.tight_layout()
+            plt.savefig(plots_dir / f"{galaxy_name}_vnb_snr_histogram.png", dpi=150)
+            plt.close(fig)
+        
+        # Create bin size histogram
+        n_pixels = binned_data.metadata.get('n_pixels', None)
+        if n_pixels is not None:
+            fig, ax = plt.subplots(figsize=(8, 6))
+            
+            # Plot histogram of bin sizes
+            ax.hist(n_pixels, bins=20, color='lightgreen', edgecolor='black')
+            
+            # Add median bin size line
+            median_pixels = np.median(n_pixels)
+            ax.axvline(x=median_pixels, color='red', linestyle='-', 
+                      label=f'Median Size = {median_pixels:.1f} pixels')
+            
+            ax.set_title(f'Bin Size Distribution - {galaxy_name}')
+            ax.set_xlabel('Number of Pixels per Bin')
+            ax.set_ylabel('Number of Bins')
+            ax.legend()
+            
+            # Save figure
+            plt.tight_layout()
+            plt.savefig(plots_dir / f"{galaxy_name}_vnb_binsize_histogram.png", dpi=150)
+            plt.close(fig)
+            
+        # Create bin spatial coverage
+        if n_pixels is not None and pixel_size_x > 0:
+            # Calculate physical area of each bin in square arcseconds
+            bin_areas = n_pixels * (pixel_size_x * pixel_size_y)
+            
+            fig, ax = plt.subplots(figsize=(8, 6))
+            
+            # Plot histogram of bin areas
+            ax.hist(bin_areas, bins=20, color='salmon', edgecolor='black')
+            
+            # Add median area line
+            median_area = np.median(bin_areas)
+            ax.axvline(x=median_area, color='red', linestyle='-', 
+                      label=f'Median Area = {median_area:.2f} arcsec²')
+            
+            ax.set_title(f'Bin Area Distribution - {galaxy_name}')
+            ax.set_xlabel('Area (arcsec²)')
+            ax.set_ylabel('Number of Bins')
+            ax.legend()
+            
+            # Save figure
+            plt.tight_layout()
+            plt.savefig(plots_dir / f"{galaxy_name}_vnb_bin_area.png", dpi=150)
+            plt.close(fig)
+    
+    except Exception as e:
+        logger.error(f"Error creating binning plots: {str(e)}")
+        logger.error(traceback.format_exc())
+
+
+
+def create_robust_binning_plots(binned_data, plots_dir, galaxy_name):
+    """
+    Create binning visualization plots avoiding pcolormesh and dimension issues
+    
+    Parameters
+    ----------
+    binned_data : BinnedSpectra
+        Binned data object
+    plots_dir : Path
+        Directory to save plots
+    galaxy_name : str
+        Galaxy name
+    """
+    try:
+        # Get pixel scale for coordinate conversion
+        pixel_size_x = binned_data.metadata.get('pixelsize_x', 1.0)
+        pixel_size_y = binned_data.metadata.get('pixelsize_y', 1.0)
+        
+        # Get bin centers and SNR values
+        x_gen = binned_data.metadata.get('x_gen', None)
+        y_gen = binned_data.metadata.get('y_gen', None)
+        sn = binned_data.metadata.get('sn', None)
+        
+        # Get dimensions from metadata
+        n_y = binned_data.metadata.get('ny', 1)
+        n_x = binned_data.metadata.get('nx', 1)
+        
+        # Create figure
+        fig, ax = plt.subplots(figsize=(10, 8))
+        
+        # Create a mapping from bin numbers to pixels
+        x_coords = []
+        y_coords = []
+        bins = []
+        
+        # Check if we can reshape bin_num to 2D
+        try:
+            bin_map = binned_data.bin_num.reshape(n_y, n_x)
+            # Convert to physical coordinates using meshgrid
+            y_indices, x_indices = np.indices((n_y, n_x))
+            x_phys = (x_indices - n_x/2) * pixel_size_x
+            y_phys = (y_indices - n_y/2) * pixel_size_y
+            
+            # Find all valid bins
+            for bin_id in range(np.max(bin_map) + 1):
+                mask = bin_map == bin_id
+                if np.any(mask):
+                    y_idx, x_idx = np.where(mask)
+                    for i in range(len(y_idx)):
+                        y_coords.append(y_phys[y_idx[i], x_idx[i]])
+                        x_coords.append(x_phys[y_idx[i], x_idx[i]])
+                        bins.append(bin_id)
+        except:
+            # If reshaping fails, try to get pixels from bin_indices
+            if hasattr(binned_data, 'bin_indices') and binned_data.bin_indices:
+                for bin_id, indices in enumerate(binned_data.bin_indices):
+                    for idx in indices:
+                        # Convert linear index to 2D coordinates
+                        y = idx // n_x
+                        x = idx % n_x
+                        if 0 <= y < n_y and 0 <= x < n_x:
+                            # Convert to physical coordinates
+                            x_phys = (x - n_x/2) * pixel_size_x
+                            y_phys = (y - n_y/2) * pixel_size_y
+                            x_coords.append(x_phys)
+                            y_coords.append(y_phys)
+                            bins.append(bin_id)
+            else:
+                # No binning information, plot a placeholder
+                ax.text(0.5, 0.5, "No valid binning data available", 
+                       ha='center', va='center', transform=ax.transAxes)
+                ax.set_title(f'Binning Map - {galaxy_name}')
+                
+                # Save figure and return
+                plt.tight_layout()
+                plt.savefig(plots_dir / f"{galaxy_name}_binning_map.png", dpi=150)
+                plt.close(fig)
+                return
+        
+        # Convert lists to arrays
+        x_coords = np.array(x_coords)
+        y_coords = np.array(y_coords)
+        bins = np.array(bins)
+        
+        # Check if we have any valid bins
+        if len(bins) == 0:
+            ax.text(0.5, 0.5, "No valid binning data available", 
+                   ha='center', va='center', transform=ax.transAxes)
+            ax.set_title(f'Binning Map - {galaxy_name}')
+                
+            # Save figure and return
+            plt.tight_layout()
+            plt.savefig(plots_dir / f"{galaxy_name}_binning_map.png", dpi=150)
+            plt.close(fig)
+            return
+        
+        # Use scatter plot instead of pcolormesh
+        cmap = plt.cm.get_cmap('tab20', max(20, np.max(bins)+1))
+        unique_bins = np.unique(bins)
+        
+        # Plot each bin with a separate call to scatter for proper legend
+        for bin_id in unique_bins:
+            mask = bins == bin_id
+            ax.scatter(x_coords[mask], y_coords[mask], 
+                     color=cmap(bin_id % 20), s=15, alpha=0.7,
+                     label=f'Bin {bin_id}' if bin_id < 5 else None)
+        
+        # Add bin centers if available
+        if x_gen is not None and y_gen is not None:
+            # Convert to physical coordinates
+            x_gen_phys = [(x - n_x/2) * pixel_size_x for x in x_gen]
+            y_gen_phys = [(y - n_y/2) * pixel_size_y for y in y_gen]
+            
+            # Plot bin centers with numbers
+            for i, (x, y) in enumerate(zip(x_gen_phys, y_gen_phys)):
+                if i < len(unique_bins):
+                    ax.plot(x, y, 'ko', markersize=8)
+                    ax.text(x, y, str(i), color='white', fontsize=8, 
+                           ha='center', va='center',
+                           bbox=dict(facecolor='black', alpha=0.7, boxstyle='round,pad=0.1'))
+        
+        # Add SNR values if available
+        if sn is not None and x_gen is not None and y_gen is not None:
+            # Create a separate scatter plot for SNR
+            try:
+                limit = min(len(x_gen_phys), len(y_gen_phys), len(sn))
+                sc = ax.scatter(
+                    x_gen_phys[:limit], 
+                    y_gen_phys[:limit], 
+                    c=sn[:limit], 
+                    cmap='viridis', 
+                    s=30, 
+                    alpha=0.5,
+                    edgecolor='k'
+                )
+                plt.colorbar(sc, ax=ax, label='Signal-to-Noise Ratio')
+            except Exception as e:
+                logger.warning(f"Error adding SNR colorbar: {e}")
+        
+        # Set labels and grid
+        ax.set_xlabel('X (arcsec)')
+        ax.set_ylabel('Y (arcsec)')
+        ax.set_aspect('equal')
+        ax.grid(True, alpha=0.3)
+        ax.set_title(f'Binning Map - {galaxy_name}')
+        
+        # Add legend for first few bins
+        if len(unique_bins) > 0:
+            handles, labels = ax.get_legend_handles_labels()
+            if handles:
+                ax.legend(
+                    handles[:min(5, len(handles))],
+                    labels[:min(5, len(labels))],
+                    loc='upper right', 
+                    fontsize='small'
+                )
+        
+        # Save figure
+        plt.tight_layout()
+        plt.savefig(plots_dir / f"{galaxy_name}_binning_map.png", dpi=150)
+        plt.close(fig)
+        
+        # Create histograms for bin properties
+        # SNR histogram
+        if sn is not None:
+            fig, ax = plt.subplots(figsize=(8, 6))
+            ax.hist(sn, bins=20, color='skyblue', edgecolor='black')
+            
+            # Add target SNR line if available
+            target_snr = binned_data.metadata.get('target_snr', None)
+            if target_snr is not None:
+                ax.axvline(x=target_snr, color='red', linestyle='--', 
+                          label=f'Target SNR = {target_snr:.1f}')
+            
+            # Add median SNR line
+            median_snr = np.nanmedian(sn)
+            ax.axvline(x=median_snr, color='green', linestyle='-', 
+                      label=f'Median SNR = {median_snr:.1f}')
+            
+            ax.set_title(f'Bin SNR Distribution - {galaxy_name}')
+            ax.set_xlabel('Signal-to-Noise Ratio')
+            ax.set_ylabel('Number of Bins')
+            ax.legend()
+            
+            plt.tight_layout()
+            plt.savefig(plots_dir / f"{galaxy_name}_snr_histogram.png", dpi=150)
+            plt.close(fig)
+        
+        # Bin size histogram
+        n_pixels = binned_data.metadata.get('n_pixels', None)
+        if n_pixels is not None:
+            fig, ax = plt.subplots(figsize=(8, 6))
+            ax.hist(n_pixels, bins=20, color='lightgreen', edgecolor='black')
+            
+            median_pixels = np.nanmedian(n_pixels)
+            ax.axvline(x=median_pixels, color='red', linestyle='-', 
+                      label=f'Median Size = {median_pixels:.1f} pixels')
+            
+            ax.set_title(f'Bin Size Distribution - {galaxy_name}')
+            ax.set_xlabel('Number of Pixels per Bin')
+            ax.set_ylabel('Number of Bins')
+            ax.legend()
+            
+            plt.tight_layout()
+            plt.savefig(plots_dir / f"{galaxy_name}_binsize_histogram.png", dpi=150)
+            plt.close(fig)
+        
+        # Bin area in physical units
+        if n_pixels is not None and pixel_size_x > 0:
+            fig, ax = plt.subplots(figsize=(8, 6))
+            
+            bin_areas = n_pixels * (pixel_size_x * pixel_size_y)  # arcsec²
+            ax.hist(bin_areas, bins=20, color='salmon', edgecolor='black')
+            
+            median_area = np.nanmedian(bin_areas)
+            ax.axvline(x=median_area, color='red', linestyle='-', 
+                      label=f'Median Area = {median_area:.2f} arcsec²')
+            
+            ax.set_title(f'Bin Area Distribution - {galaxy_name}')
+            ax.set_xlabel('Area (arcsec²)')
+            ax.set_ylabel('Number of Bins')
+            ax.legend()
+            
+            plt.tight_layout()
+            plt.savefig(plots_dir / f"{galaxy_name}_binsize_histogram.png", dpi=150)
+            plt.close(fig)
+            
+    except Exception as e:
+        logger.error(f"Error creating robust binning plots: {str(e)}")
         logger.error(traceback.format_exc())
