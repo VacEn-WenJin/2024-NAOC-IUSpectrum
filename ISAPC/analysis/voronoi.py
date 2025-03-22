@@ -24,6 +24,10 @@ from binning import (
 from utils.calc import spectres, apply_velocity_shift
 from vorbin.voronoi_2d_binning import voronoi_2d_binning
 
+
+from p2p_adapter import create_p2p_processor, BinnedDataAdapter, extract_bin_results
+from analysis.p2p import run_p2p_analysis
+
 logger = logging.getLogger(__name__)
 
 # Speed of light in km/s
@@ -226,21 +230,21 @@ def run_vnb_analysis(args, cube, p2p_results=None):
             velocity_field = None
     
     try:
-        # Determine the appropriate target SNR range
-        pixel_snr = signal / np.maximum(noise, 1e-10)
+        # Determine per-pixel SNR values
+        pixel_snr = signal / np.maximum(noise, 1e-10)  # Element-wise division for each pixel
         valid_snr = pixel_snr[valid_mask]
         max_pixel_snr = np.nanmax(valid_snr)
         median_snr = np.nanmedian(valid_snr)
         
         logger.info(f"Maximum pixel SNR: {max_pixel_snr:.1f}, Median pixel SNR: {median_snr:.1f}")
         
-        # Determine recommended SNR range based on data characteristics
-        min_recommended_snr = max(min_snr * 2, median_snr * 1.2)
-        max_recommended_snr = min(max_pixel_snr * 0.8, median_snr * 3)
+        # Determine recommended SNR range with wider bounds as suggested
+        min_recommended_snr = min(10, median_snr * 5)
+        max_recommended_snr = max(max_pixel_snr * 0.5, median_snr * 100)
         
         # Ensure min and max are in a reasonable range
-        min_recommended_snr = max(5, min(min_recommended_snr, 40))
-        max_recommended_snr = max(15, min(max_recommended_snr, 50))
+        min_recommended_snr = max(2, min_recommended_snr)  # At least 2
+        max_recommended_snr = max(15, max_recommended_snr)  # At least 15
         
         # If user-specified target_snr is outside the recommended range, adjust
         if target_snr < min_recommended_snr or target_snr > max_recommended_snr:
@@ -286,12 +290,32 @@ def run_vnb_analysis(args, cube, p2p_results=None):
             
             logger.info(f"Running Voronoi binning with {len(x_valid)} valid pixels")
             
-            bin_num, x_gen, y_gen, sn, n_pixels, scale = voronoi_2d_binning(
+            # Handle return values more robustly to accommodate different version of vorbin
+            result = voronoi_2d_binning(
                 x_valid, y_valid, 
                 signal_valid, noise_valid, 
                 safe_target_snr, plot=0, quiet=True, cvt=use_cvt)
-            best_result = (bin_num, x_gen, y_gen, sn, n_pixels, scale)
-            logger.info(f"Voronoi binning succeeded with target SNR = {safe_target_snr:.1f}")
+            
+            # Robust handling of return values
+            if isinstance(result, tuple):
+                # Check length of returned tuple
+                if len(result) >= 6:
+                    # Extract the first 6 values we need
+                    bin_num = result[0]
+                    x_gen = result[1]
+                    y_gen = result[2]
+                    sn = result[3]
+                    n_pixels = result[4]
+                    scale = result[5]
+                    best_result = (bin_num, x_gen, y_gen, sn, n_pixels, scale)
+                    logger.info(f"Voronoi binning succeeded with target SNR = {safe_target_snr:.1f}")
+                else:
+                    # Not enough values
+                    raise ValueError(f"Voronoi binning returned {len(result)} values, expected at least 6")
+            else:
+                # Single return value (unlikely but handle anyway)
+                raise ValueError("Unexpected return format from Voronoi binning")
+                
         except Exception as e:
             success = False
             best_result = None
@@ -312,30 +336,50 @@ def run_vnb_analysis(args, cube, p2p_results=None):
                     logger.info(f"Trying Voronoi binning with target SNR = {snr_value:.1f}, CVT=True")
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore")
-                        bin_num, x_gen, y_gen, sn, n_pixels, scale = voronoi_2d_binning(
+                        result = voronoi_2d_binning(
                             x_valid, y_valid, 
                             signal_valid, noise_valid, 
                             snr_value, plot=0, quiet=True, cvt=True)
-                    
-                    success = True
-                    best_result = (bin_num, x_gen, y_gen, sn, n_pixels, scale)
-                    logger.info(f"Voronoi binning succeeded with target SNR = {snr_value:.1f}")
-                    break
+                        
+                        # Extract the first 6 values
+                        if isinstance(result, tuple) and len(result) >= 6:
+                            bin_num = result[0]
+                            x_gen = result[1]
+                            y_gen = result[2]
+                            sn = result[3]
+                            n_pixels = result[4]
+                            scale = result[5]
+                            best_result = (bin_num, x_gen, y_gen, sn, n_pixels, scale)
+                            success = True
+                            logger.info(f"Voronoi binning succeeded with target SNR = {snr_value:.1f}")
+                            break
+                        else:
+                            raise ValueError("Unexpected return format from Voronoi binning")
                 except Exception as e:
                     # Now try without CVT
                     try:
                         logger.info(f"Trying Voronoi binning with target SNR = {snr_value:.1f}, CVT=False")
                         with warnings.catch_warnings():
                             warnings.simplefilter("ignore")
-                            bin_num, x_gen, y_gen, sn, n_pixels, scale = voronoi_2d_binning(
+                            result = voronoi_2d_binning(
                                 x_valid, y_valid, 
                                 signal_valid, noise_valid, 
                                 snr_value, plot=0, quiet=True, cvt=False)
-                        
-                        success = True
-                        best_result = (bin_num, x_gen, y_gen, sn, n_pixels, scale)
-                        logger.info(f"Voronoi binning succeeded with target SNR = {snr_value:.1f} (CVT=False)")
-                        break
+                            
+                            # Extract the first 6 values
+                            if isinstance(result, tuple) and len(result) >= 6:
+                                bin_num = result[0]
+                                x_gen = result[1]
+                                y_gen = result[2]
+                                sn = result[3]
+                                n_pixels = result[4]
+                                scale = result[5]
+                                best_result = (bin_num, x_gen, y_gen, sn, n_pixels, scale)
+                                success = True
+                                logger.info(f"Voronoi binning succeeded with target SNR = {snr_value:.1f} (CVT=False)")
+                                break
+                            else:
+                                raise ValueError("Unexpected return format from Voronoi binning")
                     except Exception as e2:
                         continue
         
@@ -352,15 +396,25 @@ def run_vnb_analysis(args, cube, p2p_results=None):
                         # Try both with and without CVT
                         for use_cvt_val in [True, False]:
                             try:
-                                bin_num, x_gen, y_gen, sn, n_pixels, scale = voronoi_2d_binning(
+                                result = voronoi_2d_binning(
                                     x_valid, y_valid, 
                                     signal_valid, noise_valid, 
                                     snr_fixed, plot=0, quiet=True, cvt=use_cvt_val)
                                 
-                                success = True
-                                best_result = (bin_num, x_gen, y_gen, sn, n_pixels, scale)
-                                logger.info(f"Voronoi binning succeeded with fixed target SNR = {snr_fixed} (CVT={use_cvt_val})")
-                                break
+                                # Extract values
+                                if isinstance(result, tuple) and len(result) >= 6:
+                                    bin_num = result[0]
+                                    x_gen = result[1]
+                                    y_gen = result[2]
+                                    sn = result[3]
+                                    n_pixels = result[4]
+                                    scale = result[5]
+                                    best_result = (bin_num, x_gen, y_gen, sn, n_pixels, scale)
+                                    success = True
+                                    logger.info(f"Voronoi binning succeeded with fixed target SNR = {snr_fixed} (CVT={use_cvt_val})")
+                                    break
+                                else:
+                                    continue
                             except:
                                 continue
                         if success:
@@ -921,8 +975,6 @@ def run_analysis_on_binned_data(args, binned_data, cube, p2p_results=None):
         logger.info("Running analysis on binned data...")
         
         # Import required modules
-        from p2p_adapter import create_p2p_processor, BinnedDataAdapter, extract_bin_results
-        from analysis.p2p import run_p2p_analysis
         
         # Create P2P processor
         p2p_processor = create_p2p_processor(run_p2p_analysis)
