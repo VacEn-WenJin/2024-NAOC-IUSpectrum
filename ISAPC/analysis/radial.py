@@ -190,11 +190,20 @@ def run_rdb_analysis(args, cube, p2p_results=None):
     
     # Try to load P2P results if not provided but auto-reuse is enabled
     if p2p_results is None and hasattr(args, 'auto_reuse') and args.auto_reuse:
-        from p2p_adapter import load_p2p_results_for_galaxy
-        p2p_results = load_p2p_results_for_galaxy(galaxy_name, args.output_dir)
-        
-        if p2p_results is not None:
-            logger.info("Successfully loaded P2P results for RDB analysis")
+        try:
+            # Try loading from standard paths
+            p2p_results_path = data_dir / f"{galaxy_name}_P2P_results.npz"
+            std_results_path = data_dir / f"{galaxy_name}_P2P_standardized.npz"
+            
+            if p2p_results_path.exists():
+                p2p_results = np.load(p2p_results_path, allow_pickle=True)
+                logger.info("Successfully loaded P2P results for RDB analysis")
+            elif std_results_path.exists():
+                p2p_results = np.load(std_results_path, allow_pickle=True)
+                logger.info("Successfully loaded standardized P2P results for RDB analysis")
+        except Exception as e:
+            logger.warning(f"Error loading P2P results: {e}")
+            p2p_results = None
     
     # Adapt number of rings based on data size
     if hasattr(args, 'n_rings'):
@@ -328,23 +337,55 @@ def run_rdb_analysis(args, cube, p2p_results=None):
             bin_radii=bin_radii
         )
         
-        # Run analysis on binned spectra
-        rdb_results = run_analysis_on_binned_data(args, binned_data, cube, p2p_results)
+        # Set up binning in the cube
+        cube.setup_binning('RDB', binned_data)
         
-        # Create visualization plots
-        if not args.no_plots:
-            create_rdb_plots(args, binned_data, rdb_results, galaxy_name, plots_dir)
+        # Run analysis using the enhanced MUSECube methods
+        velocity_field, dispersion_field, bestfit_field, optimal_tmpls, poly_coeffs = cube.fit_spectra(
+            template_filename=args.template,
+            ppxf_vel_init=args.vel_init,
+            ppxf_vel_disp_init=args.sigma_init,
+            ppxf_deg=args.poly_degree if hasattr(args, 'poly_degree') else 3,
+            n_jobs=args.n_jobs
+        )
         
-        # Prepare output dictionary
-        result_dict = {
+        # Fit emission lines if requested
+        emission_result = None
+        if not args.no_emission:
+            emission_result = cube.fit_emission_lines(
+                template_filename=args.template,
+                ppxf_vel_init=velocity_field,
+                ppxf_sig_init=args.sigma_init,
+                ppxf_deg=2,
+                n_jobs=args.n_jobs
+            )
+        
+        # Calculate spectral indices if requested
+        indices_result = None
+        if not args.no_indices:
+            indices_result = cube.calculate_spectral_indices(
+                n_jobs=args.n_jobs
+            )
+        
+        # Prepare standardized output dictionary
+        rdb_results = {
             'analysis_type': 'RDB',
-            'bin_num': bin_num,
-            'bin_indices': bin_indices,
-            'bin_info': {
-                'bin_radii': bin_radii,
-                'bin_edges': bin_edges
+            'stellar_kinematics': {
+                'velocity': cube._bin_velocity,
+                'dispersion': cube._bin_dispersion,
+                'velocity_field': velocity_field,
+                'dispersion_field': dispersion_field
             },
-            'parameters': {
+            'distance': {
+                'bin_distances': bin_radii,
+                'pixelsize_x': cube._pxl_size_x,
+                'pixelsize_y': cube._pxl_size_y
+            },
+            'binning': {
+                'bin_num': bin_num,
+                'bin_indices': bin_indices,
+                'bin_radii': bin_radii,
+                'bin_edges': bin_edges,
                 'center_x': center_x,
                 'center_y': center_y,
                 'pa': pa,
@@ -354,15 +395,52 @@ def run_rdb_analysis(args, cube, p2p_results=None):
             }
         }
         
-        # Add analysis results
-        result_dict.update(rdb_results)
+        # Add emission line results if available
+        if emission_result is not None:
+            rdb_results['emission'] = {}
+            
+            # Copy emission line fields from cube if available
+            if hasattr(cube, '_bin_emission_flux'):
+                rdb_results['emission']['flux'] = cube._bin_emission_flux
+            if hasattr(cube, '_bin_emission_vel'):
+                rdb_results['emission']['velocity'] = cube._bin_emission_vel
+            if hasattr(cube, '_bin_emission_sig'):
+                rdb_results['emission']['dispersion'] = cube._bin_emission_sig
+                
+            # Copy emission fields from emission_result
+            for key in ['emission_flux', 'emission_vel', 'emission_sig']:
+                if key in emission_result:
+                    field_name = key.split('_')[1]  # extract 'flux', 'vel', 'sig'
+                    rdb_results['emission'][field_name] = emission_result[key]
+                    
+            # Add emission line wavelengths if available
+            if 'emission_wavelength' in emission_result:
+                rdb_results['emission']['wavelengths'] = emission_result['emission_wavelength']
+        
+        # Add spectral indices if available
+        if indices_result is not None:
+            rdb_results['indices'] = indices_result
+            
+            # Add bin-level indices if available
+            if hasattr(cube, '_bin_indices_result'):
+                rdb_results['bin_indices'] = cube._bin_indices_result
+        
+        # Save binned data object
+        binned_data_path = data_dir / f"{galaxy_name}_RDB_binned_data.npz"
+        binned_data.save(binned_data_path)
+        logger.info(f"Saved binned data to {binned_data_path}")
         
         # Save results
-        save_standardized_results(galaxy_name, 'RDB', result_dict, output_dir)
+        save_standardized_results(galaxy_name, 'RDB', rdb_results, output_dir)
+        
+        # Create visualization plots if requested
+        if not hasattr(args, 'no_plots') or not args.no_plots:
+            binned_data.create_visualization_plots(plots_dir, galaxy_name)
+            create_rdb_plots(cube, rdb_results, galaxy_name, plots_dir, args)
         
         logger.info(f"RDB analysis completed in {time.time() - start_time:.1f} seconds")
         
-        return result_dict
+        return rdb_results
     
     except Exception as e:
         logger.error(f"Error in RDB analysis: {str(e)}")
@@ -374,686 +452,225 @@ def run_rdb_analysis(args, cube, p2p_results=None):
             'error': str(e)
         }
 
-def run_analysis_on_binned_data(args, binned_data, cube, p2p_results=None):
-    """
-    Run additional analysis on binned data (stellar population, emission lines, etc.)
-    
-    Parameters
-    ----------
-    args : argparse.Namespace
-        Command line arguments
-    binned_data : RadialBinnedData
-        Binned data object
-    cube : MUSECube
-        Original MUSE cube
-    p2p_results : dict, optional
-        P2P analysis results
-        
-    Returns
-    -------
-    dict
-        Analysis results
-    """
-    try:
-        logger.info("Running analysis on binned data...")
-        
-        # Import required modules
-        from p2p_adapter import create_p2p_processor, BinnedDataAdapter, extract_bin_results
-        from analysis.p2p import run_p2p_analysis
-        
-        # Create P2P processor
-        p2p_processor = create_p2p_processor(run_p2p_analysis)
-        
-        # Run P2P analysis on binned data
-        bin_p2p_results = p2p_processor(args, binned_data, p2p_results)
-        
-        # Extract bin results
-        bin_adapter = BinnedDataAdapter(binned_data)
-        results = extract_bin_results(bin_p2p_results, bin_adapter, result_type='rdb')
-        
-        # Format results for consistency with RDB output
-        formatted_results = {
-            'stellar_kinematics': {
-                'velocity': bin_p2p_results.get('velocity_field', None),
-                'dispersion': bin_p2p_results.get('dispersion_field', None)
-            },
-            'distance': {
-                'bin_distances': binned_data.bin_radii,
-                'pixelsize_x': cube._pxl_size_x,
-                'pixelsize_y': cube._pxl_size_y
-            }
-        }
-        
-        # Add emission line results if available
-        if 'emission' in bin_p2p_results:
-            formatted_results['emission'] = {}
-            
-            # Process each emission line parameter
-            for key, value in bin_p2p_results['emission'].items():
-                if isinstance(value, np.ndarray) and value.shape == (cube._n_y, cube._n_x):
-                    # Extract values for each radial bin
-                    bin_values = []
-                    for i, indices in enumerate(binned_data.bin_indices):
-                        if len(indices) > 0:
-                            # Get pixel coordinates for this bin
-                            y_indices = [idx // cube._n_x for idx in indices]
-                            x_indices = [idx % cube._n_x for idx in indices]
-                            
-                            # Extract values and compute median
-                            bin_pixels = [value[y, x] for y, x in zip(y_indices, x_indices) 
-                                         if 0 <= y < value.shape[0] and 0 <= x < value.shape[1]]
-                            
-                            if bin_pixels:
-                                bin_values.append(np.nanmedian(bin_pixels))
-                            else:
-                                bin_values.append(np.nan)
-                        else:
-                            bin_values.append(np.nan)
-                    
-                    formatted_results['emission'][key] = np.array(bin_values)
-                else:
-                    formatted_results['emission'][key] = value
-        
-        # Add spectral indices if available
-        if 'indices' in bin_p2p_results:
-            formatted_results['indices'] = {}
-            
-            # Process each index
-            for index_name, index_map in bin_p2p_results['indices'].items():
-                if isinstance(index_map, np.ndarray) and index_map.shape == (cube._n_y, cube._n_x):
-                    # Extract values for each radial bin
-                    bin_values = []
-                    for i, indices in enumerate(binned_data.bin_indices):
-                        if len(indices) > 0:
-                            # Get pixel coordinates for this bin
-                            y_indices = [idx // cube._n_x for idx in indices]
-                            x_indices = [idx % cube._n_x for idx in indices]
-                            
-                            # Extract values and compute median
-                            bin_pixels = [index_map[y, x] for y, x in zip(y_indices, x_indices) 
-                                         if 0 <= y < index_map.shape[0] and 0 <= x < index_map.shape[1]]
-                            
-                            if bin_pixels:
-                                bin_values.append(np.nanmedian(bin_pixels))
-                            else:
-                                bin_values.append(np.nan)
-                        else:
-                            bin_values.append(np.nan)
-                    
-                    formatted_results['indices'][index_name] = np.array(bin_values)
-                else:
-                    formatted_results['indices'][index_name] = index_map
-        
-        # Add stellar population parameters if available
-        if 'stellar_population' in bin_p2p_results:
-            formatted_results['stellar_population'] = {}
-            
-            # Process each parameter
-            for param_name, param_map in bin_p2p_results['stellar_population'].items():
-                if isinstance(param_map, np.ndarray) and param_map.shape == (cube._n_y, cube._n_x):
-                    # Extract values for each radial bin
-                    bin_values = []
-                    for i, indices in enumerate(binned_data.bin_indices):
-                        if len(indices) > 0:
-                            # Get pixel coordinates for this bin
-                            y_indices = [idx // cube._n_x for idx in indices]
-                            x_indices = [idx % cube._n_x for idx in indices]
-                            
-                            # Extract values and compute median
-                            bin_pixels = [param_map[y, x] for y, x in zip(y_indices, x_indices) 
-                                         if 0 <= y < param_map.shape[0] and 0 <= x < param_map.shape[1]]
-                            
-                            if bin_pixels:
-                                bin_values.append(np.nanmedian(bin_pixels))
-                            else:
-                                bin_values.append(np.nan)
-                        else:
-                            bin_values.append(np.nan)
-                    
-                    formatted_results['stellar_population'][param_name] = np.array(bin_values)
-                else:
-                    formatted_results['stellar_population'][param_name] = param_map
-        
-        return formatted_results
-    
-    except Exception as e:
-        logger.error(f"Error in analysis on binned data: {str(e)}")
-        logger.error(traceback.format_exc())
-        return {}
-
-
-# Add this function to help plotting stellar population parameters
-def plot_stellar_parameter(ax, bin_map_2d, param_values, param_name, i):
-    """Helper function to plot stellar population parameters correctly"""
-    # Handle different dimension cases
-    param_map = np.zeros_like(bin_map_2d, dtype=float)
-    param_map.fill(np.nan)  # Fill with NaN initially
-    
-    try:
-        # For different parameter dimension cases
-        if not isinstance(param_values, np.ndarray):
-            # Not an array - skip
-            ax.text(0.5, 0.5, f"No valid {param_name} data", 
-                   ha='center', va='center', transform=ax.transAxes)
-            return
-        
-        # Handle 1D arrays
-        if len(param_values.shape) == 1:
-            # Fill bin map with corresponding values
-            for j, value in enumerate(param_values):
-                if j < len(param_values) and np.isfinite(value):
-                    param_map[bin_map_2d == j] = value
-        
-        # Handle 2D arrays
-        elif len(param_values.shape) == 2:
-            # Direct copy if shapes match
-            if param_values.shape == param_map.shape:
-                param_map[:] = param_values
-            else:
-                # Try to reshape
-                try:
-                    reshaped = param_values.reshape(param_map.shape)
-                    param_map[:] = reshaped
-                except:
-                    # Fall back to bin-by-bin assignment
-                    for j in range(np.max(bin_map_2d) + 1):
-                        mask = bin_map_2d == j
-                        if np.any(mask) and j < param_values.size:
-                            param_map[mask] = param_values.flat[j]
-                    
-        # For higher dimensions, flatten and use what we can
-        else:
-            flat_param = param_values.flatten()
-            for j in range(min(np.max(bin_map_2d) + 1, len(flat_param))):
-                mask = bin_map_2d == j
-                if np.any(mask) and j < len(flat_param):
-                    param_map[mask] = flat_param[j]
-        
-        # Adjust display for age
-        if param_name == 'age':
-            param_map = param_map * 1e-9  # Convert to Gyr
-            label = 'Age (Gyr)'
-        elif param_name == 'log_age':
-            label = 'Log Age (yr)'
-        elif param_name == 'metallicity':
-            label = 'Metallicity [Z/H]'
-        else:
-            label = param_name
-            
-        # Check if we have valid data
-        valid_param = param_map[np.isfinite(param_map)]
-        if len(valid_param) > 0:
-            vmin = np.percentile(valid_param, 5)
-            vmax = np.percentile(valid_param, 95)
-            im = ax.imshow(param_map, origin='lower', cmap='plasma',
-                         vmin=vmin, vmax=vmax)
-            plt.colorbar(im, ax=ax, label=label)
-            ax.set_title(f'Stellar {label} Map')
-        else:
-            ax.text(0.5, 0.5, f"No valid {param_name} data", 
-                   ha='center', va='center', transform=ax.transAxes)
-    except Exception as e:
-        logger.warning(f"Error plotting {param_name}: {e}")
-        ax.text(0.5, 0.5, f"Error plotting {param_name}", 
-               ha='center', va='center', transform=ax.transAxes)
-
-
-def create_rdb_plots(args, binned_data, rdb_results, galaxy_name, plots_dir):
+def create_rdb_plots(cube, rdb_results, galaxy_name, plots_dir, args):
     """
     Create visualization plots for RDB analysis
     
     Parameters
     ----------
-    args : argparse.Namespace
-        Command line arguments
-    binned_data : RadialBinnedData
-        Binned data object
+    cube : MUSECube
+        MUSE cube with binned data
     rdb_results : dict
         RDB analysis results
     galaxy_name : str
         Galaxy name
     plots_dir : Path
         Directory to save plots
+    args : argparse.Namespace
+        Command line arguments
     """
     try:
-        # Create basic binning plots
-        binned_data.create_visualization_plots(plots_dir, galaxy_name)
+        import visualization
         
-        # Create radial profile plots
-        n_y, n_x = binned_data.bin_num.reshape(-1, 1).shape if hasattr(binned_data.bin_num, 'shape') else (1, len(binned_data.bin_num))
+        # Create radial profiles of key parameters
         
         # Create kinematics radial profile
-        if 'stellar_kinematics' in rdb_results:
-            velocity = rdb_results['stellar_kinematics'].get('velocity', None)
-            dispersion = rdb_results['stellar_kinematics'].get('dispersion', None)
-            
-            if velocity is not None and dispersion is not None and np.any(np.isfinite(velocity)) and np.any(np.isfinite(dispersion)):
-                try:
-                    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-                    
-                    # Ensure bin_radii and velocity/dispersion have the same length
-                    radii = binned_data.bin_radii
-                    if len(radii) != len(velocity):
-                        # Keep only common length
-                        common_length = min(len(radii), len(velocity))
-                        radii = radii[:common_length]
-                        velocity = velocity[:common_length]
-                        dispersion = dispersion[:common_length] if len(dispersion) >= common_length else dispersion
-                    
-                    # Filter out NaN values
-                    vel_mask = np.isfinite(velocity)
-                    disp_mask = np.isfinite(dispersion)
-                    
-                    # Plot velocity profile
-                    if np.any(vel_mask):
-                        axes[0].plot(radii[vel_mask], velocity[vel_mask], 'o-', label='Velocity')
-                        axes[0].set_xlabel('Radius (arcsec)')
-                        axes[0].set_ylabel('Velocity (km/s)')
-                        axes[0].set_title('Stellar Velocity Profile')
-                        axes[0].grid(True, alpha=0.3)
-                    else:
-                        axes[0].text(0.5, 0.5, "No valid velocity data", 
-                                  ha='center', va='center', transform=axes[0].transAxes)
-                    
-                    # Plot dispersion profile
-                    if np.any(disp_mask):
-                        axes[1].plot(radii[disp_mask], dispersion[disp_mask], 'o-', label='Dispersion')
-                        axes[1].set_xlabel('Radius (arcsec)')
-                        axes[1].set_ylabel('Dispersion (km/s)')
-                        axes[1].set_title('Stellar Dispersion Profile')
-                        axes[1].grid(True, alpha=0.3)
-                    else:
-                        axes[1].text(0.5, 0.5, "No valid dispersion data", 
-                                  ha='center', va='center', transform=axes[1].transAxes)
-                    
-                    plt.tight_layout()
-                    plt.savefig(plots_dir / f"{galaxy_name}_rdb_kinematics_profile.png", dpi=150)
-                    plt.close(fig)
-                    
-                    # Create 2D bin map with kinematics
-                    try:
-                        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-                        
-                        # Create 2D bin map
-                        bin_map_2d = binned_data.bin_num.reshape(n_y, n_x)
-                        
-                        # Plot velocity map
-                        velocity_map = np.zeros_like(bin_map_2d, dtype=float)
-                        velocity_map.fill(np.nan)  # Fill with NaN initially
-                        for i, vel in enumerate(velocity):
-                            if i < len(velocity) and np.isfinite(vel):
-                                velocity_map[bin_map_2d == i] = vel
-                        
-                        # Check if we have valid data
-                        if np.any(np.isfinite(velocity_map)):
-                            valid_vel = velocity_map[np.isfinite(velocity_map)]
-                            vmin = np.percentile(valid_vel, 5)
-                            vmax = np.percentile(valid_vel, 95)
-                            im0 = axes[0].imshow(velocity_map, origin='lower', cmap='coolwarm',
-                                              vmin=vmin, vmax=vmax)
-                            plt.colorbar(im0, ax=axes[0], label='Velocity (km/s)')
-                        else:
-                            axes[0].text(0.5, 0.5, "No valid velocity data", 
-                                      ha='center', va='center', transform=axes[0].transAxes)
-                        axes[0].set_title('Stellar Velocity Map')
-                        
-                        # Plot dispersion map
-                        dispersion_map = np.zeros_like(bin_map_2d, dtype=float)
-                        dispersion_map.fill(np.nan)  # Fill with NaN initially
-                        for i, disp in enumerate(dispersion):
-                            if i < len(dispersion) and np.isfinite(disp):
-                                dispersion_map[bin_map_2d == i] = disp
-                        
-                        # Check if we have valid data
-                        if np.any(np.isfinite(dispersion_map)):
-                            valid_disp = dispersion_map[np.isfinite(dispersion_map)]
-                            vmin = np.percentile(valid_disp, 5)
-                            vmax = np.percentile(valid_disp, 95)
-                            im1 = axes[1].imshow(dispersion_map, origin='lower', cmap='viridis', 
-                                              vmin=vmin, vmax=vmax)
-                            plt.colorbar(im1, ax=axes[1], label='Dispersion (km/s)')
-                        else:
-                            axes[1].text(0.5, 0.5, "No valid dispersion data", 
-                                      ha='center', va='center', transform=axes[1].transAxes)
-                        axes[1].set_title('Stellar Dispersion Map')
-                        
-                        plt.tight_layout()
-                        plt.savefig(plots_dir / f"{galaxy_name}_rdb_kinematics_map.png", dpi=150)
-                        plt.close(fig)
-                    except Exception as e:
-                        logger.warning(f"Error creating 2D kinematics maps: {str(e)}")
-                except Exception as e:
-                    logger.warning(f"Error creating kinematics profile plots: {str(e)}")
-        
-        # Create stellar population radial profiles
-        if 'stellar_population' in rdb_results:
+        if 'stellar_kinematics' in rdb_results and 'bin_distances' in rdb_results.get('distance', {}):
             try:
-                params = rdb_results['stellar_population']
-                param_names = list(params.keys())
+                bin_radii = rdb_results['distance']['bin_distances']
+                velocity = rdb_results['stellar_kinematics']['velocity']
+                dispersion = rdb_results['stellar_kinematics']['dispersion']
                 
-                if param_names:
-                    fig, axes = plt.subplots(1, len(param_names), figsize=(4 * len(param_names), 4))
-                    if len(param_names) == 1:
-                        axes = [axes]
-                    
-                    for i, param_name in enumerate(param_names):
-                        param_values = params[param_name]
-                        
-                        # Ensure bin_radii and param_values have the same length
-                        radii = binned_data.bin_radii
-                        if len(radii) != len(param_values):
-                            # Keep only common length
-                            common_length = min(len(radii), len(param_values))
-                            radii = radii[:common_length]
-                            param_values = param_values[:common_length]
-                        
-                        # Filter out NaN values
-                        valid_mask = np.isfinite(param_values) & np.isfinite(radii)
-                        
-                        if np.any(valid_mask):
-                            # Adjust display for age
-                            if param_name == 'age':
-                                param_values = param_values * 1e-9  # Convert to Gyr
-                                label = 'Age (Gyr)'
-                            elif param_name == 'log_age':
-                                label = 'Log Age (yr)'
-                            elif param_name == 'metallicity':
-                                label = 'Metallicity [Z/H]'
-                            else:
-                                label = param_name
-                            
-                            axes[i].plot(radii[valid_mask], param_values[valid_mask], 'o-')
-                            axes[i].set_xlabel('Radius (arcsec)')
-                            axes[i].set_ylabel(label)
-                            axes[i].set_title(f'Stellar {label} Profile')
-                            axes[i].grid(True, alpha=0.3)
-                        else:
-                            axes[i].text(0.5, 0.5, f"No valid {param_name} data", 
-                                      ha='center', va='center', transform=axes[i].transAxes)
-                    
-                    plt.tight_layout()
-                    plt.savefig(plots_dir / f"{galaxy_name}_rdb_stellar_pop_profile.png", dpi=150)
-                    plt.close(fig)
-                    
-                    # Create 2D maps of stellar population parameters
-                    # Replace the 2D stellar population maps section in create_rdb_plots with:
-                    # In create_rdb_plots, replace the stellar population plotting code with:
-
-                    # Create stellar population radial profiles
-                    if 'stellar_population' in rdb_results:
-                        try:
-                            from visualization import safe_plot_array
-                            
-                            params = rdb_results['stellar_population']
-                            param_names = list(params.keys())
-                            
-                            if param_names:
-                                # 1. Create profile plots
-                                fig, axes = plt.subplots(1, len(param_names), figsize=(4 * len(param_names), 4))
-                                if len(param_names) == 1:
-                                    axes = [axes]
-                                
-                                for i, param_name in enumerate(param_names):
-                                    param_values = params[param_name]
-                                    
-                                    # Ensure bin_radii and param_values have the same length
-                                    radii = binned_data.bin_radii
-                                    if len(radii) != len(param_values):
-                                        # Keep only common length
-                                        common_length = min(len(radii), len(param_values))
-                                        radii = radii[:common_length]
-                                        param_values = param_values[:common_length]
-                                    
-                                    # Filter out NaN values
-                                    valid_mask = np.isfinite(param_values) & np.isfinite(radii)
-                                    
-                                    if np.any(valid_mask):
-                                        # Adjust display for age
-                                        if param_name == 'age':
-                                            param_values = param_values * 1e-9  # Convert to Gyr
-                                            label = 'Age (Gyr)'
-                                        elif param_name == 'log_age':
-                                            label = 'Log Age (yr)'
-                                        elif param_name == 'metallicity':
-                                            label = 'Metallicity [Z/H]'
-                                        else:
-                                            label = param_name
-                                        
-                                        axes[i].plot(radii[valid_mask], param_values[valid_mask], 'o-')
-                                        axes[i].set_xlabel('Radius (arcsec)')
-                                        axes[i].set_ylabel(label)
-                                        axes[i].set_title(f'Stellar {label} Profile')
-                                        axes[i].grid(True, alpha=0.3)
-                                    else:
-                                        axes[i].text(0.5, 0.5, f"No valid {param_name} data", 
-                                                ha='center', va='center', transform=axes[i].transAxes)
-                                
-                                plt.tight_layout()
-                                plt.savefig(plots_dir / f"{galaxy_name}_rdb_stellar_pop_profile.png", dpi=150)
-                                plt.close(fig)
-                                
-                                # 2. Create 2D maps of stellar population parameters using safe function
-                                try:
-                                    fig, axes = plt.subplots(1, len(param_names), figsize=(4 * len(param_names), 4))
-                                    if len(param_names) == 1:
-                                        axes = [axes]
-                                    
-                                    # Create 2D bin map
-                                    bin_map_2d = binned_data.bin_num.reshape(n_y, n_x)
-                                    
-                                    for i, param_name in enumerate(param_names):
-                                        param_values = params[param_name]
-                                        
-                                        # Adjust display for age
-                                        if param_name == 'age':
-                                            # Convert to Gyr before plotting
-                                            if isinstance(param_values, np.ndarray):
-                                                param_values = param_values * 1e-9
-                                            label = 'Age (Gyr)'
-                                        elif param_name == 'log_age':
-                                            label = 'Log Age (yr)'
-                                        elif param_name == 'metallicity':
-                                            label = 'Metallicity [Z/H]'
-                                        else:
-                                            label = param_name
-                                        
-                                        # Use safe plotting function
-                                        safe_plot_array(
-                                            param_values, 
-                                            bin_map_2d, 
-                                            ax=axes[i], 
-                                            title=f'Stellar {label}', 
-                                            cmap='plasma', 
-                                            label=label
-                                        )
-                                    
-                                    plt.tight_layout()
-                                    plt.savefig(plots_dir / f"{galaxy_name}_rdb_stellar_pop_map.png", dpi=150)
-                                    plt.close(fig)
-                                except Exception as e:
-                                    logger.warning(f"Error creating 2D stellar population maps: {str(e)}")
-                                    plt.close('all')
-                                    
-                        except Exception as e:
-                            logger.warning(f"Error creating stellar population plots: {str(e)}")
-                            plt.close('all')
+                # Create radial velocity profile
+                fig, ax = plt.subplots(figsize=(10, 6))
+                ax.plot(bin_radii, velocity, 'o-', label='Velocity')
+                ax.set_xlabel('Radius (arcsec)')
+                ax.set_ylabel('Velocity (km/s)')
+                ax.set_title(f"{galaxy_name} - Radial Velocity Profile")
+                ax.grid(True, alpha=0.3)
+                plt.savefig(plots_dir / f"{galaxy_name}_RDB_velocity_profile.png", dpi=150)
+                plt.close(fig)
+                
+                # Create radial dispersion profile
+                fig, ax = plt.subplots(figsize=(10, 6))
+                ax.plot(bin_radii, dispersion, 'o-', label='Dispersion')
+                ax.set_xlabel('Radius (arcsec)')
+                ax.set_ylabel('Dispersion (km/s)')
+                ax.set_title(f"{galaxy_name} - Radial Dispersion Profile")
+                ax.grid(True, alpha=0.3)
+                plt.savefig(plots_dir / f"{galaxy_name}_RDB_dispersion_profile.png", dpi=150)
+                plt.close(fig)
+                
+                # Create combined kinematics plot
+                fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+                
+                # Plot velocity profile
+                axes[0].plot(bin_radii, velocity, 'o-', label='Velocity')
+                axes[0].set_xlabel('Radius (arcsec)')
+                axes[0].set_ylabel('Velocity (km/s)')
+                axes[0].set_title('Stellar Velocity Profile')
+                axes[0].grid(True, alpha=0.3)
+                
+                # Plot dispersion profile
+                axes[1].plot(bin_radii, dispersion, 'o-', label='Dispersion')
+                axes[1].set_xlabel('Radius (arcsec)')
+                axes[1].set_ylabel('Dispersion (km/s)')
+                axes[1].set_title('Stellar Dispersion Profile')
+                axes[1].grid(True, alpha=0.3)
+                
+                plt.tight_layout()
+                plt.savefig(plots_dir / f"{galaxy_name}_RDB_kinematics_profile.png", dpi=150)
+                plt.close(fig)
+                
+                # Also create 2D maps of the radial bins
+                bin_num = rdb_results['binning']['bin_num']
+                
+                # Velocity map
+                fig, ax = plt.subplots(figsize=(10, 8))
+                visualization.plot_bin_map(
+                    bin_num, 
+                    velocity, 
+                    ax=ax, 
+                    cmap='coolwarm',
+                    title=f'{galaxy_name} - RDB Velocity',
+                    vmin=np.percentile(velocity[np.isfinite(velocity)], 5),
+                    vmax=np.percentile(velocity[np.isfinite(velocity)], 95),
+                    colorbar_label='Velocity (km/s)'
+                )
+                plt.savefig(plots_dir / f"{galaxy_name}_RDB_velocity_map.png", dpi=150)
+                plt.close(fig)
+                
+                # Dispersion map
+                fig, ax = plt.subplots(figsize=(10, 8))
+                visualization.plot_bin_map(
+                    bin_num, 
+                    dispersion, 
+                    ax=ax, 
+                    cmap='viridis',
+                    title=f'{galaxy_name} - RDB Dispersion',
+                    vmin=np.percentile(dispersion[np.isfinite(dispersion)], 5),
+                    vmax=np.percentile(dispersion[np.isfinite(dispersion)], 95),
+                    colorbar_label='Dispersion (km/s)'
+                )
+                plt.savefig(plots_dir / f"{galaxy_name}_RDB_dispersion_map.png", dpi=150)
+                plt.close(fig)
             except Exception as e:
-                logger.warning(f"Error creating stellar population plots: {str(e)}")
+                logger.warning(f"Error creating kinematics plots: {e}")
+                plt.close('all')
         
-        # Create emission line plots
-        if 'emission' in rdb_results:
+        # Create emission line plots if available
+        if 'emission' in rdb_results and 'bin_distances' in rdb_results.get('distance', {}):
             try:
+                bin_radii = rdb_results['distance']['bin_distances']
                 emission = rdb_results['emission']
+                bin_num = rdb_results['binning']['bin_num']
                 
-                # Find flux maps
-                flux_maps = {}
-                for key, value in emission.items():
-                    if key.startswith('flux_') and isinstance(value, np.ndarray):
-                        line_name = key[5:]  # Remove 'flux_' prefix
-                        flux_maps[line_name] = value
-                
-                if flux_maps:
-                    n_lines = min(len(flux_maps), 6)  # Show at most 6 lines
-                    fig, axes = plt.subplots(1, n_lines, figsize=(4 * n_lines, 4))
-                    if n_lines == 1:
-                        axes = [axes]
-                    
-                    for i, (line_name, flux) in enumerate(list(flux_maps.items())[:n_lines]):
-                        # Ensure bin_radii and flux have the same length
-                        radii = binned_data.bin_radii
-                        if len(radii) != len(flux):
-                            # Keep only common length
-                            common_length = min(len(radii), len(flux))
-                            radii = radii[:common_length]
-                            flux = flux[:common_length]
+                # Find emission flux maps
+                for line_name, flux in emission.get('flux', {}).items():
+                    if isinstance(flux, np.ndarray) and len(flux) > 0:
+                        # Radial profile
+                        fig, ax = plt.subplots(figsize=(10, 6))
+                        ax.plot(bin_radii, flux, 'o-', label=line_name)
+                        ax.set_xlabel('Radius (arcsec)')
+                        ax.set_ylabel('Flux')
+                        ax.set_title(f"{galaxy_name} - {line_name} Radial Profile")
+                        ax.grid(True, alpha=0.3)
                         
-                        # Filter out NaN values
-                        valid_mask = np.isfinite(flux) & np.isfinite(radii)
-                        
-                        if np.any(valid_mask):
-                            axes[i].plot(radii[valid_mask], flux[valid_mask], 'o-')
-                            axes[i].set_xlabel('Radius (arcsec)')
-                            axes[i].set_ylabel('Flux')
-                            axes[i].set_title(f'{line_name} Flux Profile')
-                            axes[i].grid(True, alpha=0.3)
+                        # Try using log scale for y-axis if all values are positive
+                        if np.all(flux[np.isfinite(flux)] > 0):
+                            ax.set_yscale('log')
                             
-                            # Use log scale for y-axis if all values are positive
-                            if np.all(flux[valid_mask] > 0):
-                                axes[i].set_yscale('log')
-                        else:
-                            axes[i].text(0.5, 0.5, f"No valid {line_name} data", 
-                                      ha='center', va='center', transform=axes[i].transAxes)
-                    
-                    plt.tight_layout()
-                    plt.savefig(plots_dir / f"{galaxy_name}_rdb_emission_profile.png", dpi=150)
-                    plt.close(fig)
-                    
-                    # Create 2D maps of emission line fluxes
-                    try:
-                        fig, axes = plt.subplots(1, n_lines, figsize=(4 * n_lines, 4))
-                        if n_lines == 1:
-                            axes = [axes]
-                        
-                        # Create 2D bin map
-                        bin_map_2d = binned_data.bin_num.reshape(n_y, n_x)
-                        
-                        for i, (line_name, flux) in enumerate(list(flux_maps.items())[:n_lines]):
-                            flux_map = np.zeros_like(bin_map_2d, dtype=float)
-                            flux_map.fill(np.nan)  # Fill with NaN initially
-                            for j, value in enumerate(flux):
-                                if j < len(flux) and np.isfinite(value):
-                                    flux_map[bin_map_2d == j] = value
-                            
-                            # Check if we have valid data
-                            if np.any(np.isfinite(flux_map) & (flux_map > 0)):
-                                # Use log scale for better visualization
-                                with np.errstate(divide='ignore', invalid='ignore'):
-                                    log_flux_map = np.log10(flux_map)
-                                    # Mark non-finite values as NaN
-                                    log_flux_map[~np.isfinite(log_flux_map)] = np.nan
-                                
-                                valid_log_flux = log_flux_map[np.isfinite(log_flux_map)]
-                                if len(valid_log_flux) > 0:
-                                    vmin = np.percentile(valid_log_flux, 5)
-                                    vmax = np.percentile(valid_log_flux, 95)
-                                    im = axes[i].imshow(log_flux_map, origin='lower', cmap='inferno',
-                                                     vmin=vmin, vmax=vmax)
-                                    plt.colorbar(im, ax=axes[i], label='Log Flux')
-                                else:
-                                    axes[i].text(0.5, 0.5, f"No valid {line_name} data", 
-                                              ha='center', va='center', transform=axes[i].transAxes)
-                            else:
-                                axes[i].text(0.5, 0.5, f"No valid {line_name} data", 
-                                          ha='center', va='center', transform=axes[i].transAxes)
-                            axes[i].set_title(f'{line_name} Flux Map')
-                        
-                        plt.tight_layout()
-                        plt.savefig(plots_dir / f"{galaxy_name}_rdb_emission_map.png", dpi=150)
+                        plt.savefig(plots_dir / f"{galaxy_name}_RDB_{line_name}_profile.png", dpi=150)
                         plt.close(fig)
-                    except Exception as e:
-                        logger.warning(f"Error creating 2D emission line maps: {str(e)}")
+                        
+                        # 2D map
+                        fig, ax = plt.subplots(figsize=(10, 8))
+                        visualization.plot_bin_map(
+                            bin_num, 
+                            flux, 
+                            ax=ax, 
+                            cmap='inferno',
+                            title=f'{galaxy_name} - RDB {line_name} Flux',
+                            log_scale=True,
+                            colorbar_label='Log Flux'
+                        )
+                        plt.savefig(plots_dir / f"{galaxy_name}_RDB_{line_name}_map.png", dpi=150)
+                        plt.close(fig)
             except Exception as e:
-                logger.warning(f"Error creating emission line plots: {str(e)}")
+                logger.warning(f"Error creating emission line plots: {e}")
+                plt.close('all')
         
-        # Create spectral indices plots
-        if 'indices' in rdb_results:
+        # Create spectral indices plots if available
+        if 'indices' in rdb_results and 'bin_distances' in rdb_results.get('distance', {}):
             try:
-                indices = rdb_results['indices']
-                index_names = list(indices.keys())
+                bin_radii = rdb_results['distance']['bin_distances']
+                bin_num = rdb_results['binning']['bin_num']
                 
-                if index_names:
-                    n_indices = min(len(index_names), 6)  # Show at most 6 indices
-                    fig, axes = plt.subplots(1, n_indices, figsize=(4 * n_indices, 4))
-                    if n_indices == 1:
-                        axes = [axes]
-                    
-                    for i, index_name in enumerate(index_names[:n_indices]):
-                        index_values = indices[index_name]
-                        
-                        # Ensure bin_radii and index_values have the same length
-                        radii = binned_data.bin_radii
-                        if len(radii) != len(index_values):
-                            # Keep only common length
-                            common_length = min(len(radii), len(index_values))
-                            radii = radii[:common_length]
-                            index_values = index_values[:common_length]
-                        
-                        # Filter out NaN values
-                        valid_mask = np.isfinite(index_values) & np.isfinite(radii)
-                        
-                        if np.any(valid_mask):
-                            axes[i].plot(radii[valid_mask], index_values[valid_mask], 'o-')
-                            axes[i].set_xlabel('Radius (arcsec)')
-                            axes[i].set_ylabel('Index Value')
-                            axes[i].set_title(f'{index_name} Index Profile')
-                            axes[i].grid(True, alpha=0.3)
-                        else:
-                            axes[i].text(0.5, 0.5, f"No valid {index_name} data", 
-                                      ha='center', va='center', transform=axes[i].transAxes)
-                    
-                    plt.tight_layout()
-                    plt.savefig(plots_dir / f"{galaxy_name}_rdb_indices_profile.png", dpi=150)
-                    plt.close(fig)
-                    
-                    # Create 2D maps of spectral indices
-                    try:
-                        fig, axes = plt.subplots(1, n_indices, figsize=(4 * n_indices, 4))
-                        if n_indices == 1:
-                            axes = [axes]
-                        
-                        # Create 2D bin map
-                        bin_map_2d = binned_data.bin_num.reshape(n_y, n_x)
-                        
-                        for i, index_name in enumerate(index_names[:n_indices]):
-                            index_values = indices[index_name]
+                indices_found = False
+                
+                # Try bin indices first
+                if 'bin_indices' in rdb_results:
+                    for idx_name, idx_values in rdb_results['bin_indices'].items():
+                        if isinstance(idx_values, np.ndarray) and len(idx_values) == len(bin_radii):
+                            indices_found = True
                             
-                            index_map = np.zeros_like(bin_map_2d, dtype=float)
-                            index_map.fill(np.nan)  # Fill with NaN initially
-                            for j, value in enumerate(index_values):
-                                if j < len(index_values) and np.isfinite(value):
-                                    index_map[bin_map_2d == j] = value
+                            # Create radial profile
+                            fig, ax = plt.subplots(figsize=(10, 6))
+                            ax.plot(bin_radii, idx_values, 'o-', label=idx_name)
+                            ax.set_xlabel('Radius (arcsec)')
+                            ax.set_ylabel('Index Value')
+                            ax.set_title(f"{galaxy_name} - {idx_name} Radial Profile")
+                            ax.grid(True, alpha=0.3)
+                            plt.savefig(plots_dir / f"{galaxy_name}_RDB_{idx_name}_profile.png", dpi=150)
+                            plt.close(fig)
                             
-                            # Check if we have valid data
-                            if np.any(np.isfinite(index_map)):
-                                valid_index = index_map[np.isfinite(index_map)]
-                                vmin = np.percentile(valid_index, 5)
-                                vmax = np.percentile(valid_index, 95)
-                                im = axes[i].imshow(index_map, origin='lower', cmap='viridis',
-                                                 vmin=vmin, vmax=vmax)
-                                plt.colorbar(im, ax=axes[i], label='Index Value')
-                            else:
-                                axes[i].text(0.5, 0.5, f"No valid {index_name} data", 
-                                          ha='center', va='center', transform=axes[i].transAxes)
-                            axes[i].set_title(f'{index_name} Index Map')
-                        
-                        plt.tight_layout()
-                        plt.savefig(plots_dir / f"{galaxy_name}_rdb_indices_map.png", dpi=150)
-                        plt.close(fig)
-                    except Exception as e:
-                        logger.warning(f"Error creating 2D spectral index maps: {str(e)}")
+                            # Create 2D map
+                            fig, ax = plt.subplots(figsize=(10, 8))
+                            visualization.plot_bin_map(
+                                bin_num, 
+                                idx_values, 
+                                ax=ax, 
+                                cmap='plasma',
+                                title=f'{galaxy_name} - RDB {idx_name}',
+                                colorbar_label='Index Value'
+                            )
+                            plt.savefig(plots_dir / f"{galaxy_name}_RDB_{idx_name}_map.png", dpi=150)
+                            plt.close(fig)
+                
+                # If no bin indices, try indices
+                if not indices_found and isinstance(rdb_results['indices'], dict):
+                    for idx_name, idx_values in rdb_results['indices'].items():
+                        # For map plots, we need to extract values for each bin
+                        if hasattr(cube, '_bin_indices_result') and idx_name in cube._bin_indices_result:
+                            bin_idx_values = cube._bin_indices_result[idx_name]
+                            
+                            # Create radial profile
+                            fig, ax = plt.subplots(figsize=(10, 6))
+                            ax.plot(bin_radii, bin_idx_values, 'o-', label=idx_name)
+                            ax.set_xlabel('Radius (arcsec)')
+                            ax.set_ylabel('Index Value')
+                            ax.set_title(f"{galaxy_name} - {idx_name} Radial Profile")
+                            ax.grid(True, alpha=0.3)
+                            plt.savefig(plots_dir / f"{galaxy_name}_RDB_{idx_name}_profile.png", dpi=150)
+                            plt.close(fig)
+                            
+                            # Create 2D map
+                            fig, ax = plt.subplots(figsize=(10, 8))
+                            visualization.plot_bin_map(
+                                bin_num, 
+                                bin_idx_values, 
+                                ax=ax, 
+                                cmap='plasma',
+                                title=f'{galaxy_name} - RDB {idx_name}',
+                                colorbar_label='Index Value'
+                            )
+                            plt.savefig(plots_dir / f"{galaxy_name}_RDB_{idx_name}_map.png", dpi=150)
+                            plt.close(fig)
             except Exception as e:
-                logger.warning(f"Error creating spectral indices plots: {str(e)}")
+                logger.warning(f"Error creating spectral indices plots: {e}")
+                plt.close('all')
     
     except Exception as e:
-        logger.error(f"Error creating RDB plots: {str(e)}")
+        logger.error(f"Error in create_rdb_plots: {str(e)}")
         logger.error(traceback.format_exc())
+        plt.close('all')
