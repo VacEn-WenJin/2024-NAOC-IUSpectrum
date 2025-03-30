@@ -85,10 +85,15 @@ class BinnedSpectra:
     
     def save(self, filename: Union[str, Path]) -> None:
         """Save binned data to file"""
+        # Convert bin_indices to a list and wrap in object array to preserve heterogeneous sizes
+        bin_indices_obj = np.empty(len(self.bin_indices), dtype=object)
+        for i, indices in enumerate(self.bin_indices):
+            bin_indices_obj[i] = indices
+        
         np.savez_compressed(
             filename, 
             bin_num=self.bin_num,
-            bin_indices=self.bin_indices,
+            bin_indices=bin_indices_obj,  # Store as object array
             spectra=self.spectra,
             wavelength=self.wavelength,
             metadata=self.metadata
@@ -99,9 +104,15 @@ class BinnedSpectra:
     def load(cls, filename: Union[str, Path]):
         """Load binned data from file"""
         data = np.load(filename, allow_pickle=True)
+        
+        # Extract bin_indices as a list of arrays
+        bin_indices = []
+        for obj in data['bin_indices']:
+            bin_indices.append(obj)
+        
         return cls(
             bin_num=data['bin_num'],
-            bin_indices=data['bin_indices'].tolist(),
+            bin_indices=bin_indices,  # Use the extracted list
             spectra=data['spectra'],
             wavelength=data['wavelength'],
             metadata=data['metadata'].item()
@@ -552,7 +563,7 @@ def calculate_wavelength_intersection(wavelength, velocity_field, n_x):
     rest_max = np.max(wavelength) / max(min_factor, max_factor)
     
     # Get intersection range with some margin (1%)
-    margin = 0.01 * (rest_max - rest_min)
+    margin = 0.03 * (rest_max - rest_min)
     min_wave = rest_min + margin
     max_wave = rest_max - margin
     

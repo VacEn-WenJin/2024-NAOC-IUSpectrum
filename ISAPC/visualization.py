@@ -600,8 +600,9 @@ def plot_rotation_model(velocity_field, mask=None, center_x=None, center_y=None,
     
     return ax
 
+
 def plot_parameter_map(data, bin_map, ax=None, title=None, cmap='viridis', 
-                       label=None, vmin=None, vmax=None, equal_aspect=True):
+                      label=None, vmin=None, vmax=None, equal_aspect=True):
     """
     Plot parameter map with robust handling of different array dimensions
     
@@ -764,7 +765,7 @@ def safe_plot_array(data, bin_map, ax=None, title=None, cmap='viridis', label=No
         elif data.ndim == 1:  # 1D array
             # Map each value to corresponding bin
             for i, val in enumerate(data):
-                if np.isfinite(val):
+                if i < len(data) and np.isfinite(val):
                     param_map[bin_map == i] = val
             
         elif data.ndim == 2 and data.shape == bin_map.shape:  # Matching 2D array
@@ -819,7 +820,252 @@ def safe_plot_array(data, bin_map, ax=None, title=None, cmap='viridis', label=No
             ax.set_title(title)
     
     return ax
-# In galaxy_params.py
+
+
+def plot_bin_map(bin_num, values, ax=None, cmap='viridis', title=None, 
+                vmin=None, vmax=None, log_scale=False, colorbar_label=None):
+    """
+    Plot values for binned data, handling both 1D and 2D bin formats
+    
+    Parameters
+    ----------
+    bin_num : ndarray
+        Bin map or bin indices
+    values : ndarray
+        Values for each bin
+    ax : matplotlib.axes.Axes, optional
+        Axis to plot on
+    cmap : str, default='viridis'
+        Colormap name
+    title : str, optional
+        Plot title
+    vmin, vmax : float, optional
+        Minimum and maximum color values
+    log_scale : bool, default=False
+        Whether to use log scale for values
+    colorbar_label : str, optional
+        Label for colorbar
+        
+    Returns
+    -------
+    matplotlib.axes.Axes
+        Axis with plot
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, 6))
+    
+    try:
+        # Convert inputs to numpy arrays if not already
+        bin_num_np = np.asarray(bin_num)
+        values_np = np.asarray(values)
+        
+        # Check for 1D vs 2D bin_num
+        if bin_num_np.ndim == 1:
+            # For 1D arrays, create a bar plot
+            return plot_binned_values(bin_num_np, values_np, ax=ax, 
+                                     title=title, cmap=cmap, 
+                                     colorbar_label=colorbar_label,
+                                     vmin=vmin, vmax=vmax, 
+                                     log_scale=log_scale)
+        else:
+            # For 2D arrays, use safe_plot_array
+            return safe_plot_array(values_np, bin_num_np, ax=ax, 
+                                  title=title, cmap=cmap, 
+                                  label=colorbar_label)
+    
+    except Exception as e:
+        logger.warning(f"Error in plot_bin_map: {e}")
+        ax.text(0.5, 0.5, f"Error plotting: {str(e)}", 
+              ha='center', va='center', transform=ax.transAxes)
+        if title:
+            ax.set_title(title)
+        return ax
+
+
+def plot_binned_values(bin_indices, values, ax=None, title=None, cmap='viridis',
+                      colorbar_label=None, vmin=None, vmax=None, log_scale=False):
+    """
+    Plot values for binned data using a bar plot approach that works well with any bin shape.
+    
+    Parameters
+    ----------
+    bin_indices : array-like
+        Bin indices (can be 1D array or list of bin indices)
+    values : array-like
+        Values for each bin
+    title : str, optional
+        Plot title
+    ax : matplotlib.axes.Axes, optional
+        Axis to plot on
+    cmap : str, default='viridis'
+        Colormap name
+    colorbar_label : str, optional
+        Label for colorbar
+    vmin, vmax : float, optional
+        Minimum and maximum values for colorbar
+    log_scale : bool, default=False
+        Whether to use log scale
+        
+    Returns
+    -------
+    matplotlib.axes.Axes
+        Plot axis
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(10, 6))
+    
+    try:
+        # Convert inputs to numpy arrays if not already
+        values_array = np.asarray(values).flatten()  # Ensure 1D
+        
+        # Filter out invalid values
+        valid_indices = np.isfinite(values_array)
+        if np.sum(valid_indices) == 0:
+            ax.text(0.5, 0.5, "No valid data to plot", 
+                   ha='center', va='center', transform=ax.transAxes)
+            if title:
+                ax.set_title(title)
+            return ax
+        
+        # Create plotting indices (just sequential numbers)
+        x = np.arange(len(values_array))
+        
+        # Filter to valid data points
+        x_valid = x[valid_indices]
+        values_valid = values_array[valid_indices]
+        
+        # Handle log scale if requested
+        if log_scale and np.any(values_valid > 0):
+            # Find positive values
+            positive_mask = values_valid > 0
+            if np.any(positive_mask):
+                # Get minimum positive value
+                min_positive = np.min(values_valid[positive_mask])
+                
+                # Replace non-positive values with a small value
+                values_valid[~positive_mask] = min_positive * 0.1
+                
+                # Apply log10
+                values_valid = np.log10(values_valid)
+                
+                # Adjust colorbar label
+                if colorbar_label and not colorbar_label.startswith('Log'):
+                    colorbar_label = f"Log10({colorbar_label})"
+        
+        # Get color limits
+        if len(values_valid) > 0:
+            if vmin is None:
+                vmin = np.min(values_valid)
+            if vmax is None:
+                vmax = np.max(values_valid)
+            
+            # Ensure valid range
+            if vmin >= vmax:
+                vmin = vmin * 0.9 if vmin != 0 else -1
+                vmax = vmax * 1.1 if vmax != 0 else 1
+                
+            # Create colormap
+            norm = Normalize(vmin=vmin, vmax=vmax)
+            sm = ScalarMappable(norm=norm, cmap=cmap)
+            
+            # Get colors for valid values
+            colors = sm.to_rgba(values_valid)
+            
+            # Create bar plot
+            ax.bar(x_valid, values_valid, color=colors, alpha=0.8)
+            
+            # Set labels
+            ax.set_xlabel('Bin Index')
+            ax.set_ylabel(colorbar_label if colorbar_label else 'Value')
+            
+            # Set reasonable number of x ticks
+            max_ticks = min(20, len(x_valid))
+            if len(x_valid) > max_ticks:
+                step = len(x_valid) // max_ticks
+                idx = np.arange(0, len(x_valid), step)
+                ax.set_xticks(x_valid[idx])
+                ax.set_xticklabels([str(int(i)) for i in x_valid[idx]])
+            
+            # Add colorbar
+            plt.colorbar(sm, ax=ax, label=colorbar_label)
+        else:
+            ax.text(0.5, 0.5, "No valid data to plot", 
+                   ha='center', va='center', transform=ax.transAxes)
+        
+        # Add title
+        if title:
+            ax.set_title(title)
+        
+        # Add grid
+        ax.grid(True, alpha=0.3)
+        
+        return ax
+    
+    except Exception as e:
+        logger.warning(f"Error plotting binned values: {e}")
+        ax.text(0.5, 0.5, f"Error: {str(e)}", 
+               ha='center', va='center', transform=ax.transAxes)
+        if title:
+            ax.set_title(title)
+        return ax
+
+
+def add_rotation_markers(ax, center_x, center_y, pa, radius=None, color='w'):
+    """
+    Add markers for rotation center and axis.
+    
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        Axis to add markers to
+    center_x : float
+        X-coordinate of rotation center
+    center_y : float
+        Y-coordinate of rotation center
+    pa : float
+        Position angle in degrees
+    radius : float, optional
+        Length of rotation axis
+    color : str, default='w'
+        Color of markers
+        
+    Returns
+    -------
+    matplotlib.axes.Axes
+        Axis with markers
+    """
+    try:
+        # Check parameters
+        if not np.isfinite(center_x) or not np.isfinite(center_y) or not np.isfinite(pa):
+            return ax
+        
+        # Add rotation center
+        ax.plot(center_x, center_y, 'o', color=color, markersize=10, markeredgecolor='k')
+        
+        # Add rotation axis if radius provided
+        if radius is not None:
+            # Convert PA to radians
+            pa_rad = np.radians(pa)
+            
+            # Calculate endpoints of rotation axis line
+            x1 = center_x + radius * np.cos(pa_rad)
+            y1 = center_y + radius * np.sin(pa_rad)
+            x2 = center_x - radius * np.cos(pa_rad)
+            y2 = center_y - radius * np.sin(pa_rad)
+            
+            # Plot rotation axis
+            ax.plot([x1, x2], [y1, y2], '--', color=color, lw=2)
+            
+            # Add PA annotation
+            ax.text(0.05, 0.95, f'PA = {pa:.1f}°', 
+                   transform=ax.transAxes, fontsize=12,
+                   verticalalignment='top', color=color,
+                   bbox=dict(facecolor='k', alpha=0.5))
+    except Exception as e:
+        warnings.warn(f"Error adding rotation markers: {str(e)}")
+    
+    return ax
+
 
 def plot_kinematics_summary(velocity_field, dispersion_field, bin_map=None, 
                           rotation_curve=None, params=None, equal_aspect=False):
@@ -1022,60 +1268,3 @@ def plot_kinematics_summary(velocity_field, dispersion_field, bin_map=None,
     plt.tight_layout()
     
     return fig
-
-
-def add_rotation_markers(ax, center_x, center_y, pa, radius=None, color='w'):
-    """
-    Add markers for rotation center and axis.
-    
-    Parameters
-    ----------
-    ax : matplotlib.axes.Axes
-        Axis to add markers to
-    center_x : float
-        X-coordinate of rotation center
-    center_y : float
-        Y-coordinate of rotation center
-    pa : float
-        Position angle in degrees
-    radius : float, optional
-        Length of rotation axis
-    color : str, default='w'
-        Color of markers
-        
-    Returns
-    -------
-    matplotlib.axes.Axes
-        Axis with markers
-    """
-    try:
-        # Check parameters
-        if not np.isfinite(center_x) or not np.isfinite(center_y) or not np.isfinite(pa):
-            return ax
-        
-        # Add rotation center
-        ax.plot(center_x, center_y, 'o', color=color, markersize=10, markeredgecolor='k')
-        
-        # Add rotation axis if radius provided
-        if radius is not None:
-            # Convert PA to radians
-            pa_rad = np.radians(pa)
-            
-            # Calculate endpoints of rotation axis line
-            x1 = center_x + radius * np.cos(pa_rad)
-            y1 = center_y + radius * np.sin(pa_rad)
-            x2 = center_x - radius * np.cos(pa_rad)
-            y2 = center_y - radius * np.sin(pa_rad)
-            
-            # Plot rotation axis
-            ax.plot([x1, x2], [y1, y2], '--', color=color, lw=2)
-            
-            # Add PA annotation
-            ax.text(0.05, 0.95, f'PA = {pa:.1f}°', 
-                   transform=ax.transAxes, fontsize=12,
-                   verticalalignment='top', color=color,
-                   bbox=dict(facecolor='k', alpha=0.5))
-    except Exception as e:
-        warnings.warn(f"Error adding rotation markers: {str(e)}")
-    
-    return ax

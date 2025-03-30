@@ -149,9 +149,9 @@ def run_vnb_analysis(args, cube, p2p_results=None):
     min_recommended_snr = min(10, median_snr * 5)
     max_recommended_snr = max(max_pixel_snr * 0.5, median_snr * 100)
     
-    # Ensure min and max are in a reasonable range
-    min_recommended_snr = max(2, min_recommended_snr)  # At least 2
-    max_recommended_snr = max(15, max_recommended_snr)  # At least 15
+    # # Ensure min and max are in a reasonable range
+    # min_recommended_snr = max(2, min_recommended_snr)  # At least 2
+    # max_recommended_snr = max(15, max_recommended_snr)  # At least 15
     
     # If user-specified target_snr is outside the recommended range, adjust
     if target_snr < min_recommended_snr or target_snr > max_recommended_snr:
@@ -353,7 +353,7 @@ def run_vnb_analysis(args, cube, p2p_results=None):
     
     # Combine spectra into bins with velocity correction
     binned_spectra = combine_spectra_efficiently(
-        spectra, wavelength, bin_indices, velocity_field, cube._n_x, cube._n_y
+        spectra, wavelength, bin_indices, velocity_field, cube._n_x
     )
     
     # Create metadata
