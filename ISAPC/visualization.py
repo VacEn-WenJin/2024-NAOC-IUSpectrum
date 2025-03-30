@@ -601,7 +601,7 @@ def plot_rotation_model(velocity_field, mask=None, center_x=None, center_y=None,
     return ax
 
 def plot_parameter_map(data, bin_map, ax=None, title=None, cmap='viridis', 
-                      label=None, vmin=None, vmax=None, equal_aspect=True):
+                       label=None, vmin=None, vmax=None, equal_aspect=True):
     """
     Plot parameter map with robust handling of different array dimensions
     
@@ -630,7 +630,7 @@ def plot_parameter_map(data, bin_map, ax=None, title=None, cmap='viridis',
         Axis with the plot
     """
     if ax is None:
-        fig, ax = plt.subplots(figsize=(8, 7))
+        fig, ax = plt.subplots(figsize=(8, 8))  # Square figure size
     
     try:
         # Create parameter map
@@ -719,6 +719,7 @@ def plot_parameter_map(data, bin_map, ax=None, title=None, cmap='viridis',
         if title:
             ax.set_title(title)
         return ax
+
 
 def safe_plot_array(data, bin_map, ax=None, title=None, cmap='viridis', label=None):
     """

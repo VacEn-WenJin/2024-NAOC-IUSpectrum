@@ -169,7 +169,7 @@ def main():
         
         # P2P analysis
         if args.mode in ['P2P', 'ALL']:
-            p2p_results = run_p2p_analysis(args, cube)
+            p2p_results = run_p2p_analysis(args, cube, Pmode=True)
             
             # Save results
             save_results_to_npz(

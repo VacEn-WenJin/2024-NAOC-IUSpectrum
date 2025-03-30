@@ -53,7 +53,7 @@ def calculate_distance_to_center(x, y, pxl_size_x, pxl_size_y=None):
     return distance
 
 
-def run_p2p_analysis(args, cube):
+def run_p2p_analysis(args, cube, Pmode = False):
     """
     Run pixel-to-pixel analysis
     
@@ -299,10 +299,11 @@ def run_p2p_analysis(args, cube):
                     
                     try:
                         pixel_weights = weights[:, y, x]
-                        if np.sum(pixel_weights) > 0:
-                            params = weight_parser.get_physical_params(pixel_weights)
-                            for param_name, value in params.items():
-                                stellar_pop_params[param_name][y, x] = value
+                        # if np.sum(pixel_weights) > 0:
+                        # print(pixel_weights)
+                        params = weight_parser.get_physical_params(pixel_weights)
+                        for param_name, value in params.items():
+                            stellar_pop_params[param_name][y, x] = value
                     except Exception as e:
                         logger.debug(f"Error calculating stellar params for pixel ({x}, {y}): {e}")
             
@@ -357,8 +358,8 @@ def run_p2p_analysis(args, cube):
     p2p_results = {
         'analysis_type': 'P2P',
         'stellar_kinematics': {
-            'velocity_field': stellar_velocity_field,
-            'dispersion_field': stellar_dispersion_field
+            'velocity_field': emission_result['velocity_field'],
+            'dispersion_field': emission_result['dispersion_field']
         },
         'global_kinematics': {
             **rotation_result, 
@@ -369,6 +370,16 @@ def run_p2p_analysis(args, cube):
             'field': distance_field,
             'pixelsize_x': cube._pxl_size_x,
             'pixelsize_y': cube._pxl_size_y
+        },
+        'emission': {
+            'emission_flux':emission_result['emission_flux'],
+            'emission_vel':emission_result['emission_vel'],
+            'emission_sig':emission_result['emission_sig'],
+        },
+        'signal_noise':{
+            'signal':emission_result['signal'],
+            'noise':emission_result['noise'],
+            'snr':emission_result['snr'],
         }
     }
     
@@ -464,12 +475,17 @@ def run_p2p_analysis(args, cube):
         p2p_results['indices'] = indices_result
     
     # Save results
-    save_standardized_results(galaxy_name, 'P2P', p2p_results, output_dir)
+    # Save results - Only save if this is a genuine P2P analysis (not binned)
+    # Check either Pmode flag or absence of _is_binned_analysis flag
+    should_save = Pmode or (not hasattr(args, '_is_binned_analysis') and not hasattr(args, 'no_save'))
     
-    # Create visualizations
-    if not args.no_plots:
+    if should_save:
+        save_standardized_results(galaxy_name, 'P2P', p2p_results, output_dir)
+    
+    # Create visualizations - only if this is a genuine P2P analysis
+    if should_save and not args.no_plots:
         create_p2p_plots(args, cube, p2p_results, galaxy_name, bestfit_field, optimal_tmpls, 
-                         emission_result, using_emission)
+                        emission_result, using_emission)
         # Create radial profile plots
         create_radial_profile_plots(p2p_results, plots_dir=plots_dir, galaxy_name=galaxy_name, analysis_type="P2P")
     

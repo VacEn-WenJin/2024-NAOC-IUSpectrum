@@ -138,47 +138,48 @@ def run_vnb_analysis(args, cube, p2p_results=None):
     signal[signal == 0] = min_threshold
     noise[noise == 0] = min_threshold
     
-    # Apply minimum SNR threshold to avoid problems with very low SNR spaxels
-    valid_mask = (signal / noise) >= min_snr
-    if np.sum(valid_mask) < 10:
-        # If too few valid spaxels, lower threshold
-        logger.warning(f"Very few spaxels meet minimum SNR threshold ({np.sum(valid_mask)}). Lowering minimum SNR.")
-        min_snr = max(0.5, min_snr / 2)
-        valid_mask = (signal / noise) >= min_snr
+    # # Apply minimum SNR threshold to avoid problems with very low SNR spaxels
+    # valid_mask = np.ones_like(signal)
+    # if np.sum(valid_mask) < 10:
+    #     # If too few valid spaxels, lower threshold
+    #     logger.warning(f"Very few spaxels meet minimum SNR threshold ({np.sum(valid_mask)}). Lowering minimum SNR.")
+    #     min_snr = max(0.5, min_snr / 2)
+    #     valid_mask = (signal / noise) >= min_snr
         
-        # Check if we still have too few pixels
-        if np.sum(valid_mask) < 5:
-            logger.warning("Still too few valid pixels after lowering threshold. Selecting pixels with highest SNR.")
-            # Force selection of the top pixels with highest SNR
-            snr_values = signal / noise
-            # Get indices sorted by SNR (highest first)
-            sorted_indices = np.argsort(snr_values)[::-1]
-            # Create a new mask that selects at least N pixels with highest SNR
-            min_pixels = min(100, max(10, int(0.01 * signal.size)))  # At least 1% of pixels or 10 pixels, whichever is more
-            force_indices = sorted_indices[:min_pixels]
-            new_mask = np.zeros_like(valid_mask)
-            new_mask[force_indices] = True
-            valid_mask = new_mask
+    #     # Check if we still have too few pixels
+    #     if np.sum(valid_mask) < 5:
+    #         logger.warning("Still too few valid pixels after lowering threshold. Selecting pixels with highest SNR.")
+    #         # Force selection of the top pixels with highest SNR
+    #         snr_values = signal / noise
+    #         # Get indices sorted by SNR (highest first)
+    #         sorted_indices = np.argsort(snr_values)[::-1]
+    #         # Create a new mask that selects at least N pixels with highest SNR
+    #         min_pixels = min(100, max(10, int(0.01 * signal.size)))  # At least 1% of pixels or 10 pixels, whichever is more
+    #         force_indices = sorted_indices[:min_pixels]
+    #         new_mask = np.zeros_like(valid_mask)
+    #         new_mask[force_indices] = True
+    #         valid_mask = new_mask
             
-            # If we still have no valid pixels (extremely rare case), use all pixels
-            if np.sum(valid_mask) == 0:
-                logger.warning("No valid pixels even after selection. Using all non-NaN pixels as fallback.")
-                valid_mask = np.isfinite(signal) & np.isfinite(noise)
-                # If still no valid pixels, this is truly bad data, but we'll try anyway
-                if np.sum(valid_mask) == 0:
-                    logger.warning("No valid pixels at all. Using all pixels regardless of quality.")
-                    valid_mask = np.ones_like(signal, dtype=bool)
+    #         # If we still have no valid pixels (extremely rare case), use all pixels
+    #         if np.sum(valid_mask) == 0:
+    #             logger.warning("No valid pixels even after selection. Using all non-NaN pixels as fallback.")
+    #             valid_mask = np.isfinite(signal) & np.isfinite(noise)
+    #             # If still no valid pixels, this is truly bad data, but we'll try anyway
+    #             if np.sum(valid_mask) == 0:
+    #                 logger.warning("No valid pixels at all. Using all pixels regardless of quality.")
+    #                 valid_mask = np.ones_like(signal, dtype=bool)
     
-    logger.info(f"Found {np.sum(valid_mask)} spaxels above minimum SNR threshold {min_snr}")
+    # logger.info(f"Found {np.sum(valid_mask)} spaxels above minimum SNR threshold {min_snr}")
     
     # If we have P2P results, try to use them to improve SNR
     if p2p_results is not None:
         try:
             # Use SNR from P2P results if available (like in the notebook)
             if 'signal_noise' in p2p_results:
-                p2p_signal = p2p_results['signal_noise'].get('signal', None)
-                p2p_noise = p2p_results['signal_noise'].get('noise', None)
-                
+                p2p_signal = (p2p_results['signal_noise'].get('signal', None)).reshape(-1)
+                p2p_noise = (p2p_results['signal_noise'].get('noise', None)).reshape(-1)
+                p2p_snr = (p2p_results['signal_noise'].get('snr', None)).reshape(-1)
+                # print(p2p_signal)
                 if p2p_signal is not None and p2p_noise is not None:
                     logger.info("Using signal and noise from P2P results")
                     
@@ -197,6 +198,7 @@ def run_vnb_analysis(args, cube, p2p_results=None):
                     
                     signal = p2p_signal
                     noise = p2p_noise
+                    pixel_snr = p2p_snr
                     
                     # Recalculate valid mask
                     valid_mask = (signal / noise) >= min_snr
@@ -233,8 +235,9 @@ def run_vnb_analysis(args, cube, p2p_results=None):
     
     try:
         # Determine per-pixel SNR values
-        pixel_snr = signal / np.maximum(noise, 1e-10)  # Element-wise division for each pixel
-        valid_snr = pixel_snr[valid_mask]
+        # pixel_snr = signal / noise  # Element-wise division for each pixel
+        # valid_snr = pixel_snr[valid_mask]
+        valid_snr = pixel_snr
         max_pixel_snr = np.nanmax(valid_snr)
         median_snr = np.nanmedian(valid_snr)
         
@@ -245,8 +248,8 @@ def run_vnb_analysis(args, cube, p2p_results=None):
         max_recommended_snr = max(max_pixel_snr * 0.5, median_snr * 100)
         
         # Ensure min and max are in a reasonable range
-        min_recommended_snr = max(2, min_recommended_snr)  # At least 2
-        max_recommended_snr = max(15, max_recommended_snr)  # At least 15
+        # min_recommended_snr = max(2, min_recommended_snr)  # At least 2
+        # max_recommended_snr = max(15, max_recommended_snr)  # At least 15
         
         # If user-specified target_snr is outside the recommended range, adjust
         if target_snr < min_recommended_snr or target_snr > max_recommended_snr:
@@ -264,16 +267,21 @@ def run_vnb_analysis(args, cube, p2p_results=None):
         # First attempt with the selected target SNR
         try:
             success = True
+            # print('TS A')
             # Use the valid_mask to filter data
-            x_valid = x[valid_mask]
-            y_valid = y[valid_mask]
-            signal_valid = signal[valid_mask]
-            noise_valid = noise[valid_mask]
+            # x_valid = x[valid_mask]
+            # y_valid = y[valid_mask]
+            # signal_valid = signal[valid_mask]
+            # noise_valid = noise[valid_mask]
+            x_valid = x
+            y_valid = y
+            signal_valid = signal
+            noise_valid = noise
             
             # Check if we have enough valid pixels
             if len(x_valid) == 0:
                 raise ValueError("No valid pixels available for Voronoi binning")
-            
+            # print('TS B')
             # Make sure arrays have consistent lengths
             min_len = min(len(x_valid), len(y_valid), len(signal_valid), len(noise_valid))
             if min_len == 0:
@@ -283,21 +291,22 @@ def run_vnb_analysis(args, cube, p2p_results=None):
             y_valid = y_valid[:min_len]
             signal_valid = signal_valid[:min_len]
             noise_valid = noise_valid[:min_len]
-            
+            # print('TS C')
             # Double-check for any problematic values
-            for i in range(len(signal_valid)):
-                if signal_valid[i] < min_threshold or noise_valid[i] < min_threshold or (signal_valid[i]/noise_valid[i]) < 1.0:
-                    signal_valid[i] = min_threshold
-                    noise_valid[i] = min_threshold
-            
+            # for i in range(len(signal_valid)):
+            #     if signal_valid[i] < min_threshold or noise_valid[i] < min_threshold or (signal_valid[i]/noise_valid[i]) < 1.0:
+            #         signal_valid[i] = min_threshold
+            #         noise_valid[i] = min_threshold
+            # print('TS C-2')
             logger.info(f"Running Voronoi binning with {len(x_valid)} valid pixels")
-            
+            # print(x_valid.shape, y_valid.shape)
+            # print(signal_valid.shape, noise_valid.shape)
             # Handle return values more robustly to accommodate different version of vorbin
             result = voronoi_2d_binning(
                 x_valid, y_valid, 
                 signal_valid, noise_valid, 
                 safe_target_snr, plot=0, quiet=True, cvt=use_cvt)
-            
+            # print('TS D')
             # Robust handling of return values
             if isinstance(result, tuple):
                 # Check length of returned tuple
@@ -321,7 +330,8 @@ def run_vnb_analysis(args, cube, p2p_results=None):
         except Exception as e:
             success = False
             best_result = None
-            logger.warning(f"Initial Voronoi binning failed: {str(e)}")
+            logger.warning(f"!/!/!/!:Initial Voronoi binning failed: {str(e)}")
+            return 0
         
         # If initial attempt failed, try a systematic search through recommended SNR values
         if not success:
@@ -426,141 +436,15 @@ def run_vnb_analysis(args, cube, p2p_results=None):
         
         # If all attempts failed, use a grid binning approach as fallback
         if not success or best_result is None:
-            logger.warning("All Voronoi binning attempts failed, using grid binning as fallback")
+            logger.warning("GG GG GG GG GG GG GG")
             
-            # Determine a reasonable number of bins based on data size and SNR
-            valid_count = np.sum(valid_mask)
-            
-            # More sophisticated bin count calculation based on data size and SNR
-            if max_pixel_snr > 0:
-                # More bins for higher SNR data
-                bin_factor = min(5, max(1, max_pixel_snr / 10))
-            else:
-                bin_factor = 1
-            
-            num_bins = min(100, max(4, int(np.sqrt(valid_count / bin_factor))))
-            
-            # Determine grid dimensions - try to match aspect ratio of data
-            xrange = np.max(x_valid) - np.min(x_valid)
-            yrange = np.max(y_valid) - np.min(y_valid)
-            
-            aspect = xrange / max(yrange, 1e-10)  # Avoid division by zero
-            
-            if aspect > 1.5:  # Wider than tall
-                nx = int(np.sqrt(num_bins * aspect))
-                ny = int(num_bins / nx)
-            elif aspect < 0.67:  # Taller than wide
-                ny = int(np.sqrt(num_bins / aspect))
-                nx = int(num_bins / ny)
-            else:  # Roughly square
-                nx = ny = int(np.sqrt(num_bins))
-            
-            # Ensure at least 2x2 grid
-            nx = max(2, nx)
-            ny = max(2, ny)
-            
-            logger.info(f"Creating {nx}×{ny} grid binning with approximately {nx*ny} bins")
-            
-            # Get bounds of coordinates
-            xmin, xmax = np.min(x_valid), np.max(x_valid)
-            ymin, ymax = np.min(y_valid), np.max(y_valid)
-            
-            # Create grid binning
-            bin_result = create_grid_binning(
-                x_valid, y_valid,
-                signal_valid, noise_valid,
-                nx=nx, ny=ny, xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax
-            )
-            
-            if bin_result is not None:
-                # Map bin numbers back to the original arrays
-                bin_num_valid, x_gen, y_gen, sn_values, n_pixels, scale = bin_result
-                
-                bin_num_full = np.full_like(x, -1, dtype=int)
-                bin_num_full[valid_mask] = bin_num_valid
-                
-                best_result = (bin_num_valid, x_gen, y_gen, sn_values, n_pixels, scale)
-                success = True
-                logger.info(f"Created {len(x_gen)} grid bins as fallback")
-            else:
-                # Last resort: create a simple single bin
-                logger.warning("Grid binning failed, creating simple radial bins as last resort")
-                
-                # Create simple radial bins - often more useful than a uniform grid
-                center_x = np.median(x_valid)
-                center_y = np.median(y_valid)
-                
-                # Calculate distance from center
-                r = np.sqrt((x - center_x)**2 + (y - center_y)**2)
-                
-                # Create simple radial bins (4 is a reasonable minimum)
-                n_radial_bins = min(8, max(4, int(np.sqrt(valid_count / 10))))
-                
-                # Get maximum radius with margin
-                r_max = np.nanmax(r[valid_mask]) * 1.01
-                
-                # Create bin edges
-                bin_edges = np.linspace(0, r_max, n_radial_bins + 1)
-                
-                # Assign bins
-                bin_num_full = np.full_like(r, -1, dtype=int)
-                
-                for i in range(n_radial_bins):
-                    r_min = bin_edges[i]
-                    r_max_bin = bin_edges[i + 1]
-                    mask = valid_mask & (r >= r_min) & (r < r_max_bin)
-                    bin_num_full[mask] = i
-                
-                # Create generator coordinates, SNR values, and pixel counts
-                x_gen = []
-                y_gen = []
-                sn_values = []
-                n_pixels = []
-                
-                for i in range(n_radial_bins):
-                    mask = bin_num_full == i
-                    if np.any(mask):
-                        x_gen.append(np.mean(x[mask]))
-                        y_gen.append(np.mean(y[mask]))
-                        n_pixels.append(np.sum(mask))
-                        
-                        # Estimate SNR
-                        this_signal = np.mean(signal[mask])
-                        this_noise = np.mean(noise[mask])
-                        # Ensure minimum SNR of 1
-                        snr = max(1.0, this_signal / this_noise if this_noise > 0 else 1.0)
-                        sn_values.append(snr)
-                
-                # Convert to arrays
-                x_gen = np.array(x_gen)
-                y_gen = np.array(y_gen)
-                sn_values = np.array(sn_values)
-                n_pixels = np.array(n_pixels)
-                
-                # Check if we have any valid bins
-                if len(x_gen) > 0:
-                    best_result = (bin_num_full[valid_mask], x_gen, y_gen, sn_values, n_pixels, 1.0)
-                    success = True
-                    logger.info(f"Created {len(x_gen)} radial bins as fallback")
-                else:
-                    # If all else fails, use a simple single bin
-                    bin_num_full = np.zeros_like(x, dtype=int)
-                    bin_num_full[~valid_mask] = -1  # Mark invalid points as -1
-                    x_gen = np.array([np.mean(x_valid)])
-                    y_gen = np.array([np.mean(y_valid)])
-                    sn_values = np.array([max(median_snr, 5.0)])
-                    n_pixels = np.array([np.sum(valid_mask)])
-                    
-                    best_result = (bin_num_full[valid_mask], x_gen, y_gen, sn_values, n_pixels, 1.0)
-                    success = True
-                    logger.warning("Created a single bin as last resort fallback")
         
         # Extract the results from the successful binning operation
         bin_num, x_gen, y_gen, sn, n_pixels, scale = best_result
         
         # Convert bin_num back to full size
         full_bin_num = np.full(signal.shape, -1, dtype=int)
-        full_bin_num[valid_mask] = bin_num
+        full_bin_num = bin_num
         
         # Get bin indices for each bin
         bin_indices = []
@@ -583,12 +467,12 @@ def run_vnb_analysis(args, cube, p2p_results=None):
             logger.info("No velocity correction applied")
         
         # Apply wavelength mask
-        wavelength = cube._lambda_gal[wave_mask]
+        wavelength = cube._lambda_gal
         
         # Combine spectra in each bin with enhanced velocity correction
         # This approach similar to the notebook's Spectrum_ReSMP function
-        binned_spectra = combine_spectra_with_velocity_correction(
-            cube._spectra[wave_mask], wavelength, bin_indices, velocity_field, cube._n_x, cube._n_y
+        wavelength, binned_spectra = combine_spectra_with_velocity_correction(
+            cube._spectra, wavelength, bin_indices, velocity_field, cube._n_x, cube._n_y, min_wave, max_wave
         )
         
         logger.info(f"Combined spectra into {len(bin_indices)} bins")
@@ -620,10 +504,10 @@ def run_vnb_analysis(args, cube, p2p_results=None):
             wavelength=wavelength,
             metadata=metadata
         )
-        
+        # print('TS A')
         # Run analysis on binned spectra (template fitting, etc.)
         vnb_results = run_analysis_on_binned_data(args, binned_data, cube, p2p_results)
-        
+        # print('TS B')
         # Create visualization plots
         if not args.no_plots:
             create_vnb_plots(args, binned_data, vnb_results, galaxy_name, plots_dir)
@@ -670,10 +554,11 @@ def run_vnb_analysis(args, cube, p2p_results=None):
             'error': str(e)
         }
 
-def combine_spectra_with_velocity_correction(spectra, wavelength, bin_indices, velocity_field=None, n_x=None, n_y=None):
+
+def combine_spectra_with_velocity_correction(spectra, wavelength, bin_indices, velocity_field=None,
+                                             n_x=None, n_y=None, min_wave=None, max_wave=None):
     """
-    Combine spectra within bins with improved velocity correction.
-    This implementation is inspired by the Spectrum_ReSMP function in the notebook.
+    Combine spectra within bins with velocity correction based on the Spectrum_ReSMP approach.
     
     Parameters
     ----------
@@ -695,6 +580,8 @@ def combine_spectra_with_velocity_correction(spectra, wavelength, bin_indices, v
     numpy.ndarray
         Combined bin spectra array [n_wave, n_bins]
     """
+    from utils.calc import spectres
+    w_arg = np.linspace(min_wave, max_wave, len(wavelength))
     n_wave = len(wavelength)
     n_bins = len(bin_indices)
     c = 299792.458  # Speed of light in km/s
@@ -702,222 +589,95 @@ def combine_spectra_with_velocity_correction(spectra, wavelength, bin_indices, v
     # Initialize output array
     bin_spectra = np.zeros((n_wave, n_bins))
     
-    # Check if velocity correction is requested and available
-    do_correction = velocity_field is not None and n_x is not None
+    # Velocity limits
+    del_v_lim = 300  # km/s, maximum velocity difference from bin median
+    v_LR = 300       # km/s, maximum absolute velocity
     
     # Process each bin
-    for i, indices in enumerate(bin_indices):
+    for bin_idx, indices in enumerate(bin_indices):
         # Skip empty bins
         if len(indices) == 0:
-            bin_spectra[:, i] = np.nan
+            bin_spectra[:, bin_idx] = np.nan
             continue
         
         try:
-            # Extract velocities for this bin if available
-            if do_correction:
-                # Calculate median velocity for this bin
-                bin_velocities = []
-                for idx in indices:
-                    row = idx // n_x
-                    col = idx % n_x
-                    if row < n_y and col < n_x:
-                        if velocity_field is not None and row < velocity_field.shape[0] and col < velocity_field.shape[1]:
-                            vel = velocity_field[row, col]
-                            if np.isfinite(vel):
-                                bin_velocities.append(vel)
-                
-                # Apply velocity correction if we have valid velocities
-                if bin_velocities:
-                    median_velocity = np.median(bin_velocities)
-                    
-                    # Only apply correction for non-negligible velocities
-                    if abs(median_velocity) > 1.0:  # Minimum 1 km/s to apply correction
-                        # Following the notebook approach:
-                        # 1. Collect spectra for each spaxel
-                        corrected_spectra = []
-                        
-                        for idx in indices:
-                            spec = spectra[:, idx]
-                            if not np.all(~np.isfinite(spec)):
-                                # Get velocity for this spaxel
-                                row = idx // n_x
-                                col = idx % n_x
-                                
-                                if row < velocity_field.shape[0] and col < velocity_field.shape[1]:
-                                    vel = velocity_field[row, col]
-                                    
-                                    # Check for outlier velocities within the bin
-                                    vel_limit = 300  # km/s, from notebook
-                                    if abs(vel - median_velocity) > vel_limit:
-                                        vel = median_velocity
-                                    
-                                    if abs(vel) > 300:  # Skip extreme velocities
-                                        vel = 0
-                                    
-                                    # Apply velocity shift to wavelength grid
-                                    lam_shifted = wavelength / (1 + (vel/c))
-                                    
-                                    # Resample spectrum to original wavelength grid
-                                    try:
-                                        corrected_spec = spectres(wavelength, lam_shifted, spec)
-                                        corrected_spectra.append(corrected_spec)
-                                    except:
-                                        # Fallback to original spectrum if resampling fails
-                                        corrected_spectra.append(spec)
-                                else:
-                                    corrected_spectra.append(spec)
-                        
-                        # Combine corrected spectra
-                        if corrected_spectra:
-                            # Take median of all corrected spectra
-                            bin_spectra[:, i] = np.nanmedian(np.array(corrected_spectra), axis=0)
-                        else:
-                            bin_spectra[:, i] = np.nan
-                            
-                        continue  # Skip remaining processing for this bin
+            # Prepare a velocity-corrected spectra array for this bin
+            spc_vel_fix = np.zeros((n_wave, len(indices)))
             
-            # If we get here, either no velocity correction was applied or it wasn't needed
-            # Simply combine original spectra
-            bin_data = []
-            for idx in indices:
-                spec = spectra[:, idx]
-                if not np.all(~np.isfinite(spec)):
-                    bin_data.append(spec)
-            
-            if bin_data:
-                bin_spectra[:, i] = np.nanmedian(np.array(bin_data), axis=0)
-            else:
-                bin_spectra[:, i] = np.nan
-                
-        except Exception as e:
-            logger.error(f"Error combining spectra for bin {i}: {e}")
-            bin_spectra[:, i] = np.nan
-    
-    return bin_spectra
-
-def combine_spectra_with_velocity_correction(spectra, wavelength, bin_indices, velocity_field, n_x, n_y):
-    """
-    Combine spectra within bins with velocity correction.
-    
-    Parameters
-    ----------
-    spectra : numpy.ndarray
-        Array of spectra [n_wave, n_spectra]
-    wavelength : numpy.ndarray
-        Wavelength array
-    bin_indices : list
-        List of arrays with indices for each bin
-    velocity_field : numpy.ndarray
-        Velocity field for correction
-    n_x : int
-        Number of pixels in x direction
-    n_y : int
-        Number of pixels in y direction
-        
-    Returns
-    -------
-    numpy.ndarray
-        Combined bin spectra array [n_wave, n_bins]
-    """
-    n_wave = len(wavelength)
-    n_bins = len(bin_indices)
-    c = 299792.458  # Speed of light in km/s
-    
-    # Initialize output array
-    bin_spectra = np.zeros((n_wave, n_bins))
-    
-    # Set velocity limits for outlier correction
-    vel_limit = 300  # Maximum velocity difference from median (km/s)
-    max_velocity = 300  # Maximum absolute velocity (km/s)
-    
-    # Process each bin
-    for i, indices in enumerate(bin_indices):
-        # Skip empty bins
-        if len(indices) == 0:
-            bin_spectra[:, i] = np.nan
-            continue
-        
-        try:
-            # Extract velocities for this bin
+            # Get velocities for this bin
             bin_velocities = []
-            for idx in indices:
+            for idx_pos, idx in enumerate(indices):
                 row = idx // n_x
                 col = idx % n_x
-                if row < n_y and col < n_x:
-                    if velocity_field is not None and row < velocity_field.shape[0] and col < velocity_field.shape[1]:
+                if row < n_y and col < n_x and velocity_field is not None:
+                    if row < velocity_field.shape[0] and col < velocity_field.shape[1]:
                         vel = velocity_field[row, col]
                         if np.isfinite(vel):
                             bin_velocities.append(vel)
             
-            # Calculate median velocity for this bin
-            median_velocity = np.median(bin_velocities) if bin_velocities else 0
+            # Calculate median velocity for the bin
+            v_mid = np.median(bin_velocities) if bin_velocities else 0
             
-            # Collect velocity-corrected spectra
-            corrected_spectra = []
-            
-            for idx in indices:
+            # Process each spectrum in the bin
+            for idx_pos, idx in enumerate(indices):
+                # Get spectrum
                 spec = spectra[:, idx]
-                if not np.all(~np.isfinite(spec)):
-                    # Get velocity for this pixel
-                    vel = 0
-                    
-                    if velocity_field is not None:
-                        row = idx // n_x
-                        col = idx % n_x
-                        if row < velocity_field.shape[0] and col < velocity_field.shape[1]:
-                            pixel_vel = velocity_field[row, col]
-                            
-                            # Apply velocity limits as mentioned in your code snippet
-                            if np.isfinite(pixel_vel):
-                                # Check for outliers compared to bin median
-                                if abs(pixel_vel - median_velocity) > vel_limit:
-                                    vel = median_velocity
-                                    logger.debug(f"Velocity outlier in bin {i}: pixel_vel={pixel_vel:.1f}, median={median_velocity:.1f}")
-                                # Check for extreme velocities
-                                elif abs(pixel_vel) > max_velocity:
-                                    vel = 0
-                                    logger.debug(f"Extreme velocity in bin {i}: pixel_vel={pixel_vel:.1f}")
-                                else:
-                                    vel = pixel_vel
-                    
-                    # Apply velocity shift
-                    if abs(vel) > 1.0:  # Only apply for non-negligible velocities
-                        try:
-                            # Shift wavelength in opposite direction of velocity
-                            # For redshift (v > 0), we need a bluer template, so divide lambda
-                            # For blueshift (v < 0), we need a redder template, so multiply lambda
-                            lam_shifted = wavelength / (1 + vel/c)
-                            
-                            # Use spectres for resampling
-                            from utils.calc import spectres
-                            corrected_spec = spectres(wavelength, lam_shifted, spec)
-                            corrected_spectra.append(corrected_spec)
-                        except Exception as e:
-                            logger.debug(f"Error in velocity correction for bin {i}, pixel {idx}: {e}")
-                            corrected_spectra.append(spec)  # Add original as fallback
-                    else:
-                        corrected_spectra.append(spec)
+                
+                # Skip if spectrum is all NaN
+                if np.all(~np.isfinite(spec)):
+                    continue
+                
+                # Get velocity for this pixel
+                vel = 0
+                if velocity_field is not None:
+                    row = idx // n_x
+                    col = idx % n_x
+                    if row < velocity_field.shape[0] and col < velocity_field.shape[1]:
+                        vel = velocity_field[row, col]
+                        
+                        # Apply velocity limits
+                        if abs(vel - v_mid) > del_v_lim:
+                            vel = v_mid
+                        if abs(vel) > v_LR:
+                            vel = 0
+                
+                # Apply velocity correction
+                if abs(vel) > 0:
+                    try:
+                        # Create wavelength range for destination
+                        # Use min/max of wavelength as the range
+                        
+                        # Apply velocity shift to wavelength grid
+                        lam_shifted = wavelength.copy()
+                        for i in range(len(lam_shifted)):
+                            lam_shifted[i] = lam_shifted[i] / (1 + (vel/c))
+                        
+                        # Create target wavelength grid
+                        
+                        
+                        # Resample spectrum to the velocity-corrected grid
+                        corrected_spec = spectres(w_arg, lam_shifted, spec)
+                        
+                        # Store the corrected spectrum
+                        spc_vel_fix[:, idx_pos] = corrected_spec
+                    except Exception as e:
+                        logger.debug(f"Error in velocity correction for pixel {idx}: {e}")
+                        spc_vel_fix[:, idx_pos] = spec  # Use original spectrum as fallback
+                else:
+                    # No velocity correction needed
+                    spc_vel_fix[:, idx_pos] = spec
             
-            # Combine spectra if any valid
-            if corrected_spectra:
-                # Convert to array for easier operations
-                spectra_array = np.array(corrected_spectra)
-                
-                # Compute median spectrum - more robust than mean
-                bin_spectra[:, i] = np.nanmedian(spectra_array, axis=0)
-                
-                # Set all-NaN wavelengths to NaN in result
-                all_nan = np.all(~np.isfinite(spectra_array), axis=0)
-                bin_spectra[all_nan, i] = np.nan
-            else:
-                # No valid spectra
-                bin_spectra[:, i] = np.nan
-                
+            # Combine the corrected spectra using median
+            # print('\nTS A')
+            bin_spectra[:, bin_idx] = np.nanmedian(spc_vel_fix, axis=1)
+            # print(spc_vel_fix)
+            # print('TS B\n')
         except Exception as e:
-            logger.error(f"Error combining spectra for bin {i}: {e}")
-            bin_spectra[:, i] = np.nan
+            logger.error(f"Error combining spectra for bin {bin_idx}: {e}")
+            bin_spectra[:, bin_idx] = np.nan
     
-    return bin_spectra
+    return w_arg,bin_spectra
+
 
 def create_grid_binning(x, y, signal, noise, nx=4, ny=4, xmin=None, xmax=None, ymin=None, ymax=None):
     """
@@ -1047,8 +807,8 @@ def calculate_wavelength_intersection(wavelength, velocity_field, n_x):
     # Calculate wavelength limits
     # For redshifted spectra, the maximum wavelength becomes larger
     # For blueshifted spectra, the minimum wavelength becomes smaller
-    min_factor = 1 + min_vel/c
-    max_factor = 1 + max_vel/c
+    min_factor = 1 + (min_vel/c)
+    max_factor = 1 + (max_vel/c)
     
     # The observed range must be adjusted to account for all possible velocity shifts
     # This ensures that after shifting, all spectra cover the same rest-frame range
@@ -1104,14 +864,14 @@ def run_analysis_on_binned_data(args, binned_data, cube, p2p_results=None):
         
         # Create P2P processor
         p2p_processor = create_p2p_processor(run_p2p_analysis)
-        
+        print('TS B')
         # Run P2P analysis on binned data
         bin_p2p_results = p2p_processor(args, binned_data, p2p_results)
-        
+        print('TS A')
         # Extract bin results
         bin_adapter = BinnedDataAdapter(binned_data)
         results = extract_bin_results(bin_p2p_results, bin_adapter, result_type='vnb')
-        
+        print('TS C')
         # Format results for consistency with VNB output
         formatted_results = {
             'stellar_kinematics': {

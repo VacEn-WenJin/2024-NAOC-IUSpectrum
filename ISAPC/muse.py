@@ -331,17 +331,20 @@ class MUSECube:
                         
                         # Calculate signal as median of model
                         signal = np.nanmedian(model)
+                        if signal < 0:
+                            signal = 0.1
                         
                         # Calculate noise as std of residuals
                         residual = observed - model
                         noise = np.nanstd(residual)
                         
                         # Calculate SNR
-                        if noise > 0:
-                            snr = signal / noise
-                            snr_map[y, x] = snr
-                            signal_map[y, x] = signal
-                            noise_map[y, x] = noise
+                        if noise < 1:
+                            noise = 1
+                        snr = signal / noise
+                        snr_map[y, x] = snr
+                        signal_map[y, x] = signal
+                        noise_map[y, x] = noise
             
             return {
                 'snr': snr_map,
@@ -819,8 +822,15 @@ class MUSECube:
                     self._optimal_tmpls[:, row, col] = result['NEL_cal_tmp']
                 # Update kinematics if needed
                 if 'sol' in result and result['sol'] is not None:
-                    self._velocity_field[row, col] = result['sol'][0]
-                    self._dispersion_field[row, col] = result['sol'][1]
+                    if abs(result['sol'][0]) < 300:
+                        self._velocity_field[row, col] = result['sol'][0]
+                    else:
+                        self._velocity_field[row, col] = 0
+                    
+                    if result['sol'][1] < 300:
+                        self._dispersion_field[row, col] = result['sol'][1]
+                    else:
+                        self._dispersion_field[row, col] = 0
                 
                 # Save emission line flux and velocity information
                 if 'flux' in result and result['flux'] is not None:
@@ -882,7 +892,7 @@ class MUSECube:
             #     'velocity_field': self._velocity_field,
             #     'dispersion_field': self._dispersion_field,
             #     }
-        
+            return result_dict
         except Exception as e:
             logger.error(f"Error fitting emission lines: {str(e)}")
             logger.setLevel(original_level)
