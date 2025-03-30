@@ -1268,3 +1268,224 @@ def plot_kinematics_summary(velocity_field, dispersion_field, bin_map=None,
     plt.tight_layout()
     
     return fig
+
+
+def plot_bin_spectrum_fit(wavelength, bin_idx, bin_spectrum, bin_bestfit, 
+                         bin_gas_bestfit=None, bin_stellar_bestfit=None,
+                         ax=None, title=None, plot_range=None, figsize=(12, 6)):
+    """
+    Plot spectrum fitting results for a specific bin
+    
+    Parameters
+    ----------
+    wavelength : ndarray
+        Wavelength array
+    bin_idx : int
+        Bin index to plot
+    bin_spectrum : ndarray
+        2D array of bin spectra [n_wave, n_bins]
+    bin_bestfit : ndarray
+        2D array of best-fit spectra [n_wave, n_bins]
+    bin_gas_bestfit : ndarray, optional
+        2D array of gas component best-fit [n_wave, n_bins]
+    bin_stellar_bestfit : ndarray, optional
+        2D array of stellar component best-fit [n_wave, n_bins]
+    ax : matplotlib.axes, optional
+        Axis to plot on (will create new figure if None)
+    title : str, optional
+        Title for the plot (will use default if None)
+    plot_range : tuple, optional
+        Wavelength range to plot (min, max)
+    figsize : tuple, default=(12, 6)
+        Figure size for new figure
+        
+    Returns
+    -------
+    tuple
+        (fig, axes) - Figure and axes objects
+    """
+    # Create figure if needed
+    if ax is None:
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=figsize, 
+                                      gridspec_kw={'height_ratios': [3, 1]})
+    else:
+        # If ax is provided, create a residual subplot below it
+        fig = ax.figure
+        gs = ax.get_gridspec()
+        ax1 = ax
+        
+        # Create residual subplot
+        for i, axis in enumerate(fig.axes):
+            if axis == ax:
+                # Create new subplot below this one
+                ax2 = fig.add_subplot(gs[i+1])
+                break
+    
+    try:
+        # Extract spectra for this bin
+        if bin_spectrum.ndim == 2 and bin_spectrum.shape[1] > bin_idx:
+            observed = bin_spectrum[:, bin_idx]
+        else:
+            observed = bin_spectrum.flatten()
+            
+        if bin_bestfit.ndim == 2 and bin_bestfit.shape[1] > bin_idx:
+            model = bin_bestfit[:, bin_idx]
+        else:
+            model = bin_bestfit.flatten()
+        
+        # Get gas and stellar components if provided
+        if bin_gas_bestfit is not None:
+            if bin_gas_bestfit.ndim == 2 and bin_gas_bestfit.shape[1] > bin_idx:
+                gas = bin_gas_bestfit[:, bin_idx]
+            else:
+                gas = bin_gas_bestfit.flatten()
+        else:
+            gas = None
+            
+        if bin_stellar_bestfit is not None:
+            if bin_stellar_bestfit.ndim == 2 and bin_stellar_bestfit.shape[1] > bin_idx:
+                stellar = bin_stellar_bestfit[:, bin_idx]
+            else:
+                stellar = bin_stellar_bestfit.flatten()
+        elif gas is not None:
+            # Calculate stellar = total - gas
+            stellar = model - gas
+        else:
+            stellar = None
+        
+        # Calculate residual
+        residual = observed - model
+        
+        # Filter wavelength range if provided
+        if plot_range is not None:
+            wmin, wmax = plot_range
+            wave_mask = (wavelength >= wmin) & (wavelength <= wmax)
+            
+            # Apply mask if any valid points
+            if np.any(wave_mask):
+                plot_wave = wavelength[wave_mask]
+                plot_observed = observed[wave_mask]
+                plot_model = model[wave_mask]
+                plot_residual = residual[wave_mask]
+                
+                if gas is not None:
+                    plot_gas = gas[wave_mask]
+                else:
+                    plot_gas = None
+                    
+                if stellar is not None:
+                    plot_stellar = stellar[wave_mask]
+                else:
+                    plot_stellar = None
+            else:
+                # Use full range if no valid points in specified range
+                plot_wave = wavelength
+                plot_observed = observed
+                plot_model = model
+                plot_residual = residual
+                plot_gas = gas
+                plot_stellar = stellar
+        else:
+            # Use full range
+            plot_wave = wavelength
+            plot_observed = observed
+            plot_model = model
+            plot_residual = residual
+            plot_gas = gas
+            plot_stellar = stellar
+        
+        # Check if we have any valid data
+        if not np.any(np.isfinite(plot_observed)) or not np.any(np.isfinite(plot_model)):
+            ax1.text(0.5, 0.5, "No valid data for this bin", 
+                    ha='center', va='center', transform=ax1.transAxes)
+            ax2.text(0.5, 0.5, "No valid data", 
+                    ha='center', va='center', transform=ax2.transAxes)
+            
+            # Set title
+            if title:
+                ax1.set_title(title)
+            else:
+                ax1.set_title(f"Bin {bin_idx} - No valid data")
+                
+            return fig, (ax1, ax2)
+        
+        # Plot observed data and model
+        ax1.plot(plot_wave, plot_observed, 'k-', label='Observed', alpha=0.7, lw=1)
+        ax1.plot(plot_wave, plot_model, 'r-', label='Model', lw=1.5)
+        
+        # Plot components if available
+        if plot_stellar is not None and np.any(np.isfinite(plot_stellar)):
+            ax1.plot(plot_wave, plot_stellar, 'b-', label='Stellar', lw=1, alpha=0.8)
+            
+        if plot_gas is not None and np.any(np.isfinite(plot_gas)):
+            ax1.plot(plot_wave, plot_gas, 'g-', label='Gas', lw=1, alpha=0.8)
+        
+        # Plot residual
+        ax2.plot(plot_wave, plot_residual, 'k-', lw=1)
+        ax2.axhline(y=0, color='r', linestyle='-', lw=0.5)
+        
+        # Calculate axis limits robustly
+        try:
+            # Get all valid spectra for y-axis limits
+            all_data = [d for d in [plot_observed, plot_model, plot_stellar, plot_gas] 
+                       if d is not None and np.any(np.isfinite(d))]
+            
+            if all_data:
+                # Concatenate all data
+                all_values = np.concatenate([d[np.isfinite(d)] for d in all_data])
+                
+                if len(all_values) > 0:
+                    # Set y limits with 5% padding
+                    ymin = np.percentile(all_values, 1)
+                    ymax = np.percentile(all_values, 99)
+                    yrange = ymax - ymin
+                    ax1.set_ylim(ymin - 0.05*yrange, ymax + 0.05*yrange)
+                    
+                    # Set residual limits
+                    valid_residual = plot_residual[np.isfinite(plot_residual)]
+                    if len(valid_residual) > 0:
+                        res_ymin = np.percentile(valid_residual, 1)
+                        res_ymax = np.percentile(valid_residual, 99)
+                        res_yrange = max(res_ymax - res_ymin, 1e-10)
+                        ax2.set_ylim(res_ymin - 0.05*res_yrange, res_ymax + 0.05*res_yrange)
+        except Exception as e:
+            # Fall back to automatic scaling
+            logger.warning(f"Error calculating plot limits: {e}")
+        
+        # Add labels and title
+        ax1.set_ylabel('Flux')
+        ax1.legend(loc='upper right')
+        
+        if title:
+            ax1.set_title(title)
+        else:
+            ax1.set_title(f"Bin {bin_idx} - Spectrum Fit")
+            
+        ax2.set_xlabel('Wavelength (Å)')
+        ax2.set_ylabel('Residual')
+        
+        # Hide x-ticks for top panel
+        ax1.set_xticklabels([])
+        
+        # Adjust spacing between subplots
+        plt.subplots_adjust(hspace=0.1)
+        
+        return fig, (ax1, ax2)
+        
+    except Exception as e:
+        # Handle errors
+        logger.warning(f"Error plotting bin spectrum: {e}")
+        
+        # Display error message
+        if ax1 is not None:
+            ax1.text(0.5, 0.5, f"Error plotting spectrum: {str(e)}", 
+                    ha='center', va='center', transform=ax1.transAxes)
+        if ax2 is not None:
+            ax2.axis('off')  # Hide residual axis
+            
+        if title:
+            ax1.set_title(title)
+        else:
+            ax1.set_title(f"Bin {bin_idx} - Error")
+            
+        return fig, (ax1, ax2)

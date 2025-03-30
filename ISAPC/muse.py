@@ -298,8 +298,6 @@ class MUSECube:
             logger.error(f"Error preprocessing cube: {str(e)}")
             raise
 
-
-
     def setup_binning(self, bin_type, bin_data):
         """
         Set up binning information in the cube for binned analysis
@@ -359,7 +357,6 @@ class MUSECube:
         self._bin_ln_wavelength = np.log(self._binned_wavelength)
         
         logger.info(f"Cube set up for {bin_type} analysis with {self._n_bins} bins")
-
 
     def calculate_snr(self, continuum_range=None):
         """
@@ -442,7 +439,6 @@ class MUSECube:
         except Exception as e:
             logger.error(f"Error calculating SNR: {str(e)}")
             return None
-
 
     def _calculate_snr_binned(self, continuum_range=None):
         """
@@ -545,7 +541,6 @@ class MUSECube:
             logger.error(f"Error calculating SNR for binned data: {str(e)}")
             return None
 
-
     def fit_spectra(
         self,
         template_filename: str,
@@ -566,7 +561,6 @@ class MUSECube:
             # Original pixel-by-pixel implementation
             return self._fit_spectra_original(template_filename, ppxf_vel_init, 
                                             ppxf_vel_disp_init, ppxf_deg, n_jobs)
-
 
     def _fit_spectra_original(
             self,
@@ -960,7 +954,6 @@ class MUSECube:
                     np.full((n_wave_temp, self._n_y, self._n_x), np.nan),
                     [])
 
-
     def fit_emission_lines(
         self,
         template_filename: str,
@@ -1010,7 +1003,6 @@ class MUSECube:
             # Original pixel-by-pixel implementation
             return self._fit_emission_lines_original(template_filename, line_names, ppxf_vel_init,
                                                 ppxf_sig_init, ppxf_deg, n_jobs, verbose)
-        
 
     def _fit_emission_lines_original(
         self,
@@ -2589,6 +2581,205 @@ class MUSECube:
         except Exception as e:
             logger.error(f"Error plotting fit for spaxel ({row}, {col}): {str(e)}")
             return None
+
+    def plot_bin_fit(self, bin_idx, wavelength_range=None, figsize=(12, 6), save_path=None):
+        """
+        Plot the spectrum and fit for a specific bin in binned mode
+        
+        Parameters
+        ----------
+        bin_idx : int
+            Bin index to plot
+        wavelength_range : tuple, optional
+            Wavelength range to plot [min, max]
+        figsize : tuple, default=(12, 6)
+            Figure size
+        save_path : str, optional
+            Path to save the figure
+            
+        Returns
+        -------
+        tuple
+            (fig, axes) - Figure and axes objects
+        """
+        import visualization
+        
+        if not hasattr(self, '_is_binned') or not self._is_binned:
+            logger.warning("Not in binned mode, can't plot bin fit")
+            return None
+        
+        if not hasattr(self, '_bin_bestfit') or self._bin_bestfit is None:
+            logger.warning("No bin fitting results available, run fit_spectra() first")
+            return None
+        
+        if bin_idx < 0 or bin_idx >= self._n_bins:
+            logger.warning(f"Invalid bin index {bin_idx}, valid range is 0-{self._n_bins-1}")
+            return None
+        
+        try:
+            # Get gas best fit if available
+            bin_gas_bestfit = self._bin_gas_bestfit if hasattr(self, '_bin_gas_bestfit') else None
+            
+            # Get stellar best fit if directly available, or calculate as total - gas
+            if hasattr(self, '_bin_stellar_bestfit'):
+                bin_stellar_bestfit = self._bin_stellar_bestfit
+            elif bin_gas_bestfit is not None:
+                # Calculate stellar = total - gas
+                bin_stellar_bestfit = self._bin_bestfit - bin_gas_bestfit
+            else:
+                bin_stellar_bestfit = None
+            
+            # Get wavelength range for plot
+            if wavelength_range is None:
+                # Default to full wavelength range
+                wavelength_range = (
+                    np.min(self._binned_wavelength), 
+                    np.max(self._binned_wavelength)
+                )
+                
+                # Try to find interesting spectral features to include
+                if hasattr(self, '_emission_wavelength') and self._emission_wavelength:
+                    # Find emission line wavelengths
+                    emission_waves = list(self._emission_wavelength.values())
+                    if emission_waves:
+                        # Calculate range to include main emission lines
+                        em_min = min(emission_waves) - 100
+                        em_max = max(emission_waves) + 100
+                        
+                        # Use emission line range if it's within our data
+                        if (em_min > wavelength_range[0] and 
+                            em_max < wavelength_range[1] and 
+                            em_max - em_min > 200):
+                            wavelength_range = (em_min, em_max)
+            
+            # Create title with bin info
+            title = f"Bin {bin_idx}"
+            
+            # Add velocity and dispersion if available
+            if hasattr(self, '_bin_velocity') and len(self._bin_velocity) > bin_idx:
+                vel = self._bin_velocity[bin_idx]
+                disp = self._bin_dispersion[bin_idx]
+                if np.isfinite(vel) and np.isfinite(disp):
+                    title += f" - V={vel:.1f} km/s, σ={disp:.1f} km/s"
+            
+            # If this is a radial bin, add radius information
+            if hasattr(self, '_bin_radii') and len(self._bin_radii) > bin_idx:
+                radius = self._bin_radii[bin_idx]
+                if np.isfinite(radius):
+                    title += f" - Radius={radius:.1f} arcsec"
+            
+            # Call visualization function
+            fig, axes = visualization.plot_bin_spectrum_fit(
+                self._binned_wavelength,
+                bin_idx,
+                self._binned_spectra,
+                self._bin_bestfit,
+                bin_gas_bestfit=bin_gas_bestfit,
+                bin_stellar_bestfit=bin_stellar_bestfit,
+                title=title,
+                plot_range=wavelength_range,
+                figsize=figsize
+            )
+            
+            # Save figure if path provided
+            if save_path is not None:
+                fig.savefig(save_path, dpi=150, bbox_inches='tight')
+                logger.info(f"Saved bin spectrum plot to {save_path}")
+            
+            return fig, axes
+        
+        except Exception as e:
+            logger.error(f"Error plotting bin fit: {e}")
+            return None
+
+    def plot_bin_fits(self, bin_indices=None, n_bins=5, wavelength_range=None, 
+                    figsize=(12, 6), save_dir=None):
+        """
+        Plot fits for multiple bins
+        
+        Parameters
+        ----------
+        bin_indices : list, optional
+            List of bin indices to plot. If None, will use evenly spaced bins.
+        n_bins : int, default=5
+            Number of bins to plot if bin_indices is None
+        wavelength_range : tuple, optional
+            Wavelength range to plot [min, max]
+        figsize : tuple, default=(12, 6)
+            Figure size
+        save_dir : str, optional
+            Directory to save figures (will create if doesn't exist)
+            
+        Returns
+        -------
+        list
+            List of (fig, axes) tuples
+        """
+        if not hasattr(self, '_is_binned') or not self._is_binned:
+            logger.warning("Not in binned mode, can't plot bin fits")
+            return []
+        
+        if not hasattr(self, '_bin_bestfit') or self._bin_bestfit is None:
+            logger.warning("No bin fitting results available, run fit_spectra() first")
+            return []
+        
+        # Determine which bins to plot
+        if bin_indices is None:
+            # Choose evenly spaced bins
+            valid_bins = []
+            for i in range(self._n_bins):
+                if (hasattr(self, '_bin_velocity') and 
+                    i < len(self._bin_velocity) and 
+                    np.isfinite(self._bin_velocity[i])):
+                    valid_bins.append(i)
+            
+            if len(valid_bins) == 0:
+                logger.warning("No valid bins with fits found")
+                return []
+                
+            # Take evenly spaced indices
+            if len(valid_bins) <= n_bins:
+                bin_indices = valid_bins
+            else:
+                step = len(valid_bins) // n_bins
+                bin_indices = valid_bins[::step][:n_bins]
+        
+        # Create save directory if provided
+        if save_dir is not None:
+            import os
+            from pathlib import Path
+            save_path = Path(save_dir)
+            save_path.mkdir(exist_ok=True, parents=True)
+        
+        # Plot each bin
+        results = []
+        for bin_idx in bin_indices:
+            if bin_idx < 0 or bin_idx >= self._n_bins:
+                continue
+                
+            # Create save path if needed
+            if save_dir is not None:
+                if hasattr(self, '_bin_type'):
+                    # Include bin type in filename
+                    save_file = f"{self._bin_type}_bin_{bin_idx}_fit.png"
+                else:
+                    save_file = f"bin_{bin_idx}_fit.png"
+                save_path_bin = os.path.join(save_dir, save_file)
+            else:
+                save_path_bin = None
+            
+            # Plot bin fit
+            result = self.plot_bin_fit(
+                bin_idx, 
+                wavelength_range=wavelength_range,
+                figsize=figsize,
+                save_path=save_path_bin
+            )
+            
+            if result is not None:
+                results.append(result)
+        
+        return results
 
     @property
     def redshift(self):

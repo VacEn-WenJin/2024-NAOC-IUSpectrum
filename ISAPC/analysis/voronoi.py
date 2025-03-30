@@ -505,6 +505,22 @@ def run_vnb_analysis(args, cube, p2p_results=None):
     if not hasattr(args, 'no_plots') or not args.no_plots:
         binned_data.create_visualization_plots(plots_dir, galaxy_name)
         create_vnb_plots(cube, vnb_results, galaxy_name, plots_dir, args)
+
+    
+    # Add these lines near the end of the run_vnb_analysis function in voronoi.py
+    # Just before returning the results
+
+    # Create bin spectrum plots if requested
+    if not args.no_plots:
+        # Create directory for bin plots
+        bin_plots_dir = plots_dir / "bin_spectra"
+        bin_plots_dir.mkdir(exist_ok=True, parents=True)
+        
+        # Plot a sample of bin spectra
+        try:
+            cube.plot_bin_fits(n_bins=min(5, cube._n_bins), save_dir=bin_plots_dir)
+        except Exception as e:
+            logger.warning(f"Error creating bin fitting plots: {e}")
     
     logger.info(f"VNB analysis completed in {time.time() - start_time:.1f} seconds")
     

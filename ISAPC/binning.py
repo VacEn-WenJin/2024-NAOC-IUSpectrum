@@ -744,6 +744,7 @@ def combine_spectra_efficiently(spectra, wavelength, bin_indices, velocity_field
     
     return bin_spectra
 
+
 def create_grid_binning(x, y, signal, noise, nx=3, ny=3, xmin=None, xmax=None, ymin=None, ymax=None):
     """
     Create a grid-based binning as a reliable fallback
