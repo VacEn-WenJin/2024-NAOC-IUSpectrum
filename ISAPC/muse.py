@@ -1033,7 +1033,7 @@ class MUSECube:
             Number of parallel jobs to run
         verbose : bool, default=True
             Whether to print verbose output
-            
+                
         Returns
         -------
         Dict[str, Any]
@@ -1081,13 +1081,28 @@ class MUSECube:
                 valid_indices = []
                 for i, name in enumerate(gas_names):
                     base_name = name.split('_(')[0] if '_(' in name else name
-                    if any(requested.lower() in base_name.lower() for requested in line_names):
+                    
+                    # Improved matching to handle special characters in line names
+                    match_found = False
+                    for requested in line_names:
+                        # Clean up names for comparison by removing special characters
+                        cleaned_base = base_name.replace('[', '').replace(']', '').replace('_d', '')
+                        cleaned_requested = requested.replace('[', '').replace(']', '').replace('_d', '')
+                        
+                        if cleaned_requested.lower() in cleaned_base.lower():
+                            match_found = True
+                            break
+                    
+                    if match_found:
                         valid_indices.append(i)
-                
+                    
                 if valid_indices:
                     gas_templates = gas_templates[:, valid_indices]
                     gas_names = [gas_names[i] for i in valid_indices]
                     line_wave = [line_wave[i] for i in valid_indices]
+                else:
+                    logger.warning(f"No matching emission lines found for: {line_names}")
+                    logger.warning(f"Available lines: {[n.split('_(')[0] for n in gas_names]}")
             
             # Store emission line wavelengths for reference
             self._emission_wavelength = dict(zip(gas_names, line_wave))
@@ -1144,7 +1159,7 @@ class MUSECube:
                     stars_gas_templates = np.column_stack([optimal_template, gas_templates])
                     
                     # Define component types - [0] for stellar, [1] for gas components
-                    component = [0] + [1]*2  # This indicates 2 gas components
+                    component = [0] + [1]*gas_templates.shape[1]  # Correct number based on actual templates
                     gas_component = np.array(component) > 0  # True for gas components
                     
                     # Define moments for each component type
@@ -1305,9 +1320,12 @@ class MUSECube:
                                 self._emission_vel[base_name][row, col] = result['gas_sol'][0]
                                 self._emission_sig[base_name][row, col] = result['gas_sol'][1]
             
+            # Post-process emission line results
+            self._post_process_emission_results()
+            
             # Restore original log level
             logger.setLevel(original_level)
-            # Return result dictionary
+            
             # Calculate SNR after emission line fitting (more accurate with full model)
             snr_info = self.calculate_snr()
             if snr_info is not None:
@@ -1338,17 +1356,6 @@ class MUSECube:
                     'dispersion_field': self._dispersion_field
                 }
 
-            # return result_dict
-            # return {
-            #     'emission_flux': self._emission_flux,
-            #     'emission_vel': self._emission_vel,
-            #     'emission_sig': self._emission_sig,
-            #     'gas_bestfit_field': self._gas_bestfit_field,
-            #     'emission_wavelength': self._emission_wavelength,
-            #     'optimal_tmpls': self._optimal_tmpls,
-            #     'velocity_field': self._velocity_field,
-            #     'dispersion_field': self._dispersion_field,
-            #     }
             return result_dict
         except Exception as e:
             logger.error(f"Error fitting emission lines: {str(e)}")
@@ -1786,7 +1793,6 @@ class MUSECube:
                 'gas_bestfit_field': np.full((n_wave, self._n_y, self._n_x), np.nan),
                 'emission_wavelength': {}
             }
-
 
     def calculate_spectral_indices(self, indices_list=None, n_jobs=-1, verbose=False, use_binned=None):
         """
@@ -3295,6 +3301,46 @@ class MUSECube:
             logger.error(traceback.format_exc())
             return None
     
+    def _post_process_emission_results(self):
+        """
+        Post-process emission line results by replacing NaN values with zeros
+        where other pixels have data
+        """
+        # Check if we have emission line data
+        if not hasattr(self, '_emission_flux') or not self._emission_flux:
+            return
+        
+        # For each emission line
+        for line_name in self._emission_flux:
+            # Get the emission flux for this line
+            flux_map = self._emission_flux[line_name]
+            
+            # Check if we have any valid values
+            if np.any(np.isfinite(flux_map)):
+                # Replace NaNs with zeros
+                nan_mask = ~np.isfinite(flux_map)
+                flux_map[nan_mask] = 0.0
+                self._emission_flux[line_name] = flux_map
+                
+                # Also update velocity and dispersion maps
+                if hasattr(self, '_emission_vel') and line_name in self._emission_vel:
+                    vel_map = self._emission_vel[line_name]
+                    vel_map[nan_mask] = 0.0
+                    self._emission_vel[line_name] = vel_map
+                    
+                if hasattr(self, '_emission_sig') and line_name in self._emission_sig:
+                    sig_map = self._emission_sig[line_name]
+                    sig_map[nan_mask] = 0.0
+                    self._emission_sig[line_name] = sig_map
+        
+        # Also fix gas_bestfit_field if available
+        if hasattr(self, '_gas_bestfit_field') and self._gas_bestfit_field is not None:
+            # Find pixels with NaN values
+            nan_mask = ~np.isfinite(self._gas_bestfit_field)
+            if np.any(nan_mask):
+                # Replace NaNs with zeros
+                self._gas_bestfit_field[nan_mask] = 0.0
+
     @property
     def redshift(self):
         """Return the galaxy redshift"""

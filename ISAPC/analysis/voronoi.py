@@ -405,6 +405,11 @@ def run_vnb_analysis(args, cube, p2p_results=None):
             n_jobs=args.n_jobs
         )
     
+    # Before returning the results, add:
+    # Ensure emission lines are consistently processed
+    if emission_result is not None and hasattr(cube, '_post_process_emission_results'):
+        cube._post_process_emission_results()
+    
     # Calculate spectral indices if requested
     indices_result = None
     if not args.no_indices:
@@ -635,7 +640,7 @@ def create_vnb_plots(cube, vnb_results, galaxy_name, plots_dir, args):
                     vmax=np.percentile(velocity[np.isfinite(velocity)], 95),
                     colorbar_label='Velocity (km/s)'
                 )
-                plt.savefig(plots_dir / f"{galaxy_name}_VNB_velocity.png", dpi=150)
+                visualization.standardize_figure_saving(fig, plots_dir / f"{galaxy_name}_VNB_velocity.png")
                 plt.close(fig)
                 
                 # Create dispersion map
@@ -650,7 +655,7 @@ def create_vnb_plots(cube, vnb_results, galaxy_name, plots_dir, args):
                     vmax=np.percentile(dispersion[np.isfinite(dispersion)], 95),
                     colorbar_label='Dispersion (km/s)'
                 )
-                plt.savefig(plots_dir / f"{galaxy_name}_VNB_dispersion.png", dpi=150)
+                visualization.standardize_figure_saving(fig, plots_dir / f"{galaxy_name}_VNB_dispersion.png")
                 plt.close(fig)
             except Exception as e:
                 logger.warning(f"Error creating kinematics plots: {e}")
@@ -675,7 +680,7 @@ def create_vnb_plots(cube, vnb_results, galaxy_name, plots_dir, args):
                             log_scale=True,
                             colorbar_label='Log Flux'
                         )
-                        plt.savefig(plots_dir / f"{galaxy_name}_VNB_{line_name}_flux.png", dpi=150)
+                        visualization.standardize_figure_saving(fig, plots_dir / f"{galaxy_name}_VNB_{line_name}_flux.png")
                         plt.close(fig)
             except Exception as e:
                 logger.warning(f"Error creating emission line plots: {e}")
@@ -711,7 +716,7 @@ def create_vnb_plots(cube, vnb_results, galaxy_name, plots_dir, args):
                             cmap='plasma',
                             label='Index Value'
                         )
-                        plt.savefig(plots_dir / f"{galaxy_name}_VNB_{idx_name}.png", dpi=150)
+                        visualization.standardize_figure_saving(fig, plots_dir / f"{galaxy_name}_VNB_{idx_name}.png")
                         plt.close(fig)
                     elif 'bin_indices' in vnb_results and idx_name in vnb_results['bin_indices']:
                         # Try bin-level indices
@@ -725,7 +730,7 @@ def create_vnb_plots(cube, vnb_results, galaxy_name, plots_dir, args):
                             title=f'{galaxy_name} - VNB {idx_name}',
                             colorbar_label='Index Value'
                         )
-                        plt.savefig(plots_dir / f"{galaxy_name}_VNB_{idx_name}.png", dpi=150)
+                        visualization.standardize_figure_saving(fig, plots_dir / f"{galaxy_name}_VNB_{idx_name}.png")
                         plt.close(fig)
             except Exception as e:
                 logger.warning(f"Error creating spectral indices plots: {e}")
@@ -752,9 +757,7 @@ def create_vnb_plots(cube, vnb_results, galaxy_name, plots_dir, args):
                                 label='Index Value'
                             )
                             
-                            plt.savefig(plots_dir / f"{galaxy_name}_VNB_{idx_name}.png", dpi=150)  # For voronoi.py
-                            # Or for radial.py:
-                            # plt.savefig(plots_dir / f"{galaxy_name}_RDB_{idx_name}.png", dpi=150)
+                            visualization.standardize_figure_saving(fig, plots_dir / f"{galaxy_name}_VNB_{idx_name}.png")
                             plt.close(fig)
             except Exception as e:
                 logger.warning(f"Error creating spectral indices maps: {e}")

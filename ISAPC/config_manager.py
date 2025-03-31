@@ -1,11 +1,8 @@
-"""
-Configuration management for ISAPC
-Handles loading and parsing of configuration settings
-"""
 import os
 import sys
 import logging
 import configparser
+import functools
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -23,8 +20,11 @@ CONFIG_LOCATIONS = [
 # Global configuration object
 _config = None
 
+import functools
+
+@functools.lru_cache(maxsize=1)
 def get_config():
-    """Get the global configuration object, loading it if necessary"""
+    """Get the global configuration object, loading it only once"""
     global _config
     if _config is None:
         _config = load_config()
@@ -87,10 +87,14 @@ def get_spectral_indices():
     """Get the list of default spectral indices to calculate"""
     config = get_config()
     indices_str = config.get('SpectralIndices', 'default_indices', 
-                            fallback='Hbeta, Fe5015, Mgb')
+                           fallback='Hbeta, Fe5015, Mgb')
     
-    # Parse comma-separated list
-    indices = [idx.strip() for idx in indices_str.split(',')]
+    # Remove any comments (anything after '#')
+    if '#' in indices_str:
+        indices_str = indices_str.split('#', 1)[0]
+    
+    # Parse comma-separated list and strip whitespace
+    indices = [idx.strip() for idx in indices_str.split(',') if idx.strip()]
     
     # Ensure Hbeta is included
     if 'Hbeta' not in indices:
@@ -105,8 +109,12 @@ def get_emission_lines():
     lines_str = config.get('EmissionLines', 'default_lines', 
                           fallback='Hbeta, OIII_4959, OIII_5007')
     
-    # Parse comma-separated list
-    lines = [line.strip() for line in lines_str.split(',')]
+    # Remove any comments (anything after '#')
+    if '#' in lines_str:
+        lines_str = lines_str.split('#', 1)[0]
+    
+    # Parse comma-separated list and strip whitespace
+    lines = [line.strip() for line in lines_str.split(',') if line.strip()]
     
     return lines
 

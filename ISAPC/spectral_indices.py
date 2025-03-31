@@ -768,8 +768,16 @@ class LineIndexCalculator:
         ax1.set_title(f'Original Data Comparison (v={self.velocity:.1f} km/s)')
         ax2.set_title('Processed Spectrum with Continuum Fits')
         
-        # Adjust layout
-        plt.tight_layout()
+        # Apply a safer approach to tight_layout
+        try:
+            plt.tight_layout()
+        except Warning:
+            # Ignore warnings about tight_layout
+            pass
+        except Exception as e:
+            logger.debug(f"Error applying tight_layout: {e}")
+            # Apply a more basic spacing adjustment
+            plt.subplots_adjust(hspace=0.3, wspace=0.3)
         
         # Save figure if path provided
         if save_path and mode_title:
@@ -782,7 +790,7 @@ class LineIndexCalculator:
             
             try:
                 # Save figure
-                plt.savefig(filepath, format='pdf', bbox_inches='tight')
+                fig.savefig(filepath, format='pdf', bbox_inches='tight')
                 print(f"Figure saved as: {filepath}")
             except Exception as e:
                 self._warn(f"Error saving figure: {str(e)}")

@@ -359,6 +359,10 @@ def run_rdb_analysis(args, cube, p2p_results=None):
                 ppxf_deg=2,
                 n_jobs=args.n_jobs
             )
+        # Before returning the results, add:
+        # Ensure emission lines are consistently processed
+        if emission_result is not None and hasattr(cube, '_post_process_emission_results'):
+            cube._post_process_emission_results()
         
         # Calculate spectral indices if requested
         indices_result = None
@@ -563,7 +567,7 @@ def create_rdb_plots(cube, rdb_results, galaxy_name, plots_dir, args):
                 ax.set_ylabel('Velocity (km/s)')
                 ax.set_title(f"{galaxy_name} - Radial Velocity Profile")
                 ax.grid(True, alpha=0.3)
-                plt.savefig(plots_dir / f"{galaxy_name}_RDB_velocity_profile.png", dpi=150)
+                visualization.standardize_figure_saving(fig, plots_dir / f"{galaxy_name}_RDB_velocity_profile.png")
                 plt.close(fig)
                 
                 # Create radial dispersion profile
@@ -573,7 +577,7 @@ def create_rdb_plots(cube, rdb_results, galaxy_name, plots_dir, args):
                 ax.set_ylabel('Dispersion (km/s)')
                 ax.set_title(f"{galaxy_name} - Radial Dispersion Profile")
                 ax.grid(True, alpha=0.3)
-                plt.savefig(plots_dir / f"{galaxy_name}_RDB_dispersion_profile.png", dpi=150)
+                visualization.standardize_figure_saving(fig, plots_dir / f"{galaxy_name}_RDB_dispersion_profile.png")
                 plt.close(fig)
                 
                 # Create combined kinematics plot
@@ -594,25 +598,25 @@ def create_rdb_plots(cube, rdb_results, galaxy_name, plots_dir, args):
                 axes[1].grid(True, alpha=0.3)
                 
                 plt.tight_layout()
-                plt.savefig(plots_dir / f"{galaxy_name}_RDB_kinematics_profile.png", dpi=150)
+                visualization.standardize_figure_saving(fig, plots_dir / f"{galaxy_name}_RDB_kinematics_profile.png")
                 plt.close(fig)
                 
                 # Also create 2D maps of the radial bins
                 bin_num = rdb_results['binning']['bin_num']
                 
+                # Ensure bin_num is properly formatted for plotting
+                if isinstance(bin_num, np.ndarray) and bin_num.ndim > 1:
+                    bin_num_2d = bin_num
+                else:
+                    # Reshape to 2D if possible
+                    try:
+                        bin_num_2d = bin_num.reshape(cube._n_y, cube._n_x)
+                    except:
+                        # Keep as is if reshape fails
+                        bin_num_2d = bin_num
+                
                 # Velocity map
                 fig, ax = plt.subplots(figsize=(10, 8))
-                # Reshape bin_num to 2D if it's 1D
-                bin_num_2d = bin_num
-                if bin_num.ndim == 1:
-                    # Reshape bin_num to 2D grid matching the original image dimensions
-                    bin_num_2d = np.full((cube._n_y, cube._n_x), -1)
-                    for i, bin_id in enumerate(bin_num):
-                        if i < cube._n_y * cube._n_x:
-                            row = i // cube._n_x
-                            col = i % cube._n_x
-                            bin_num_2d[row, col] = bin_id
-                            
                 visualization.plot_bin_map(
                     bin_num_2d, 
                     velocity, 
@@ -623,7 +627,7 @@ def create_rdb_plots(cube, rdb_results, galaxy_name, plots_dir, args):
                     vmax=np.percentile(velocity[np.isfinite(velocity)], 95),
                     colorbar_label='Velocity (km/s)'
                 )
-                plt.savefig(plots_dir / f"{galaxy_name}_RDB_velocity_map.png", dpi=150)
+                visualization.standardize_figure_saving(fig, plots_dir / f"{galaxy_name}_RDB_velocity_map.png")
                 plt.close(fig)
                 
                 # Dispersion map
@@ -638,7 +642,7 @@ def create_rdb_plots(cube, rdb_results, galaxy_name, plots_dir, args):
                     vmax=np.percentile(dispersion[np.isfinite(dispersion)], 95),
                     colorbar_label='Dispersion (km/s)'
                 )
-                plt.savefig(plots_dir / f"{galaxy_name}_RDB_dispersion_map.png", dpi=150)
+                visualization.standardize_figure_saving(fig, plots_dir / f"{galaxy_name}_RDB_dispersion_map.png")
                 plt.close(fig)
             except Exception as e:
                 logger.warning(f"Error creating kinematics plots: {e}")
@@ -651,37 +655,74 @@ def create_rdb_plots(cube, rdb_results, galaxy_name, plots_dir, args):
                 emission = rdb_results['emission']
                 bin_num = rdb_results['binning']['bin_num']
                 
-                # Find emission flux maps
-                for line_name, flux in emission.get('flux', {}).items():
-                    if isinstance(flux, np.ndarray) and len(flux) > 0:
-                        # Radial profile
-                        fig, ax = plt.subplots(figsize=(10, 6))
-                        ax.plot(bin_radii, flux, 'o-', label=line_name)
-                        ax.set_xlabel('Radius (arcsec)')
-                        ax.set_ylabel('Flux')
-                        ax.set_title(f"{galaxy_name} - {line_name} Radial Profile")
-                        ax.grid(True, alpha=0.3)
-                        
-                        # Try using log scale for y-axis if all values are positive
-                        if np.all(flux[np.isfinite(flux)] > 0):
-                            ax.set_yscale('log')
+                # Ensure bin_num is properly formatted for plotting
+                if isinstance(bin_num, np.ndarray) and bin_num.ndim > 1:
+                    bin_num_2d = bin_num
+                else:
+                    # Reshape to 2D if possible
+                    try:
+                        bin_num_2d = bin_num.reshape(cube._n_y, cube._n_x)
+                    except:
+                        # Keep as is if reshape fails
+                        bin_num_2d = bin_num
+                
+                # Check for flux dictionaries
+                flux_entries = {}
+                
+                # First try 'flux' dictionary
+                if 'flux' in emission and isinstance(emission['flux'], dict):
+                    flux_entries = emission['flux']
+                
+                # Also try other keys that might contain flux information
+                for key in emission:
+                    if key.startswith('flux_') and isinstance(emission[key], np.ndarray):
+                        line_name = key[5:]  # Remove 'flux_' prefix
+                        flux_entries[line_name] = emission[key]
+                    elif isinstance(emission[key], dict) and 'flux' in key.lower():
+                        # Might be a nested dictionary of fluxes
+                        for subkey, subvalue in emission[key].items():
+                            if isinstance(subvalue, np.ndarray):
+                                flux_entries[subkey] = subvalue
+                
+                # Process each emission line flux
+                for line_name, flux in flux_entries.items():
+                    if isinstance(flux, np.ndarray):
+                        # Check if flux has the right shape for radial profiles
+                        if len(flux) == len(bin_radii):
+                            # Good shape for radial profile - create plot
+                            fig, ax = plt.subplots(figsize=(10, 6))
                             
-                        plt.savefig(plots_dir / f"{galaxy_name}_RDB_{line_name}_profile.png", dpi=150)
-                        plt.close(fig)
-                        
-                        # 2D map
-                        fig, ax = plt.subplots(figsize=(10, 8))
-                        visualization.plot_bin_map(
-                            bin_num, 
-                            flux, 
-                            ax=ax, 
-                            cmap='inferno',
-                            title=f'{galaxy_name} - RDB {line_name} Flux',
-                            log_scale=True,
-                            colorbar_label='Log Flux'
-                        )
-                        plt.savefig(plots_dir / f"{galaxy_name}_RDB_{line_name}_map.png", dpi=150)
-                        plt.close(fig)
+                            # Replace NaN with zeros for plotting
+                            flux_plot = np.nan_to_num(flux, nan=0.0)
+                            
+                            ax.plot(bin_radii, flux_plot, 'o-', label=line_name)
+                            ax.set_xlabel('Radius (arcsec)')
+                            ax.set_ylabel('Flux')
+                            ax.set_title(f"{galaxy_name} - {line_name} Radial Profile")
+                            ax.grid(True, alpha=0.3)
+                            
+                            # Try using log scale for y-axis if all values are positive
+                            if np.all(flux_plot[np.isfinite(flux_plot)] > 0):
+                                ax.set_yscale('log')
+                                
+                            visualization.standardize_figure_saving(fig, plots_dir / f"{galaxy_name}_RDB_{line_name}_profile.png")
+                            plt.close(fig)
+                            
+                            # Create 2D map if bin_num is properly formatted
+                            fig, ax = plt.subplots(figsize=(10, 8))
+                            visualization.plot_bin_map(
+                                bin_num_2d, 
+                                flux_plot, 
+                                ax=ax, 
+                                cmap='inferno',
+                                title=f'{galaxy_name} - RDB {line_name} Flux',
+                                log_scale=True,
+                                colorbar_label='Log Flux'
+                            )
+                            visualization.standardize_figure_saving(fig, plots_dir / f"{galaxy_name}_RDB_{line_name}_map.png")
+                            plt.close(fig)
+                        else:
+                            logger.warning(f"Skipping {line_name} plot - dimension mismatch: bin_radii shape {bin_radii.shape}, flux shape {flux.shape}")
             except Exception as e:
                 logger.warning(f"Error creating emission line plots: {e}")
                 plt.close('all')
@@ -692,36 +733,51 @@ def create_rdb_plots(cube, rdb_results, galaxy_name, plots_dir, args):
                 bin_radii = rdb_results['distance']['bin_distances']
                 bin_num = rdb_results['binning']['bin_num']
                 
+                # Ensure bin_num is properly formatted for plotting
+                if isinstance(bin_num, np.ndarray) and bin_num.ndim > 1:
+                    bin_num_2d = bin_num
+                else:
+                    # Reshape to 2D if possible
+                    try:
+                        bin_num_2d = bin_num.reshape(cube._n_y, cube._n_x)
+                    except:
+                        # Keep as is if reshape fails
+                        bin_num_2d = bin_num
+                
                 indices_found = False
                 
                 # Try bin indices first
                 if 'bin_indices' in rdb_results:
                     for idx_name, idx_values in rdb_results['bin_indices'].items():
-                        if isinstance(idx_values, np.ndarray) and len(idx_values) == len(bin_radii):
-                            indices_found = True
-                            
-                            # Create radial profile
-                            fig, ax = plt.subplots(figsize=(10, 6))
-                            ax.plot(bin_radii, idx_values, 'o-', label=idx_name)
-                            ax.set_xlabel('Radius (arcsec)')
-                            ax.set_ylabel('Index Value')
-                            ax.set_title(f"{galaxy_name} - {idx_name} Radial Profile")
-                            ax.grid(True, alpha=0.3)
-                            plt.savefig(plots_dir / f"{galaxy_name}_RDB_{idx_name}_profile.png", dpi=150)
-                            plt.close(fig)
-                            
-                            # Create 2D map
-                            fig, ax = plt.subplots(figsize=(10, 8))
-                            visualization.plot_bin_map(
-                                bin_num, 
-                                idx_values, 
-                                ax=ax, 
-                                cmap='plasma',
-                                title=f'{galaxy_name} - RDB {idx_name}',
-                                colorbar_label='Index Value'
-                            )
-                            plt.savefig(plots_dir / f"{galaxy_name}_RDB_{idx_name}_map.png", dpi=150)
-                            plt.close(fig)
+                        if isinstance(idx_values, np.ndarray):
+                            # Check if dimensions match
+                            if len(idx_values) == len(bin_radii):
+                                indices_found = True
+                                
+                                # Create radial profile
+                                fig, ax = plt.subplots(figsize=(10, 6))
+                                ax.plot(bin_radii, idx_values, 'o-', label=idx_name)
+                                ax.set_xlabel('Radius (arcsec)')
+                                ax.set_ylabel('Index Value')
+                                ax.set_title(f"{galaxy_name} - {idx_name} Radial Profile")
+                                ax.grid(True, alpha=0.3)
+                                visualization.standardize_figure_saving(fig, plots_dir / f"{galaxy_name}_RDB_{idx_name}_profile.png")
+                                plt.close(fig)
+                                
+                                # Create 2D map
+                                fig, ax = plt.subplots(figsize=(10, 8))
+                                visualization.plot_bin_map(
+                                    bin_num_2d, 
+                                    idx_values, 
+                                    ax=ax, 
+                                    cmap='plasma',
+                                    title=f'{galaxy_name} - RDB {idx_name}',
+                                    colorbar_label='Index Value'
+                                )
+                                visualization.standardize_figure_saving(fig, plots_dir / f"{galaxy_name}_RDB_{idx_name}_map.png")
+                                plt.close(fig)
+                            else:
+                                logger.warning(f"Skipping {idx_name} plot - dimension mismatch: bin_radii shape {bin_radii.shape}, index shape {idx_values.shape}")
                 
                 # If no bin indices, try indices
                 if not indices_found and isinstance(rdb_results['indices'], dict):
@@ -730,58 +786,62 @@ def create_rdb_plots(cube, rdb_results, galaxy_name, plots_dir, args):
                         if hasattr(cube, '_bin_indices_result') and idx_name in cube._bin_indices_result:
                             bin_idx_values = cube._bin_indices_result[idx_name]
                             
-                            # Create radial profile
-                            fig, ax = plt.subplots(figsize=(10, 6))
-                            ax.plot(bin_radii, bin_idx_values, 'o-', label=idx_name)
-                            ax.set_xlabel('Radius (arcsec)')
-                            ax.set_ylabel('Index Value')
-                            ax.set_title(f"{galaxy_name} - {idx_name} Radial Profile")
-                            ax.grid(True, alpha=0.3)
-                            plt.savefig(plots_dir / f"{galaxy_name}_RDB_{idx_name}_profile.png", dpi=150)
-                            plt.close(fig)
-                            
-                            # Create 2D map
-                            fig, ax = plt.subplots(figsize=(10, 8))
-                            visualization.plot_bin_map(
-                                bin_num, 
-                                bin_idx_values, 
-                                ax=ax, 
-                                cmap='plasma',
-                                title=f'{galaxy_name} - RDB {idx_name}',
-                                colorbar_label='Index Value'
-                            )
-                            plt.savefig(plots_dir / f"{galaxy_name}_RDB_{idx_name}_map.png", dpi=150)
-                            plt.close(fig)
+                            # Check if dimensions match
+                            if len(bin_idx_values) == len(bin_radii):
+                                # Create radial profile
+                                fig, ax = plt.subplots(figsize=(10, 6))
+                                ax.plot(bin_radii, bin_idx_values, 'o-', label=idx_name)
+                                ax.set_xlabel('Radius (arcsec)')
+                                ax.set_ylabel('Index Value')
+                                ax.set_title(f"{galaxy_name} - {idx_name} Radial Profile")
+                                ax.grid(True, alpha=0.3)
+                                visualization.standardize_figure_saving(fig, plots_dir / f"{galaxy_name}_RDB_{idx_name}_profile.png")
+                                plt.close(fig)
+                                
+                                # Create 2D map
+                                fig, ax = plt.subplots(figsize=(10, 8))
+                                visualization.plot_bin_map(
+                                    bin_num_2d, 
+                                    bin_idx_values, 
+                                    ax=ax, 
+                                    cmap='plasma',
+                                    title=f'{galaxy_name} - RDB {idx_name}',
+                                    colorbar_label='Index Value'
+                                )
+                                visualization.standardize_figure_saving(fig, plots_dir / f"{galaxy_name}_RDB_{idx_name}_map.png")
+                                plt.close(fig)
+                            else:
+                                logger.warning(f"Skipping {idx_name} plot - dimension mismatch: bin_radii shape {bin_radii.shape}, index shape {bin_idx_values.shape}")
             except Exception as e:
                 logger.warning(f"Error creating spectral indices plots: {e}")
                 plt.close('all')
             
-            # Add this code to create_vnb_plots in voronoi.py and create_rdb_plots in radial.py:
-
             # Add spectral indices visualization
-            if 'indices' in rdb_results and 'bin_indices' in rdb_results:  # For voronoi.py
+            if 'indices' in rdb_results and 'bin_indices' in rdb_results:
                 try:
                     bin_indices = rdb_results['bin_indices']
                     if bin_indices and isinstance(bin_indices, dict):
                         for idx_name, idx_values in bin_indices.items():
                             if isinstance(idx_values, np.ndarray) and len(idx_values) > 0:
-                                # Create 2D index map
-                                fig, ax = plt.subplots(figsize=(10, 8))
-                                
-                                # Use safe_plot_array for robust plotting
-                                visualization.safe_plot_array(
-                                    idx_values, 
-                                    bin_num, 
-                                    ax=ax, 
-                                    title=f'{galaxy_name} - {idx_name}',
-                                    cmap='plasma',
-                                    label='Index Value'
-                                )
-                                
-                                plt.savefig(plots_dir / f"{galaxy_name}_RDB_{idx_name}.png", dpi=150)  # For voronoi.py
-                                # Or for radial.py:
-                                # plt.savefig(plots_dir / f"{galaxy_name}_RDB_{idx_name}.png", dpi=150)
-                                plt.close(fig)
+                                # Check if dimensions match
+                                if len(idx_values) == len(bin_radii):
+                                    # Create 2D index map
+                                    fig, ax = plt.subplots(figsize=(10, 8))
+                                    
+                                    # Use safe_plot_array for robust plotting
+                                    visualization.safe_plot_array(
+                                        idx_values, 
+                                        bin_num_2d, 
+                                        ax=ax, 
+                                        title=f'{galaxy_name} - {idx_name}',
+                                        cmap='plasma',
+                                        label='Index Value'
+                                    )
+                                    
+                                    visualization.standardize_figure_saving(fig, plots_dir / f"{galaxy_name}_RDB_{idx_name}.png")
+                                    plt.close(fig)
+                                else:
+                                    logger.warning(f"Skipping {idx_name} map - dimension mismatch: bin_radii shape {bin_radii.shape}, index shape {idx_values.shape}")
                 except Exception as e:
                     logger.warning(f"Error creating spectral indices maps: {e}")
                     plt.close('all')

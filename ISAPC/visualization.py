@@ -10,8 +10,26 @@ from matplotlib.patches import Ellipse
 import warnings
 from scipy.ndimage import gaussian_filter
 
+import os
+
 import logging
 logger = logging.getLogger(__name__)
+
+
+def standardize_figure_saving(fig, file_path, dpi=150):
+    """Standard approach to save figures with consistent settings"""
+    try:
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        
+        # Save with consistent settings
+        fig.savefig(file_path, dpi=dpi, bbox_inches='tight')
+        logger.info(f"Saved figure to {file_path}")
+        return True
+    except Exception as e:
+        logger.warning(f"Error saving figure to {file_path}: {e}")
+        return False
+    
 
 def plot_spectrum(wavelength, flux, ax=None, title='Spectrum', xlabel='Wavelength (Å)', 
                  ylabel='Flux', color='k', linewidth=1, alpha=1, label=None):
