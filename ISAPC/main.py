@@ -94,6 +94,26 @@ def setup_parser():
     parser.add_argument('--no-auto-reuse', action='store_false', dest='auto_reuse',
                         help='Disable automatic reuse of previous results')
     
+    # Find the argument parser setup section in main.py and add these lines:
+
+    # # Spectral indices controls
+    # parser.add_argument('--no-indices', action='store_true', default=False,
+    #                 help='Skip calculation of spectral indices')
+
+    # # Visualization controls
+    # parser.add_argument('--no-plots', action='store_true', default=False,
+    #                 help='Skip creation of visualization plots')
+    # parser.add_argument('--no-lic', action='store_true', default=False,
+    #                 help='Skip creation of LIC visualization')
+    # parser.add_argument('--no-emission-plots', action='store_true', default=False,
+    #                 help='Skip creation of emission line plots')
+    # parser.add_argument('--no-kinematic-plots', action='store_true', default=False,
+    #                 help='Skip creation of kinematic plots')
+    # parser.add_argument('--no-bin-plots', action='store_true', default=False,
+    #                 help='Skip creation of individual bin plots')
+    # parser.add_argument('--max-bin-plots', type=int, default=5,
+    #                 help='Maximum number of bin spectra to plot (default: 5)')
+    
     return parser
 
 def main():

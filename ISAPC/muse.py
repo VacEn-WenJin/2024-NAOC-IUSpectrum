@@ -2100,8 +2100,11 @@ class MUSECube:
                             for index_name, value in indices.items():
                                 self._spectral_indices[index_name][row, col] = value
             
-            # Return pixel-based results for compatibility
-            return self._spectral_indices
+            # Return index results (both bin and pixel versions)
+            return {
+                'bin_indices': self._bin_indices_result,
+                'pixel_indices': self._spectral_indices
+            }
             
         except Exception as e:
             logger.error(f"Error in binned spectral indices calculation: {str(e)}")
@@ -2887,20 +2890,87 @@ class MUSECube:
                     logger.warning(f"Error creating emission line plots: {e}")
             
             # 5. Spectral Indices
-            if (hasattr(self, '_bin_indices_result') and self._bin_indices_result and
-                hasattr(self, '_bin_num') and self._bin_num is not None):
+            if ((hasattr(self, '_bin_indices_result') and self._bin_indices_result) or 
+                (hasattr(self, 'bin_indices') and self.bin_indices)):
                 try:
-                    # Create spectral indices figures
-                    fig, axes = visualization.plot_bin_indices(
-                        self._bin_num.reshape(self._n_y, self._n_x),
-                        self._bin_indices_result,
-                        title=f"{self._bin_type} Spectral Indices" if hasattr(self, '_bin_type') else "Spectral Indices"
-                    )
-                    
-                    if fig is not None and output_dir is not None:
-                        fig.savefig(output_dir / "spectral_indices.png", dpi=150, bbox_inches='tight')
-                    
-                    figures['spectral_indices'] = (fig, axes)
+                    # Get indices dict - try both possible attributes
+                    if hasattr(self, '_bin_indices_result') and self._bin_indices_result:
+                        indices_dict = self._bin_indices_result
+                    elif hasattr(self, 'bin_indices') and self.bin_indices:
+                        indices_dict = self.bin_indices
+                    else:
+                        indices_dict = {}
+                        
+                    # Check if we have any indices to plot
+                    if indices_dict and isinstance(indices_dict, dict):
+                        # Create spectral indices figures
+                        bin_map = self._bin_num.reshape(self._n_y, self._n_x)
+                        
+                        # Get index names
+                        index_names = list(indices_dict.keys())
+                        if not index_names:
+                            raise ValueError("No spectral indices available")
+                            
+                        # Limit to 6 indices for display
+                        index_names = index_names[:6]
+                        n_indices = len(index_names)
+                        
+                        # Calculate figure layout
+                        if n_indices <= 3:
+                            nrows, ncols = 1, n_indices
+                        else:
+                            nrows = (n_indices + 2) // 3  # Ceiling division
+                            ncols = min(3, n_indices)
+                        
+                        # Create figure
+                        fig, axes = plt.subplots(nrows, ncols, figsize=(4*ncols, 4*nrows))
+                        
+                        # Handle different axes arrangements
+                        if n_indices == 1:
+                            axes = np.array([axes])
+                        
+                        # Ensure axes is array-like for iteration
+                        axes = np.atleast_1d(axes)
+                        
+                        # Plot each index
+                        for i, index_name in enumerate(index_names):
+                            if i < axes.size:  # Ensure we have an axis for this index
+                                # Get axis (handle both 1D and 2D axes arrays)
+                                if axes.ndim == 1:
+                                    ax = axes[i]
+                                else:
+                                    ax = axes.flat[i]
+                                    
+                                # Get values for this index
+                                values = indices_dict[index_name]
+                                
+                                # Use safe plotting function
+                                visualization.safe_plot_array(
+                                    values, bin_map, ax=ax,
+                                    title=index_name,
+                                    cmap='plasma',
+                                    label='Index Value'
+                                )
+                        
+                        # Hide any unused axes
+                        for i in range(n_indices, axes.size):
+                            if axes.ndim == 1 and i < len(axes):
+                                axes[i].axis('off')
+                            elif axes.ndim > 1:
+                                axes.flat[i].axis('off')
+                        
+                        # Add title
+                        fig.suptitle(f"{self._bin_type} Spectral Indices" if hasattr(self, '_bin_type') else "Spectral Indices", 
+                                fontsize=16)
+                        
+                        # Adjust layout
+                        plt.tight_layout(rect=[0, 0, 1, 0.95])  # Make room for title
+                        
+                        # Save figure
+                        if output_dir is not None:
+                            fig.savefig(output_dir / "spectral_indices.png", dpi=150, bbox_inches='tight')
+                        
+                        figures['spectral_indices'] = (fig, axes)
                 except Exception as e:
                     logger.warning(f"Error creating spectral indices plots: {e}")
             

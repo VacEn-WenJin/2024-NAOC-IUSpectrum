@@ -754,30 +754,60 @@ def safe_plot_array(data, bin_map, ax=None, title=None, cmap='viridis', label=No
         if not isinstance(data, np.ndarray):
             data = np.array(data)
         
+        # Check if bin_map is 1D and needs to be reshaped
+        bin_map_np = np.asarray(bin_map)
+        if bin_map_np.ndim == 1:
+            # If we have a 1D bin_map, we need to create a 2D visualization
+            # Try to find the ny, nx dimensions in attributes of the calling object
+            if hasattr(ax, '_ny') and hasattr(ax, '_nx'):
+                ny, nx = ax._ny, ax._nx
+            else:
+                # Try to guess a reasonable shape that's close to square
+                total_pixels = len(bin_map_np)
+                nx = int(np.sqrt(total_pixels))
+                ny = total_pixels // nx
+                if nx * ny < total_pixels:
+                    ny += 1
+            
+            # Create a 2D map with the reconstructed shape
+            shape = (ny, nx)
+            try:
+                # Try to reshape into 2D array (will only work if it's a perfect rectangle)
+                bin_map_2d = bin_map_np.reshape(shape)
+            except ValueError:
+                # If reshape fails, create a new array and fill values
+                bin_map_2d = np.full(shape, -1, dtype=int)
+                for i, bin_idx in enumerate(bin_map_np):
+                    if i < ny * nx:  # Ensure we don't exceed dimensions
+                        row, col = i // nx, i % nx
+                        bin_map_2d[row, col] = bin_idx
+            
+            bin_map_np = bin_map_2d
+        
         # Create parameter map
-        param_map = np.full_like(bin_map, np.nan, dtype=float)
+        param_map = np.full_like(bin_map_np, np.nan, dtype=float)
         
         # Different approaches based on data dimensions
         if data.ndim == 0:  # Scalar
             # Use scalar value for all valid bins
-            param_map[bin_map >= 0] = float(data)
+            param_map[bin_map_np >= 0] = float(data)
             
         elif data.ndim == 1:  # 1D array
             # Map each value to corresponding bin
             for i, val in enumerate(data):
                 if i < len(data) and np.isfinite(val):
-                    param_map[bin_map == i] = val
+                    param_map[bin_map_np == i] = val
             
-        elif data.ndim == 2 and data.shape == bin_map.shape:  # Matching 2D array
+        elif data.ndim == 2 and data.shape == bin_map_np.shape:  # Matching 2D array
             # Direct copy to valid bins
-            valid = (bin_map >= 0)
+            valid = (bin_map_np >= 0)
             param_map[valid] = data[valid]
             
         else:  # Other dimensions or shapes
             # Try to flatten and use what we can
             flat_data = data.flatten()
-            for i in range(min(np.max(bin_map) + 1, len(flat_data))):
-                mask = (bin_map == i)
+            for i in range(min(np.max(bin_map_np) + 1, len(flat_data))):
+                mask = (bin_map_np == i)
                 if np.any(mask):
                     param_map[mask] = flat_data[i]
         
@@ -1340,7 +1370,7 @@ def plot_bin_kinematics(bin_num, velocity, dispersion, ax=None, figsize=(12, 5),
         return fig, (ax1, ax2)
 
 
-def plot_bin_lic(bin_num, velocity, stream_density=3, seed=42, ax=None, 
+def plot_bin_lic(bin_num, velocity, dispersion=None, ax=None, 
                 figsize=(8, 8), title=None, cmap='coolwarm'):
     """
     Plot Line Integral Convolution visualization for binned velocity field
@@ -1351,10 +1381,8 @@ def plot_bin_lic(bin_num, velocity, stream_density=3, seed=42, ax=None,
         Bin map (2D array)
     velocity : ndarray
         Velocity values for each bin
-    stream_density : int, default=3
-        Density of streamlines
-    seed : int, default=42
-        Random seed for streamline placement
+    dispersion : ndarray, optional
+        Dispersion values for each bin (for overlay)
     ax : matplotlib.axes.Axes, optional
         Axis to plot on
     figsize : tuple, default=(8, 8)
@@ -1375,20 +1403,45 @@ def plot_bin_lic(bin_num, velocity, stream_density=3, seed=42, ax=None,
         fig = ax.figure
     
     try:
+        # Check if bin_num is 1D and needs reshaping
+        bin_num_np = np.asarray(bin_num)
+        if bin_num_np.ndim == 1:
+            # Try to get dimensions
+            if hasattr(ax, 'figure') and hasattr(ax.figure, 'ny') and hasattr(ax.figure, 'nx'):
+                ny, nx = ax.figure.ny, ax.figure.nx
+            else:
+                # Try to guess a reasonable shape
+                total_pixels = len(bin_num_np)
+                nx = int(np.sqrt(total_pixels))
+                ny = total_pixels // nx
+                if nx * ny < total_pixels:
+                    ny += 1
+            
+            # Create a 2D array for bin map
+            shape = (ny, nx)
+            bin_num_2d = np.full(shape, -1)
+            
+            for i, bin_id in enumerate(bin_num_np):
+                if i < ny * nx:
+                    row, col = i // nx, i % nx
+                    bin_num_2d[row, col] = bin_id
+            
+            bin_num_np = bin_num_2d
+        
         # Create 2D velocity field from binned data
-        vel_map = np.full_like(bin_num, np.nan, dtype=float)
+        vel_map = np.full_like(bin_num_np, np.nan, dtype=float)
         
         # Map velocity values to bins
         for i, vel in enumerate(velocity):
-            if np.isfinite(vel):
-                vel_map[bin_num == i] = vel
+            if i < len(velocity) and np.isfinite(vel):
+                vel_map[bin_num_np == i] = vel
         
         # Create masked array
         masked_vel = np.ma.array(vel_map, mask=~np.isfinite(vel_map))
         
         # Check if we have enough valid data
         if np.sum(~masked_vel.mask) < 10:
-            ax.text(0.5, 0.5, "Not enough valid velocity data for LIC", 
+            ax.text(0.5, 0.5, "Not enough valid velocity data for visualization", 
                    ha='center', va='center', transform=ax.transAxes)
             if title:
                 ax.set_title(title)
@@ -1407,48 +1460,40 @@ def plot_bin_lic(bin_num, velocity, stream_density=3, seed=42, ax=None,
             vx[mask] /= norm[mask]
             vy[mask] /= norm[mask]
         
-        # Create LIC visualization
-        try:
-            # Import for Line Integral Convolution
-            from matplotlib.patches import Circle
-            import matplotlib.patheffects as PathEffects
+        # Plot velocity field
+        vmin = np.nanpercentile(vel_map[~masked_vel.mask], 5)
+        vmax = np.nanpercentile(vel_map[~masked_vel.mask], 95)
+        
+        # For velocity, use symmetric color scale
+        vabs = max(abs(vmin), abs(vmax))
+        if vmin < 0 and vmax > 0:
+            vmin, vmax = -vabs, vabs
             
+        im = ax.imshow(masked_vel, origin='lower', cmap=cmap, 
+                     aspect='equal', vmin=vmin, vmax=vmax)
+        plt.colorbar(im, ax=ax, label='Velocity (km/s)')
+        
+        # Try to add streamlines (with error handling for compatibility)
+        try:
             # Set up streamplot
             y, x = np.mgrid[:vel_map.shape[0], :vel_map.shape[1]]
             
-            # Plot velocity field
-            im = ax.imshow(masked_vel, origin='lower', cmap=cmap, aspect='equal')
-            plt.colorbar(im, ax=ax, label='Velocity (km/s)')
-            
-            # Add streamlines with random seed for reproducibility
-            np.random.seed(seed)
-            
-            # Use lower density for streamlines with more transparent lines
-            ax.streamplot(x, y, vx, vy, density=stream_density, color='k', 
-                         linewidth=1, arrowsize=1, alpha=0.5)
-            
-            # Add title
-            if title:
-                ax.set_title(title)
-            else:
-                ax.set_title('Velocity Field LIC Visualization')
-            
-        except ImportError:
-            logger.warning("LIC visualization requires matplotlib with streamplot support")
-            # Fallback: just show the velocity field
-            im = ax.imshow(masked_vel, origin='lower', cmap=cmap, aspect='equal')
-            plt.colorbar(im, ax=ax, label='Velocity (km/s)')
-            
-            # Add title
-            if title:
-                ax.set_title(title)
-            else:
-                ax.set_title('Velocity Field')
+            # Use a more compatible call to streamplot
+            # First try with just the required parameters
+            ax.streamplot(x, y, vx, vy)
+        except Exception as e:
+            logger.warning(f"Could not create streamplot: {e}")
+        
+        # Add title
+        if title:
+            ax.set_title(title)
+        else:
+            ax.set_title('Velocity Field Visualization')
         
         return fig, ax
         
     except Exception as e:
-        logger.warning(f"Error creating LIC plot: {e}")
+        logger.warning(f"Error creating velocity field plot: {e}")
         ax.text(0.5, 0.5, f"Error: {str(e)}", 
                ha='center', va='center', transform=ax.transAxes)
         if title:

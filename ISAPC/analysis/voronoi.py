@@ -412,6 +412,10 @@ def run_vnb_analysis(args, cube, p2p_results=None):
             n_jobs=args.n_jobs
         )
     
+    # In run_vnb_analysis/run_rdb_analysis:
+
+
+    
     # Calculate bin distances
     bin_distances = np.zeros(len(bin_indices))
     for i in range(len(bin_indices)):
@@ -485,14 +489,14 @@ def run_vnb_analysis(args, cube, p2p_results=None):
         if 'emission_wavelength' in emission_result:
             vnb_results['emission']['wavelengths'] = emission_result['emission_wavelength']
     
-    # Add spectral indices if available
+        # After calculating spectral indices
     if indices_result is not None:
-        vnb_results['indices'] = indices_result
+        vnb_results['indices'] = indices_result  # This will be pixel-based
         
         # Add bin-level indices if available
-        if hasattr(cube, '_bin_indices_result'):
+        if hasattr(cube, '_bin_indices_result') and cube._bin_indices_result:
             vnb_results['bin_indices'] = cube._bin_indices_result
-    
+
     # Save binned data object
     binned_data_path = data_dir / f"{galaxy_name}_VNB_binned_data.npz"
     binned_data.save(binned_data_path)
@@ -569,8 +573,19 @@ def create_vnb_plots(cube, vnb_results, galaxy_name, plots_dir, args):
                 
                 # Create velocity map
                 fig, ax = plt.subplots(figsize=(10, 8))
+                # Reshape bin_num to 2D if it's 1D
+                bin_num_2d = bin_num
+                if bin_num.ndim == 1:
+                    # Reshape bin_num to 2D grid matching the original image dimensions
+                    bin_num_2d = np.full((cube._n_y, cube._n_x), -1)
+                    for i, bin_id in enumerate(bin_num):
+                        if i < cube._n_y * cube._n_x:
+                            row = i // cube._n_x
+                            col = i % cube._n_x
+                            bin_num_2d[row, col] = bin_id
+                            
                 visualization.plot_bin_map(
-                    bin_num, 
+                    bin_num_2d, 
                     velocity, 
                     ax=ax, 
                     cmap='coolwarm',
@@ -585,7 +600,7 @@ def create_vnb_plots(cube, vnb_results, galaxy_name, plots_dir, args):
                 # Create dispersion map
                 fig, ax = plt.subplots(figsize=(10, 8))
                 visualization.plot_bin_map(
-                    bin_num, 
+                    bin_num_2d, 
                     dispersion, 
                     ax=ax, 
                     cmap='viridis',
@@ -634,13 +649,25 @@ def create_vnb_plots(cube, vnb_results, galaxy_name, plots_dir, args):
                 for idx_name, idx_values in indices.items():
                     if isinstance(idx_values, np.ndarray) and idx_values.shape == bin_num.shape:
                         fig, ax = plt.subplots(figsize=(10, 8))
-                        visualization.plot_bin_map(
-                            bin_num, 
+                        # Reshape bin_num to 2D if it's 1D
+                        bin_num_2d = bin_num
+                        if bin_num.ndim == 1:
+                            # Reshape bin_num to 2D grid matching the original image dimensions
+                            bin_num_2d = np.full((cube._n_y, cube._n_x), -1)
+                            for i, bin_id in enumerate(bin_num):
+                                if i < cube._n_y * cube._n_x:
+                                    row = i // cube._n_x
+                                    col = i % cube._n_x
+                                    bin_num_2d[row, col] = bin_id
+                                    
+                        # Use safe_plot_array for robust plotting
+                        visualization.safe_plot_array(
                             idx_values, 
+                            bin_num_2d, 
                             ax=ax, 
+                            title=f'{galaxy_name} - {idx_name}',
                             cmap='plasma',
-                            title=f'{galaxy_name} - VNB {idx_name}',
-                            colorbar_label='Index Value'
+                            label='Index Value'
                         )
                         plt.savefig(plots_dir / f"{galaxy_name}_VNB_{idx_name}.png", dpi=150)
                         plt.close(fig)
@@ -660,6 +687,35 @@ def create_vnb_plots(cube, vnb_results, galaxy_name, plots_dir, args):
                         plt.close(fig)
             except Exception as e:
                 logger.warning(f"Error creating spectral indices plots: {e}")
+                plt.close('all')
+        
+
+        # Add spectral indices visualization
+        if 'indices' in vnb_results and 'bin_indices' in vnb_results:  # For voronoi.py
+            try:
+                bin_indices = vnb_results['bin_indices']
+                if bin_indices and isinstance(bin_indices, dict):
+                    for idx_name, idx_values in bin_indices.items():
+                        if isinstance(idx_values, np.ndarray) and len(idx_values) > 0:
+                            # Create 2D index map
+                            fig, ax = plt.subplots(figsize=(10, 8))
+                            
+                            # Use safe_plot_array for robust plotting
+                            visualization.safe_plot_array(
+                                idx_values, 
+                                bin_num, 
+                                ax=ax, 
+                                title=f'{galaxy_name} - {idx_name}',
+                                cmap='plasma',
+                                label='Index Value'
+                            )
+                            
+                            plt.savefig(plots_dir / f"{galaxy_name}_VNB_{idx_name}.png", dpi=150)  # For voronoi.py
+                            # Or for radial.py:
+                            # plt.savefig(plots_dir / f"{galaxy_name}_RDB_{idx_name}.png", dpi=150)
+                            plt.close(fig)
+            except Exception as e:
+                logger.warning(f"Error creating spectral indices maps: {e}")
                 plt.close('all')
     
     except Exception as e:
