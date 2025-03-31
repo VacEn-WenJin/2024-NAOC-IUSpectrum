@@ -94,25 +94,12 @@ def setup_parser():
     parser.add_argument('--no-auto-reuse', action='store_false', dest='auto_reuse',
                         help='Disable automatic reuse of previous results')
     
-    # Find the argument parser setup section in main.py and add these lines:
-
-    # # Spectral indices controls
-    # parser.add_argument('--no-indices', action='store_true', default=False,
-    #                 help='Skip calculation of spectral indices')
-
-    # # Visualization controls
-    # parser.add_argument('--no-plots', action='store_true', default=False,
-    #                 help='Skip creation of visualization plots')
-    # parser.add_argument('--no-lic', action='store_true', default=False,
-    #                 help='Skip creation of LIC visualization')
-    # parser.add_argument('--no-emission-plots', action='store_true', default=False,
-    #                 help='Skip creation of emission line plots')
-    # parser.add_argument('--no-kinematic-plots', action='store_true', default=False,
-    #                 help='Skip creation of kinematic plots')
-    # parser.add_argument('--no-bin-plots', action='store_true', default=False,
-    #                 help='Skip creation of individual bin plots')
-    # parser.add_argument('--max-bin-plots', type=int, default=5,
-    #                 help='Maximum number of bin spectra to plot (default: 5)')
+    # Configuration options
+    parser.add_argument('--config', type=str, help='Path to custom configuration file')
+    parser.add_argument('--indices', type=str, nargs='+', 
+                        help='List of spectral indices to calculate (overrides config defaults)')
+    parser.add_argument('--emission-lines', type=str, nargs='+',
+                        help='List of emission lines to fit (overrides config defaults)')
     
     return parser
 
@@ -121,6 +108,17 @@ def main():
     # Parse command-line arguments
     parser = setup_parser()
     args = parser.parse_args()
+    
+    # Load custom config file if specified
+    if args.config:
+        from config_manager import load_config
+        load_config(args.config)
+        logger.info(f"Loaded custom configuration from {args.config}")
+    else:
+        # Load default configuration
+        from config_manager import get_config
+        get_config()  # Initialize with default config
+        logger.info("Using default configuration")
     
     # Extract galaxy name from filename
     galaxy_name = Path(args.filename).stem
@@ -155,6 +153,17 @@ def main():
         logger.error(f"Error loading data cube: {str(e)}")
         logger.error(traceback.format_exc())
         return 1
+    
+    # Get spectral indices and emission lines from config or command line
+    from config_manager import get_spectral_indices, get_emission_lines
+    
+    # Use command line args if provided, otherwise use config
+    indices_list = args.indices if args.indices else get_spectral_indices()
+    emission_lines = args.emission_lines if args.emission_lines else get_emission_lines()
+    
+    # Store configured parameters in args for use by analysis functions
+    args.configured_indices = indices_list
+    args.configured_emission_lines = emission_lines
     
     # Initialize shared results
     p2p_results = None

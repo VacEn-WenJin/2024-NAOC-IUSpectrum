@@ -1366,8 +1366,8 @@ class MUSECube:
         template_filename: str,
         line_names: Optional[List[str]] = None,
         ppxf_vel_init: Optional[np.ndarray] = None,
-        ppxf_sig_init: float = 50.0,
-        ppxf_deg: int = 2,
+        ppxf_sig_init: float = None,
+        ppxf_deg: int = None,
         n_jobs: int = -1,
         verbose: bool = False
         ) -> Dict[str, Any]:
@@ -1382,10 +1382,10 @@ class MUSECube:
             List of emission lines to fit, defaults to all available lines
         ppxf_vel_init : np.ndarray, optional
             Initial velocity field, defaults to stellar velocity field
-        ppxf_sig_init : float, default=50.0
-            Initial velocity dispersion in km/s for gas
-        ppxf_deg : int, default=2
-            Degree of additive polynomial for pPXF
+        ppxf_sig_init : float, optional
+            Initial velocity dispersion in km/s for gas, defaults to config value
+        ppxf_deg : int, optional
+            Degree of additive polynomial for pPXF, defaults to config value
         n_jobs : int, default=-1
             Number of parallel jobs to run
         verbose : bool, default=False
@@ -1396,6 +1396,33 @@ class MUSECube:
         Dict[str, Any]
             Dictionary containing emission line fitting results
         """
+        # Import configuration manager for default values
+        try:
+            from config_manager import get_emission_lines, get_spectral_fitting_parameters
+            
+            # Get parameters from config if not specified
+            fitting_params = get_spectral_fitting_parameters()
+            
+            if ppxf_sig_init is None:
+                ppxf_sig_init = fitting_params['ppxf_vel_disp_init']
+            
+            if ppxf_deg is None:
+                ppxf_deg = fitting_params['ppxf_gas_deg']
+            
+            # Use default emission lines from config if not specified
+            if line_names is None:
+                line_names = get_emission_lines()
+                logger.info(f"Using default emission lines from config: {line_names}")
+        except ImportError:
+            # Fallback if config_manager not available
+            if ppxf_sig_init is None:
+                ppxf_sig_init = 50.0
+            
+            if ppxf_deg is None:
+                ppxf_deg = 2
+            
+            # No default line_names - will use all available lines
+        
         # Set log level
         original_level = logger.level
         if not verbose:
@@ -1760,6 +1787,7 @@ class MUSECube:
                 'emission_wavelength': {}
             }
 
+
     def calculate_spectral_indices(self, indices_list=None, n_jobs=-1, verbose=False, use_binned=None):
         """
         Universal spectral indices calculation for both pixel-by-pixel and binned data
@@ -1987,7 +2015,7 @@ class MUSECube:
         Parameters
         ----------
         indices_list : list of str, optional
-            List of spectral indices to calculate, None uses standard set
+            List of spectral indices to calculate, None uses the default set from config
         n_jobs : int, default=-1
             Number of parallel jobs
         verbose : bool, default=False
@@ -2002,14 +2030,24 @@ class MUSECube:
         import traceback
         import warnings
         
+        # Import configuration manager for default indices
+        try:
+            from config_manager import get_spectral_indices
+            
+            # Define standard indices from config if not provided
+            if indices_list is None:
+                indices_list = get_spectral_indices()
+                logger.info(f"Using default indices from config: {indices_list}")
+        except ImportError:
+            # Fallback if config_manager not available
+            if indices_list is None:
+                indices_list = ['Hbeta', 'Fe5015', 'Mgb']
+                logger.info(f"Using hardcoded default indices: {indices_list}")
+        
         # Control warnings
         set_warnings(verbose)
         
         try:
-            # Define standard indices if not provided
-            if indices_list is None:
-                indices_list = ['Hbeta', 'Fe5015', 'Mgb']
-            
             # Initialize bin-level and pixel-level storage
             n_bins = self._n_bins
             self._bin_indices_result = {}
@@ -2100,12 +2138,24 @@ class MUSECube:
                         result = {}
                         for index_name in indices_list:
                             try:
+                                # Add extra logging for Hbeta
+                                if index_name == 'Hbeta' and verbose:
+                                    logger.info(f"Calculating Hbeta for bin {bin_idx}")
+                                
                                 index_value = calculator.calculate_index(index_name)
                                 result[index_name] = index_value
+                                
+                                # Log the Hbeta result
+                                if index_name == 'Hbeta' and verbose:
+                                    logger.info(f"Bin {bin_idx} - Hbeta value: {index_value}")
                             except Exception as e:
                                 if verbose:
                                     logger.debug(f"Error calculating {index_name} for bin {bin_idx}: {e}")
                                 result[index_name] = np.nan
+                                
+                                # Special handling for Hbeta errors
+                                if index_name == 'Hbeta':
+                                    logger.warning(f"Failed to calculate Hbeta for bin {bin_idx}: {e}")
                         
                         return bin_idx, result
                         

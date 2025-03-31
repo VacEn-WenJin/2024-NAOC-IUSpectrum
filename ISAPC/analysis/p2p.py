@@ -63,6 +63,8 @@ def run_p2p_analysis(args, cube, Pmode = False):
         Command line arguments
     cube : MUSECube
         MUSE data cube object
+    Pmode : bool, default=False
+        Whether this is a standalone P2P analysis (not part of VNB/RDB)
         
     Returns
     -------
@@ -101,12 +103,18 @@ def run_p2p_analysis(args, cube, Pmode = False):
     
     logger.info(f"Stellar component fitting completed in {time.time() - start_time:.1f} seconds")
     
+    # Get configured emission lines
+    emission_lines = None
+    if hasattr(args, 'configured_emission_lines'):
+        emission_lines = args.configured_emission_lines
+    
     # Fit emission lines
     emission_result = None
     if not args.no_emission:
         start_time = time.time()
         emission_result = cube.fit_emission_lines(
             template_filename=args.template,
+            line_names=emission_lines,  # Use configured emission lines
             ppxf_vel_init=stellar_velocity_field,  # Use stellar velocity field as initial guess
             ppxf_sig_init=args.sigma_init,
             ppxf_deg=2,  # Simpler polynomial for emission lines
@@ -114,11 +122,17 @@ def run_p2p_analysis(args, cube, Pmode = False):
         )
         logger.info(f"Emission line fitting completed in {time.time() - start_time:.1f} seconds")
     
+    # Get configured spectral indices
+    indices_list = None
+    if hasattr(args, 'configured_indices'):
+        indices_list = args.configured_indices
+    
     # Calculate spectral indices
     indices_result = None
     if not args.no_indices:
         start_time = time.time()
         indices_result = cube.calculate_spectral_indices(
+            indices_list=indices_list,  # Use configured indices
             n_jobs=args.n_jobs
         )
         logger.info(f"Spectral indices calculation completed in {time.time() - start_time:.1f} seconds")

@@ -186,11 +186,27 @@ class LineIndexCalculator:
         -----------
         line_name : str
             Absorption line name
-            
+                
         Returns:
         --------
         dict : Dictionary with blue, line, and red windows
         """
+        # Try to get definition from config file first
+        try:
+            from config_manager import get_spectral_line_definition
+            windows = get_spectral_line_definition(line_name)
+            if windows is not None:
+                if self.show_warnings:
+                    logger.debug(f"Using line definition from config for {line_name}")
+                return windows
+        except ImportError:
+            if self.show_warnings:
+                logger.debug("Config manager not available, using built-in line definitions")
+        except Exception as e:
+            if self.show_warnings:
+                logger.debug(f"Error getting line definition from config: {e}")
+        
+        # Fall back to hardcoded definitions
         windows = {
             'Hbeta': {
                 'blue': (4827.875, 4847.875),
@@ -218,6 +234,7 @@ class LineIndexCalculator:
                 'red': (5353.4, 5363.4)
             }
         }
+        
         return windows.get(line_name)
 
     def calculate_pseudo_continuum(self, wave_range, flux_range, region_type):
@@ -301,9 +318,24 @@ class LineIndexCalculator:
             self._warn(f"Unknown absorption line: {line_name}")
             return np.nan if not return_error else (np.nan, np.nan)
 
+        # Check for required keys in window definition
+        if 'blue' not in windows or 'red' not in windows:
+            self._warn(f"Incomplete window definition for {line_name}. Missing blue or red bands.")
+            return np.nan if not return_error else (np.nan, np.nan)
+            
+        # Handle both 'line' and 'band' keys for compatibility
+        # Config system uses 'band', older code uses 'line'
+        if 'band' in windows:
+            line_range = windows['band']
+        elif 'line' in windows:
+            line_range = windows['line']
+        else:
+            self._warn(f"Window definition for {line_name} has no line/band range.")
+            return np.nan if not return_error else (np.nan, np.nan)
+
         # Get line region data
         try:
-            line_mask = (self.wave >= windows['line'][0]) & (self.wave <= windows['line'][1])
+            line_mask = (self.wave >= line_range[0]) & (self.wave <= line_range[1])
             line_wave = self.wave[line_mask]
             line_flux = self.flux[line_mask]
             line_err = self.error[line_mask]
@@ -349,7 +381,7 @@ class LineIndexCalculator:
         except Exception as e:
             self._warn(f"Error calculating {line_name} index: {str(e)}")
             return np.nan if not return_error else (np.nan, np.nan)
-    
+
     def calculate_all_indices(self):
         """
         Calculate all defined spectral indices
@@ -385,7 +417,7 @@ class LineIndexCalculator:
             Path to save the figure. If provided, the figure will be saved there
         show_index : bool, optional
             Whether to show index parameters, default is False
-            
+                
         Returns:
         --------
         fig, axes : Figure and Axes objects for further customization
@@ -405,8 +437,8 @@ class LineIndexCalculator:
 
         # Get all defined spectral lines
         all_windows = {name: self.define_line_windows(name) 
-                      for name in ['Hbeta', 'Mgb', 'Fe5015', 'Fe5270', 'Fe5335']
-                      if self.define_line_windows(name) is not None}
+                    for name in ['Hbeta', 'Mgb', 'Fe5015', 'Fe5270', 'Fe5335']
+                    if self.define_line_windows(name) is not None}
         
         # Set fixed X-axis range
         min_wave = 4800
@@ -425,7 +457,8 @@ class LineIndexCalculator:
         # Set unified color scheme
         colors = {
             'blue': 'tab:blue',
-            'line': 'tab:green',
+            'line': 'tab:green',  # Used for 'band' or 'line' window
+            'band': 'tab:green',  # Add this key for compatibility 
             'red': 'tab:red',
             'orig_cont': 'tab:orange',   # Original spectrum continuum color (orange)
             'fit_cont': 'tab:green',     # Fitted spectrum continuum color (green)
@@ -517,21 +550,36 @@ class LineIndexCalculator:
         
         # Mark all spectral line regions in both panels
         for line_name, windows in all_windows.items():
+            if windows is None:
+                continue
+                
             for panel in [ax1, ax2]:
-                # Mark blue, line, and red regions
+                # Mark blue, line/band, and red regions
                 alpha = 0.2  # Transparency
+                
+                # Check for all required keys in windows
+                if 'blue' not in windows or ('line' not in windows and 'band' not in windows) or 'red' not in windows:
+                    self._warn(f"Incomplete window definition for {line_name}. Skipping.")
+                    continue
+                    
+                # Get line/band range - handle both 'line' and 'band' key for compatibility
+                band_range = windows.get('band', windows.get('line', None))
+                if band_range is None:
+                    self._warn(f"Missing band/line range for {line_name}. Skipping.")
+                    continue
+                    
                 # Only include in legend once for each region type
                 if line_name == list(all_windows.keys())[0]:  # First spectral line for legend
                     panel.axvspan(windows['blue'][0], windows['blue'][1], 
                                 alpha=alpha, color=colors['blue'], label='Blue window')
-                    panel.axvspan(windows['line'][0], windows['line'][1], 
+                    panel.axvspan(band_range[0], band_range[1], 
                                 alpha=alpha, color=colors['line'], label='Line region')
                     panel.axvspan(windows['red'][0], windows['red'][1], 
                                 alpha=alpha, color=colors['red'], label='Red window')
                 else:
                     panel.axvspan(windows['blue'][0], windows['blue'][1], 
                                 alpha=alpha, color=colors['blue'])
-                    panel.axvspan(windows['line'][0], windows['line'][1], 
+                    panel.axvspan(band_range[0], band_range[1], 
                                 alpha=alpha, color=colors['line'])
                     panel.axvspan(windows['red'][0], windows['red'][1], 
                                 alpha=alpha, color=colors['red'])
@@ -543,7 +591,7 @@ class LineIndexCalculator:
                     y_text = y_min_processed + 0.05 * (y_max_processed - y_min_processed)
                 
                 # Basic label
-                panel.text(np.mean(windows['line']), y_text, line_name,
+                panel.text(np.mean(band_range), y_text, line_name,
                         horizontalalignment='center', verticalalignment='top',
                         bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
                 
@@ -666,7 +714,7 @@ class LineIndexCalculator:
                                 y_offset = 0.1 * (y_max_processed - y_min_processed)
                                 
                                 # Show original spectrum value (top)
-                                panel.text(np.mean(windows['line']), 
+                                panel.text(np.mean(band_range), 
                                         base_y_text + y_offset,
                                         f"{orig_index:.3f}", 
                                         color=colors['orig_cont'], 
@@ -676,7 +724,7 @@ class LineIndexCalculator:
                                         bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
                                 
                                 # Show fitted spectrum value (bottom)
-                                panel.text(np.mean(windows['line']), 
+                                panel.text(np.mean(band_range), 
                                         base_y_text + y_offset/2,
                                         f"{fit_index:.3f}", 
                                         color=colors['fit_cont'], 
@@ -688,7 +736,7 @@ class LineIndexCalculator:
                             elif fit_index is not None:
                                 # Only show fitted spectrum value
                                 fit_text = f"{fit_index:.3f}"
-                                panel.text(np.mean(windows['line']), 
+                                panel.text(np.mean(band_range), 
                                         base_y_text + 0.02 * (y_max_processed - y_min_processed),
                                         fit_text, 
                                         color=colors['fit_cont'], 
@@ -740,7 +788,6 @@ class LineIndexCalculator:
                 self._warn(f"Error saving figure: {str(e)}")
         
         return fig, [ax1, ax2]
-
 
 def calculate_lick_indices(wave, flux, index_definitions=None, indices_list=None, show_warnings=True):
     """

@@ -563,7 +563,7 @@ def calculate_wavelength_intersection(wavelength, velocity_field, n_x):
     rest_max = np.max(wavelength) / max(min_factor, max_factor)
     
     # Get intersection range with some margin (1%)
-    margin = 0.03 * (rest_max - rest_min)
+    margin = 0.01 * (rest_max - rest_min)
     min_wave = rest_min + margin
     max_wave = rest_max - margin
     
