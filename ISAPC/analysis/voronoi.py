@@ -497,6 +497,76 @@ def run_vnb_analysis(args, cube, p2p_results=None):
         if hasattr(cube, '_bin_indices_result') and cube._bin_indices_result:
             vnb_results['bin_indices'] = cube._bin_indices_result
 
+    # After calculating spectral indices
+    if indices_result is not None and not args.no_plots:
+        try:
+            # Create directory for spectral indices plots
+            indices_plots_dir = plots_dir / "spectral_indices"
+            indices_plots_dir.mkdir(exist_ok=True, parents=True)
+            
+            # Get bins with valid results (up to 5 bins)
+            valid_bins = []
+            max_bins_to_plot = 5  # Limit the number of bins we plot
+            
+            if hasattr(cube, '_bin_velocity') and cube._bin_velocity is not None:
+                # Find bins with valid velocities
+                for i in range(min(len(cube._bin_velocity), cube._n_bins)):
+                    if np.isfinite(cube._bin_velocity[i]):
+                        valid_bins.append(i)
+                        if len(valid_bins) >= max_bins_to_plot:
+                            break
+            
+            # If we didn't find any valid bins, just use the first few
+            if not valid_bins:
+                valid_bins = list(range(min(max_bins_to_plot, cube._n_bins)))
+            
+            # Plot each bin's spectral lines
+            for bin_idx in valid_bins:
+                try:
+                    # Create a LineIndexCalculator for this bin
+                    from spectral_indices import LineIndexCalculator
+                    
+                    # Get bin spectrum and best-fit
+                    bin_spectrum = cube._binned_spectra[:, bin_idx]
+                    bin_bestfit = cube._bin_bestfit[:, bin_idx]
+                    
+                    # Get velocity for this bin
+                    bin_velocity = cube._bin_velocity[bin_idx] if hasattr(cube, '_bin_velocity') else 0
+                    
+                    # Get gas component if available
+                    bin_gas_bestfit = None
+                    if hasattr(cube, '_bin_gas_bestfit') and cube._bin_gas_bestfit is not None:
+                        bin_gas_bestfit = cube._bin_gas_bestfit[:, bin_idx]
+                    
+                    # Create LineIndexCalculator
+                    calculator = LineIndexCalculator(
+                        wave=cube._binned_wavelength,
+                        flux=bin_spectrum,
+                        fit_wave=cube._binned_wavelength,
+                        fit_flux=bin_bestfit,
+                        em_wave=cube._binned_wavelength if bin_gas_bestfit is not None else None,
+                        em_flux_list=bin_gas_bestfit,
+                        velocity_correction=bin_velocity,
+                        continuum_mode='auto',
+                        show_warnings=False
+                    )
+                    
+                    # Plot spectral lines with index calculations
+                    fig, axes = calculator.plot_all_lines(
+                        mode='VNB',
+                        number=bin_idx,
+                        save_path=str(indices_plots_dir),
+                        show_index=True
+                    )
+                    
+                    plt.close(fig)  # Close the figure to avoid memory issues
+                    
+                except Exception as e:
+                    logger.warning(f"Error creating spectral index plot for bin {bin_idx}: {e}")
+        
+        except Exception as e:
+            logger.warning(f"Error creating spectral index plots: {e}")
+
     # Save binned data object
     binned_data_path = data_dir / f"{galaxy_name}_VNB_binned_data.npz"
     binned_data.save(binned_data_path)
@@ -639,6 +709,7 @@ def create_vnb_plots(cube, vnb_results, galaxy_name, plots_dir, args):
             except Exception as e:
                 logger.warning(f"Error creating emission line plots: {e}")
                 plt.close('all')
+
         
         # Create spectral indices plots if available
         if 'indices' in vnb_results:
