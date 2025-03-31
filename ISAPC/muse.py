@@ -2781,12 +2781,238 @@ class MUSECube:
         
         return results
 
+    def plot_bin_analysis_results(self, output_dir=None):
+        """
+        Create comprehensive plots for binned analysis results
+        
+        Parameters
+        ----------
+        output_dir : str or Path, optional
+            Directory to save plots. If None, plots are displayed but not saved.
+            
+        Returns
+        -------
+        dict
+            Dictionary of created figures
+        """
+        import visualization
+        from pathlib import Path
+        
+        if not hasattr(self, '_is_binned') or not self._is_binned:
+            logger.warning("Not in binned mode, can't create binned analysis plots")
+            return {}
+        
+        # Create output directory if provided
+        if output_dir is not None:
+            output_dir = Path(output_dir)
+            output_dir.mkdir(exist_ok=True, parents=True)
+        
+        # Store created figures
+        figures = {}
+        
+        try:
+            # 1. Bin Map
+            if hasattr(self, '_bin_num') and self._bin_num is not None:
+                try:
+                    # Create bin map figure
+                    fig, ax = plt.subplots(figsize=(8, 7))
+                    
+                    # Create binning map
+                    ax.imshow(self._bin_num.reshape(self._n_y, self._n_x), 
+                            origin='lower', cmap='tab20', aspect='equal')
+                    
+                    ax.set_title(f"{self._bin_type} Binning Map" if hasattr(self, '_bin_type') else "Binning Map")
+                    
+                    if output_dir is not None:
+                        fig.savefig(output_dir / "bin_map.png", dpi=150, bbox_inches='tight')
+                    
+                    figures['bin_map'] = (fig, ax)
+                except Exception as e:
+                    logger.warning(f"Error creating bin map: {e}")
+            
+            # 2. Kinematics
+            if (hasattr(self, '_bin_velocity') and hasattr(self, '_bin_dispersion') and 
+                self._bin_velocity is not None and self._bin_dispersion is not None and
+                hasattr(self, '_bin_num') and self._bin_num is not None):
+                try:
+                    # Create kinematics figure
+                    fig, axes = visualization.plot_bin_kinematics(
+                        self._bin_num.reshape(self._n_y, self._n_x),
+                        self._bin_velocity,
+                        self._bin_dispersion,
+                        title=self._bin_type if hasattr(self, '_bin_type') else None
+                    )
+                    
+                    if output_dir is not None:
+                        fig.savefig(output_dir / "kinematics.png", dpi=150, bbox_inches='tight')
+                    
+                    figures['kinematics'] = (fig, axes)
+                except Exception as e:
+                    logger.warning(f"Error creating kinematics plot: {e}")
+            
+            # 3. LIC Visualization
+            if (hasattr(self, '_bin_velocity') and self._bin_velocity is not None and
+                hasattr(self, '_bin_num') and self._bin_num is not None):
+                try:
+                    # Create LIC figure
+                    fig, ax = visualization.plot_bin_lic(
+                        self._bin_num.reshape(self._n_y, self._n_x),
+                        self._bin_velocity,
+                        title=f"{self._bin_type} Velocity Field" if hasattr(self, '_bin_type') else "Velocity Field"
+                    )
+                    
+                    if output_dir is not None:
+                        fig.savefig(output_dir / "velocity_lic.png", dpi=150, bbox_inches='tight')
+                    
+                    figures['velocity_lic'] = (fig, ax)
+                except Exception as e:
+                    logger.warning(f"Error creating LIC plot: {e}")
+            
+            # 4. Emission Lines
+            if (hasattr(self, '_bin_emission_flux') and self._bin_emission_flux and
+                hasattr(self, '_bin_num') and self._bin_num is not None):
+                try:
+                    # Create emission line figures
+                    fig, axes = visualization.plot_bin_emission_lines(
+                        self._bin_num.reshape(self._n_y, self._n_x),
+                        self._bin_emission_flux,
+                        title=f"{self._bin_type} Emission Lines" if hasattr(self, '_bin_type') else "Emission Lines"
+                    )
+                    
+                    if fig is not None and output_dir is not None:
+                        fig.savefig(output_dir / "emission_lines.png", dpi=150, bbox_inches='tight')
+                    
+                    figures['emission_lines'] = (fig, axes)
+                except Exception as e:
+                    logger.warning(f"Error creating emission line plots: {e}")
+            
+            # 5. Spectral Indices
+            if (hasattr(self, '_bin_indices_result') and self._bin_indices_result and
+                hasattr(self, '_bin_num') and self._bin_num is not None):
+                try:
+                    # Create spectral indices figures
+                    fig, axes = visualization.plot_bin_indices(
+                        self._bin_num.reshape(self._n_y, self._n_x),
+                        self._bin_indices_result,
+                        title=f"{self._bin_type} Spectral Indices" if hasattr(self, '_bin_type') else "Spectral Indices"
+                    )
+                    
+                    if fig is not None and output_dir is not None:
+                        fig.savefig(output_dir / "spectral_indices.png", dpi=150, bbox_inches='tight')
+                    
+                    figures['spectral_indices'] = (fig, axes)
+                except Exception as e:
+                    logger.warning(f"Error creating spectral indices plots: {e}")
+            
+            # 6. Sample of bin spectra
+            if (hasattr(self, '_bin_bestfit') and self._bin_bestfit is not None):
+                try:
+                    # Create directory for bin spectra plots
+                    if output_dir is not None:
+                        bin_plots_dir = output_dir / "bin_spectra"
+                        bin_plots_dir.mkdir(exist_ok=True, parents=True)
+                    else:
+                        bin_plots_dir = None
+                    
+                    # Plot a sample of bin spectra
+                    bin_figs = self.plot_bin_fits(n_bins=min(5, self._n_bins), save_dir=bin_plots_dir)
+                    
+                    # Store figures
+                    figures['bin_spectra'] = bin_figs
+                except Exception as e:
+                    logger.warning(f"Error creating bin spectra plots: {e}")
+            
+            # 7. Radial Profiles (for RDB only)
+            if (hasattr(self, '_bin_type') and self._bin_type == 'RDB' and
+                hasattr(self, '_bin_radii') and self._bin_radii is not None):
+                try:
+                    # Velocity and dispersion profiles
+                    if hasattr(self, '_bin_velocity') and hasattr(self, '_bin_dispersion'):
+                        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+                        
+                        # Plot velocity profile
+                        if np.any(np.isfinite(self._bin_velocity)):
+                            valid = np.isfinite(self._bin_velocity) & np.isfinite(self._bin_radii)
+                            ax1.plot(self._bin_radii[valid], self._bin_velocity[valid], 'o-')
+                            ax1.set_xlabel('Radius (arcsec)')
+                            ax1.set_ylabel('Velocity (km/s)')
+                            ax1.set_title('Radial Velocity Profile')
+                            ax1.grid(True, alpha=0.3)
+                        else:
+                            ax1.text(0.5, 0.5, "No valid velocity data", 
+                                ha='center', va='center', transform=ax1.transAxes)
+                        
+                        # Plot dispersion profile
+                        if np.any(np.isfinite(self._bin_dispersion)):
+                            valid = np.isfinite(self._bin_dispersion) & np.isfinite(self._bin_radii)
+                            ax2.plot(self._bin_radii[valid], self._bin_dispersion[valid], 'o-')
+                            ax2.set_xlabel('Radius (arcsec)')
+                            ax2.set_ylabel('Dispersion (km/s)')
+                            ax2.set_title('Radial Dispersion Profile')
+                            ax2.grid(True, alpha=0.3)
+                        else:
+                            ax2.text(0.5, 0.5, "No valid dispersion data", 
+                                ha='center', va='center', transform=ax2.transAxes)
+                        
+                        plt.tight_layout()
+                        
+                        if output_dir is not None:
+                            fig.savefig(output_dir / "radial_kinematics.png", dpi=150, bbox_inches='tight')
+                        
+                        figures['radial_kinematics'] = (fig, (ax1, ax2))
+                    
+                    # Spectral indices profiles
+                    if hasattr(self, '_bin_indices_result') and self._bin_indices_result:
+                        # Get indices
+                        index_names = list(self._bin_indices_result.keys())
+                        
+                        if index_names:
+                            # Limit to 6 indices
+                            index_names = index_names[:6]
+                            n_indices = len(index_names)
+                            
+                            # Create figure
+                            fig, axes = plt.subplots(n_indices, 1, figsize=(8, 3*n_indices))
+                            if n_indices == 1:
+                                axes = [axes]
+                            
+                            # Plot each index
+                            for i, index_name in enumerate(index_names):
+                                index_values = self._bin_indices_result[index_name]
+                                valid = np.isfinite(index_values) & np.isfinite(self._bin_radii)
+                                
+                                if np.any(valid):
+                                    axes[i].plot(self._bin_radii[valid], index_values[valid], 'o-')
+                                    axes[i].set_xlabel('Radius (arcsec)')
+                                    axes[i].set_ylabel('Index Value')
+                                    axes[i].set_title(f'{index_name} Profile')
+                                    axes[i].grid(True, alpha=0.3)
+                                else:
+                                    axes[i].text(0.5, 0.5, f"No valid {index_name} data", 
+                                            ha='center', va='center', transform=axes[i].transAxes)
+                            
+                            plt.tight_layout()
+                            
+                            if output_dir is not None:
+                                fig.savefig(output_dir / "radial_indices.png", dpi=150, bbox_inches='tight')
+                            
+                            figures['radial_indices'] = (fig, axes)
+                except Exception as e:
+                    logger.warning(f"Error creating radial profile plots: {e}")
+            
+            return figures
+        
+        except Exception as e:
+            logger.error(f"Error creating binned analysis plots: {e}")
+            return figures
+
     @property
     def redshift(self):
         """Return the galaxy redshift"""
         return self._redshift
 
     @property
+
     def raw_data(self):
         """Return the raw data"""
         return {

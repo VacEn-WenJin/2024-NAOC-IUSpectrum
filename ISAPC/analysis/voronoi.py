@@ -521,6 +521,20 @@ def run_vnb_analysis(args, cube, p2p_results=None):
             cube.plot_bin_fits(n_bins=min(5, cube._n_bins), save_dir=bin_plots_dir)
         except Exception as e:
             logger.warning(f"Error creating bin fitting plots: {e}")
+
+    # Create comprehensive visualization plots
+    if not args.no_plots:
+        try:
+            # Create visualization plots directory
+            viz_plots_dir = plots_dir / "visualizations"
+            viz_plots_dir.mkdir(exist_ok=True, parents=True)
+            
+            # Generate all visualization plots
+            cube.plot_bin_analysis_results(output_dir=viz_plots_dir)
+            
+            logger.info(f"Created visualization plots in {viz_plots_dir}")
+        except Exception as e:
+            logger.warning(f"Error creating visualization plots: {e}")
     
     logger.info(f"VNB analysis completed in {time.time() - start_time:.1f} seconds")
     

@@ -885,7 +885,7 @@ def plot_bin_map(bin_num, values, ax=None, cmap='viridis', title=None,
 def plot_binned_values(bin_indices, values, ax=None, title=None, cmap='viridis',
                       colorbar_label=None, vmin=None, vmax=None, log_scale=False):
     """
-    Plot values for binned data using a bar plot approach that works well with any bin shape.
+    Plot values for binned data using a bar plot approach
     
     Parameters
     ----------
@@ -898,7 +898,7 @@ def plot_binned_values(bin_indices, values, ax=None, title=None, cmap='viridis',
     ax : matplotlib.axes.Axes, optional
         Axis to plot on
     cmap : str, default='viridis'
-        Colormap name
+        Colormap name or colormap object
     colorbar_label : str, optional
         Label for colorbar
     vmin, vmax : float, optional
@@ -960,13 +960,18 @@ def plot_binned_values(bin_indices, values, ax=None, title=None, cmap='viridis',
                 vmax = np.max(values_valid)
             
             # Ensure valid range
-            if vmin >= vmax:
+            if abs(vmax - vmin) < 1e-10:  # Nearly equal
                 vmin = vmin * 0.9 if vmin != 0 else -1
                 vmax = vmax * 1.1 if vmax != 0 else 1
-                
-            # Create colormap
+            
+            # Create colormap and normalize
+            if isinstance(cmap, str):
+                cmap_obj = plt.cm.get_cmap(cmap)
+            else:
+                cmap_obj = cmap
+            
             norm = Normalize(vmin=vmin, vmax=vmax)
-            sm = ScalarMappable(norm=norm, cmap=cmap)
+            sm = ScalarMappable(norm=norm, cmap=cmap_obj)
             
             # Get colors for valid values
             colors = sm.to_rgba(values_valid)
@@ -981,7 +986,7 @@ def plot_binned_values(bin_indices, values, ax=None, title=None, cmap='viridis',
             # Set reasonable number of x ticks
             max_ticks = min(20, len(x_valid))
             if len(x_valid) > max_ticks:
-                step = len(x_valid) // max_ticks
+                step = max(1, len(x_valid) // max_ticks)
                 idx = np.arange(0, len(x_valid), step)
                 ax.set_xticks(x_valid[idx])
                 ax.set_xticklabels([str(int(i)) for i in x_valid[idx]])
@@ -1268,6 +1273,383 @@ def plot_kinematics_summary(velocity_field, dispersion_field, bin_map=None,
     plt.tight_layout()
     
     return fig
+
+
+def plot_bin_kinematics(bin_num, velocity, dispersion, ax=None, figsize=(12, 5), 
+                       title=None, cbar_labels=None):
+    """
+    Plot binned kinematics (velocity and dispersion) side by side
+    
+    Parameters
+    ----------
+    bin_num : ndarray
+        Bin map (2D array)
+    velocity : ndarray
+        Velocity values for each bin
+    dispersion : ndarray
+        Dispersion values for each bin
+    ax : tuple of matplotlib.axes.Axes, optional
+        Tuple of two axes for plotting
+    figsize : tuple, default=(12, 5)
+        Figure size
+    title : str, optional
+        Title for the plot
+    cbar_labels : tuple, optional
+        Labels for the colorbars (velocity, dispersion)
+        
+    Returns
+    -------
+    tuple
+        (fig, axes) - Figure and axes objects
+    """
+    if ax is None:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize)
+    else:
+        ax1, ax2 = ax
+        fig = ax1.figure
+    
+    try:
+        # Default colorbar labels
+        if cbar_labels is None:
+            cbar_labels = ('Velocity (km/s)', 'Dispersion (km/s)')
+        
+        # Plot velocity
+        vel_ax = safe_plot_array(
+            velocity, bin_num, ax=ax1, 
+            cmap='coolwarm', 
+            title='Velocity Field' if title is None else f"{title} - Velocity",
+            label=cbar_labels[0]
+        )
+        
+        # Plot dispersion
+        disp_ax = safe_plot_array(
+            dispersion, bin_num, ax=ax2, 
+            cmap='viridis', 
+            title='Velocity Dispersion' if title is None else f"{title} - Dispersion",
+            label=cbar_labels[1]
+        )
+        
+        plt.tight_layout()
+        return fig, (vel_ax, disp_ax)
+    
+    except Exception as e:
+        logger.warning(f"Error plotting bin kinematics: {e}")
+        for ax in (ax1, ax2):
+            ax.text(0.5, 0.5, f"Error plotting: {str(e)}", 
+                  ha='center', va='center', transform=ax.transAxes)
+        return fig, (ax1, ax2)
+
+
+def plot_bin_lic(bin_num, velocity, stream_density=3, seed=42, ax=None, 
+                figsize=(8, 8), title=None, cmap='coolwarm'):
+    """
+    Plot Line Integral Convolution visualization for binned velocity field
+    
+    Parameters
+    ----------
+    bin_num : ndarray
+        Bin map (2D array)
+    velocity : ndarray
+        Velocity values for each bin
+    stream_density : int, default=3
+        Density of streamlines
+    seed : int, default=42
+        Random seed for streamline placement
+    ax : matplotlib.axes.Axes, optional
+        Axis to plot on
+    figsize : tuple, default=(8, 8)
+        Figure size
+    title : str, optional
+        Title for the plot
+    cmap : str, default='coolwarm'
+        Colormap for velocity
+        
+    Returns
+    -------
+    tuple
+        (fig, ax) - Figure and axis objects
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.figure
+    
+    try:
+        # Create 2D velocity field from binned data
+        vel_map = np.full_like(bin_num, np.nan, dtype=float)
+        
+        # Map velocity values to bins
+        for i, vel in enumerate(velocity):
+            if np.isfinite(vel):
+                vel_map[bin_num == i] = vel
+        
+        # Create masked array
+        masked_vel = np.ma.array(vel_map, mask=~np.isfinite(vel_map))
+        
+        # Check if we have enough valid data
+        if np.sum(~masked_vel.mask) < 10:
+            ax.text(0.5, 0.5, "Not enough valid velocity data for LIC", 
+                   ha='center', va='center', transform=ax.transAxes)
+            if title:
+                ax.set_title(title)
+            return fig, ax
+        
+        # Fill NaN values for gradient calculation
+        filled_vel = masked_vel.filled(0)
+        
+        # Calculate velocity gradients
+        vy, vx = np.gradient(filled_vel)
+        
+        # Normalize the gradient vectors
+        norm = np.sqrt(vx**2 + vy**2)
+        mask = norm > 0
+        if np.any(mask):
+            vx[mask] /= norm[mask]
+            vy[mask] /= norm[mask]
+        
+        # Create LIC visualization
+        try:
+            # Import for Line Integral Convolution
+            from matplotlib.patches import Circle
+            import matplotlib.patheffects as PathEffects
+            
+            # Set up streamplot
+            y, x = np.mgrid[:vel_map.shape[0], :vel_map.shape[1]]
+            
+            # Plot velocity field
+            im = ax.imshow(masked_vel, origin='lower', cmap=cmap, aspect='equal')
+            plt.colorbar(im, ax=ax, label='Velocity (km/s)')
+            
+            # Add streamlines with random seed for reproducibility
+            np.random.seed(seed)
+            
+            # Use lower density for streamlines with more transparent lines
+            ax.streamplot(x, y, vx, vy, density=stream_density, color='k', 
+                         linewidth=1, arrowsize=1, alpha=0.5)
+            
+            # Add title
+            if title:
+                ax.set_title(title)
+            else:
+                ax.set_title('Velocity Field LIC Visualization')
+            
+        except ImportError:
+            logger.warning("LIC visualization requires matplotlib with streamplot support")
+            # Fallback: just show the velocity field
+            im = ax.imshow(masked_vel, origin='lower', cmap=cmap, aspect='equal')
+            plt.colorbar(im, ax=ax, label='Velocity (km/s)')
+            
+            # Add title
+            if title:
+                ax.set_title(title)
+            else:
+                ax.set_title('Velocity Field')
+        
+        return fig, ax
+        
+    except Exception as e:
+        logger.warning(f"Error creating LIC plot: {e}")
+        ax.text(0.5, 0.5, f"Error: {str(e)}", 
+               ha='center', va='center', transform=ax.transAxes)
+        if title:
+            ax.set_title(title)
+        return fig, ax
+
+
+def plot_bin_emission_lines(bin_num, emission_flux, line_names=None, max_lines=6, 
+                           figsize=None, log_scale=True, title=None):
+    """
+    Plot emission line maps for binned data
+    
+    Parameters
+    ----------
+    bin_num : ndarray
+        Bin map (2D array)
+    emission_flux : dict
+        Dictionary of emission line fluxes
+    line_names : list, optional
+        List of emission lines to plot. If None, use all available.
+    max_lines : int, default=6
+        Maximum number of emission lines to plot
+    figsize : tuple, optional
+        Figure size. If None, calculated based on number of lines.
+    log_scale : bool, default=True
+        Whether to use log scale for flux
+    title : str, optional
+        Title for the plot
+        
+    Returns
+    -------
+    tuple
+        (fig, axes) - Figure and axes objects
+    """
+    # Get emission lines to plot
+    if line_names is None:
+        line_names = list(emission_flux.keys())
+    
+    # Limit to max_lines
+    line_names = line_names[:max_lines]
+    n_lines = len(line_names)
+    
+    if n_lines == 0:
+        logger.warning("No emission lines to plot")
+        return None, None
+    
+    # Calculate figure layout
+    if n_lines <= 3:
+        nrows, ncols = 1, n_lines
+    else:
+        nrows = (n_lines + 2) // 3  # Ceiling division
+        ncols = min(3, n_lines)
+    
+    # Calculate figure size if not provided
+    if figsize is None:
+        figsize = (4 * ncols, 4 * nrows)
+    
+    # Create figure
+    fig, axes = plt.subplots(nrows, ncols, figsize=figsize)
+    
+    # Flatten axes for easy iteration
+    if n_lines == 1:
+        axes = [axes]
+    elif nrows == 1 or ncols == 1:
+        axes = axes.flatten()
+    
+    try:
+        # Plot each emission line
+        for i, line_name in enumerate(line_names):
+            if i < len(axes):
+                # Get flux for this line
+                if line_name in emission_flux:
+                    flux = emission_flux[line_name]
+                    
+                    # Plot flux
+                    safe_plot_array(
+                        flux, bin_num, ax=axes[i], 
+                        cmap='inferno', 
+                        title=line_name,
+                        label='Log Flux' if log_scale else 'Flux'
+                    )
+                else:
+                    axes[i].text(0.5, 0.5, f"No data for {line_name}", 
+                               ha='center', va='center', transform=axes[i].transAxes)
+                    axes[i].set_title(line_name)
+        
+        # Hide any unused subplots
+        for i in range(n_lines, len(axes)):
+            axes[i].axis('off')
+        
+        # Add overall title if provided
+        if title:
+            fig.suptitle(title, fontsize=16)
+            plt.subplots_adjust(top=0.9)
+            
+        plt.tight_layout()
+        return fig, axes
+        
+    except Exception as e:
+        logger.warning(f"Error plotting emission lines: {e}")
+        for ax in axes:
+            ax.text(0.5, 0.5, f"Error: {str(e)}", 
+                   ha='center', va='center', transform=ax.transAxes)
+        return fig, axes
+
+
+def plot_bin_indices(bin_num, indices_values, index_names=None, max_indices=6, 
+                    figsize=None, title=None):
+    """
+    Plot spectral index maps for binned data
+    
+    Parameters
+    ----------
+    bin_num : ndarray
+        Bin map (2D array)
+    indices_values : dict
+        Dictionary of spectral index values
+    index_names : list, optional
+        List of indices to plot. If None, use all available.
+    max_indices : int, default=6
+        Maximum number of indices to plot
+    figsize : tuple, optional
+        Figure size. If None, calculated based on number of indices.
+    title : str, optional
+        Title for the plot
+        
+    Returns
+    -------
+    tuple
+        (fig, axes) - Figure and axes objects
+    """
+    # Get indices to plot
+    if index_names is None:
+        index_names = list(indices_values.keys())
+    
+    # Limit to max_indices
+    index_names = index_names[:max_indices]
+    n_indices = len(index_names)
+    
+    if n_indices == 0:
+        logger.warning("No spectral indices to plot")
+        return None, None
+    
+    # Calculate figure layout
+    if n_indices <= 3:
+        nrows, ncols = 1, n_indices
+    else:
+        nrows = (n_indices + 2) // 3  # Ceiling division
+        ncols = min(3, n_indices)
+    
+    # Calculate figure size if not provided
+    if figsize is None:
+        figsize = (4 * ncols, 4 * nrows)
+    
+    # Create figure
+    fig, axes = plt.subplots(nrows, ncols, figsize=figsize)
+    
+    # Flatten axes for easy iteration
+    if n_indices == 1:
+        axes = [axes]
+    elif nrows == 1 or ncols == 1:
+        axes = axes.flatten()
+    
+    try:
+        # Plot each index
+        for i, index_name in enumerate(index_names):
+            if i < len(axes):
+                # Get values for this index
+                if index_name in indices_values:
+                    values = indices_values[index_name]
+                    
+                    # Plot values
+                    safe_plot_array(
+                        values, bin_num, ax=axes[i], 
+                        cmap='plasma', 
+                        title=index_name,
+                        label='Index Value'
+                    )
+                else:
+                    axes[i].text(0.5, 0.5, f"No data for {index_name}", 
+                               ha='center', va='center', transform=axes[i].transAxes)
+                    axes[i].set_title(index_name)
+        
+        # Hide any unused subplots
+        for i in range(n_indices, len(axes)):
+            axes[i].axis('off')
+        
+        # Add overall title if provided
+        if title:
+            fig.suptitle(title, fontsize=16)
+            plt.subplots_adjust(top=0.9)
+            
+        plt.tight_layout()
+        return fig, axes
+        
+    except Exception as e:
+        logger.warning(f"Error plotting spectral indices: {e}")
+        for ax in axes:
+            ax.text(0.5, 0.5, f"Error: {str(e)}", 
+                   ha='center', va='center', transform=ax.transAxes)
+        return fig, axes
 
 
 def plot_bin_spectrum_fit(wavelength, bin_idx, bin_spectrum, bin_bestfit, 
