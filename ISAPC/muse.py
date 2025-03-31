@@ -1425,6 +1425,9 @@ class MUSECube:
             self._emission_sig = {}
             self._gas_bestfit_field = np.full((n_wave, self._n_y, self._n_x), np.nan)
             
+            # Store polynomial coefficients for each bin
+            self._bin_poly_coeffs = []
+            
             # Generate emission line templates
             from ppxf.ppxf_util import emission_lines
             
@@ -1584,6 +1587,25 @@ class MUSECube:
                     stellar_sol = pp.sol[0]
                     gas_sol = pp.sol[1]
                     
+                    # Properly calculate and update optimal template with polynomial
+                    updated_optimal_template = None
+                    poly_coeff = None
+                    try:
+                        # Get the polynomial from ppxf
+                        if hasattr(pp, 'apoly') and pp.apoly is not None and hasattr(self, '_sps'):
+                            # Fit polynomial coefficients (use same degree as in ppxf)
+                            poly_coeff = np.polyfit(self._binned_wavelength, pp.apoly, ppxf_deg)
+                            
+                            # Get the base stellar template with new weights
+                            # First component (index 0) is the stellar template
+                            updated_optimal_template = stars_gas_templates[:, 0] * pp.weights[0]
+                            
+                            # Add the polynomial evaluated on the template wavelength grid
+                            template_poly = np.poly1d(poly_coeff)(self._sps.lam_temp)
+                            updated_optimal_template += template_poly
+                    except Exception as e:
+                        logger.debug(f"Error updating optimal template for bin {bin_idx}: {e}")
+                    
                     # Prepare results
                     result = {
                         'gas_bestfit': gas_bestfit,
@@ -1591,7 +1613,9 @@ class MUSECube:
                         'total_bestfit': bestfit,
                         'sol': stellar_sol,
                         'gas_sol': gas_sol,
-                        'weights': pp.weights
+                        'weights': pp.weights,
+                        'updated_optimal_template': updated_optimal_template,
+                        'poly_coeff': poly_coeff
                     }
                     
                     # Add gas flux if available
@@ -1629,6 +1653,22 @@ class MUSECube:
                 
                 # Store bin-level results
                 self._bin_gas_bestfit[:, bin_idx] = result.get('gas_bestfit', np.zeros(n_wave))
+                
+                # Store updated optimal template if available
+                if 'updated_optimal_template' in result and result['updated_optimal_template'] is not None:
+                    # Initialize _bin_optimal_tmpls if needed
+                    if not hasattr(self, '_bin_optimal_tmpls') or self._bin_optimal_tmpls is None:
+                        n_wave_temp = len(self._sps.lam_temp) if hasattr(self, '_sps') else n_wave
+                        self._bin_optimal_tmpls = np.zeros((n_wave_temp, n_bins))
+                    
+                    # Store the updated optimal template
+                    self._bin_optimal_tmpls[:, bin_idx] = result['updated_optimal_template']
+                
+                # Store polynomial coefficients if available
+                if 'poly_coeff' in result and result['poly_coeff'] is not None:
+                    if not hasattr(self, '_bin_poly_coeffs'):
+                        self._bin_poly_coeffs = []
+                    self._bin_poly_coeffs.append((bin_idx, result['poly_coeff']))
                 
                 # Store emission line results
                 if 'emission_flux' in result:
@@ -1942,7 +1982,7 @@ class MUSECube:
         
     def _calculate_spectral_indices_binned(self, indices_list=None, n_jobs=-1, verbose=False):
         """
-        Calculate spectral indices for binned data
+        Calculate spectral indices for binned data using the same approach as pixel-to-pixel mode
         
         Parameters
         ----------
@@ -1959,6 +1999,8 @@ class MUSECube:
             Dictionary of spectral indices
         """
         from spectral_indices import LineIndexCalculator, set_warnings
+        import traceback
+        import warnings
         
         # Control warnings
         set_warnings(verbose)
@@ -1980,78 +2022,81 @@ class MUSECube:
             for index_name in indices_list:
                 self._spectral_indices[index_name] = np.full((self._n_y, self._n_x), np.nan)
             
+            # Check if we have emission-line fits
+            has_emission_lines = (hasattr(self, '_bin_gas_bestfit') and 
+                                self._bin_gas_bestfit is not None and 
+                                np.any(np.isfinite(self._bin_gas_bestfit)))
+            
             # Define function to calculate indices for a bin
             def process_bin(bin_idx):
-                """Calculate spectral indices for a single bin"""
+                """Calculate spectral indices for a single bin, using the same logic as p2p"""
                 # Skip bins without fits
                 if not hasattr(self, '_bin_velocity') or np.isnan(self._bin_velocity[bin_idx]):
                     return bin_idx, {name: np.nan for name in indices_list}
                 
                 try:
-                    # Get bin data
-                    bin_spectrum = self._binned_spectra[:, bin_idx]
+                    # Get all data at once to minimize Python-level operations
+                    observed_spectrum = self._binned_spectra[:, bin_idx]
                     
-                    # Skip bins with insufficient data
-                    if not np.any(np.isfinite(bin_spectrum)):
-                        return bin_idx, {name: np.nan for name in indices_list}
-                    
-                    # Get fit data if available
-                    fit_data = None
-                    fit_wave = None
-                    
-                    if hasattr(self, '_sps') and self._sps is not None:
-                        fit_wave = self._sps.lam_temp
-                        if hasattr(self, '_bin_optimal_tmpls') and self._bin_optimal_tmpls is not None:
-                            fit_data = self._bin_optimal_tmpls[:, bin_idx]
+                    # Get optimal template - this should now include polynomial components
+                    # if emission line fitting has been done
+                    if hasattr(self, '_bin_optimal_tmpls') and self._bin_optimal_tmpls is not None:
+                        optimal_template = self._bin_optimal_tmpls[:, bin_idx]
                     else:
-                        # Use wavelength grid as fallback
-                        fit_wave = self._binned_wavelength
-                    
-                    if fit_data is None or not np.any(np.isfinite(fit_data)):
-                        # Try using bestfit if available
-                        if hasattr(self, '_bin_bestfit') and self._bin_bestfit is not None:
-                            fit_data = self._bin_bestfit[:, bin_idx]
-                            fit_wave = self._binned_wavelength
-                    
-                    if fit_data is None or not np.any(np.isfinite(fit_data)):
-                        # Use observed data as a fallback
-                        fit_data = bin_spectrum
-                        fit_wave = self._binned_wavelength
-                    
-                    # Get emission line data if available
-                    em_wave = None
-                    em_flux = None
-                    if hasattr(self, '_bin_gas_bestfit') and self._bin_gas_bestfit is not None:
-                        gas_data = self._bin_gas_bestfit[:, bin_idx]
-                        if np.any(np.isfinite(gas_data)):
-                            em_wave = self._binned_wavelength
-                            em_flux = gas_data
-                    
-                    # Get velocity value (ensure it's finite)
-                    velocity = self._bin_velocity[bin_idx] if hasattr(self, '_bin_velocity') else 0.0
-                    if not np.isfinite(velocity):
-                        velocity = 0.0
-                    
-                    # Handle NaNs in data
-                    bin_spectrum_copy = bin_spectrum.copy()
-                    bin_spectrum_copy[~np.isfinite(bin_spectrum_copy)] = 0.0
-                    fit_data = np.nan_to_num(fit_data, nan=0.0)
-                    
-                    # Calculate indices
-                    try:
-                        calculator = LineIndexCalculator(
-                            wave=self._binned_wavelength,
-                            flux=bin_spectrum_copy,
-                            fit_wave=fit_wave,
-                            fit_flux=fit_data,
-                            em_wave=em_wave,
-                            em_flux_list=em_flux,
-                            velocity_correction=velocity,
-                            continuum_mode='auto',
-                            show_warnings=verbose
-                        )
+                        # Fallback if no optimal template available
+                        optimal_template = None
                         
-                        # Calculate each index
+                        # Try to compute it from weights if available (initial fitting)
+                        if hasattr(self, '_bin_weights') and len(self._bin_weights) > bin_idx:
+                            weights = self._bin_weights[bin_idx]
+                            if hasattr(self, '_sps') and hasattr(self._sps, 'templates'):
+                                # Basic optimal template from weights
+                                optimal_template = np.dot(weights, self._sps.templates.T)
+                                
+                                # Add polynomial if available
+                                if hasattr(self, '_bin_poly_coeffs'):
+                                    for b_idx, poly_coeff in self._bin_poly_coeffs:
+                                        if b_idx == bin_idx:
+                                            # Add polynomial evaluated on template wavelength grid
+                                            template_poly = np.poly1d(poly_coeff)(self._sps.lam_temp)
+                                            optimal_template += template_poly
+                                            break
+                    
+                    velocity = self._bin_velocity[bin_idx]
+                    
+                    # Get gas model if available - only once
+                    gas_model = None
+                    if has_emission_lines:
+                        gas_model = self._bin_gas_bestfit[:, bin_idx]
+                        # Verify gas model has valid values
+                        if not np.any(np.isfinite(gas_model)) or np.all(gas_model == 0):
+                            gas_model = None
+                    
+                    # Create LineIndexCalculator with warning suppression
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings('ignore', category=RuntimeWarning, 
+                                            message='invalid value encountered in')
+                        warnings.filterwarnings('ignore', category=RuntimeWarning, 
+                                            message='divide by zero')
+                        
+                        try:
+                            # Use exactly the same parameters as in p2p method
+                            calculator = LineIndexCalculator(
+                                wave=self._binned_wavelength,           # Observation wavelength grid
+                                flux=observed_spectrum,                 # Observed spectrum
+                                fit_wave=self._sps.lam_temp if hasattr(self, '_sps') else self._binned_wavelength,   # Template wavelength grid
+                                fit_flux=optimal_template,               # Template spectrum (now with polynomial)
+                                em_wave=self._binned_wavelength if gas_model is not None else None,  # Emission line wavelength grid
+                                em_flux_list=gas_model,                 # Emission line spectrum
+                                velocity_correction=velocity,           # Velocity correction
+                                continuum_mode='auto'                   # Auto select continuum mode
+                            )
+                        except Exception as e:
+                            if verbose:
+                                logger.warning(f"Error creating LineIndexCalculator for bin {bin_idx}: {e}")
+                            return bin_idx, {index_name: np.nan for index_name in indices_list}
+                        
+                        # Calculate all required indices
                         result = {}
                         for index_name in indices_list:
                             try:
@@ -2064,14 +2109,9 @@ class MUSECube:
                         
                         return bin_idx, result
                         
-                    except Exception as e:
-                        if verbose:
-                            logger.debug(f"Failed to create LineIndexCalculator for bin {bin_idx}: {e}")
-                        return bin_idx, {name: np.nan for name in indices_list}
-                    
                 except Exception as e:
                     if verbose:
-                        logger.debug(f"Error processing bin {bin_idx} for indices: {e}")
+                        logger.debug(f"Error processing bin {bin_idx}: {e}\n{traceback.format_exc()}")
                     return bin_idx, {name: np.nan for name in indices_list}
             
             # Process bins in parallel
@@ -2100,7 +2140,7 @@ class MUSECube:
                             for index_name, value in indices.items():
                                 self._spectral_indices[index_name][row, col] = value
             
-            # Return index results (both bin and pixel versions)
+            # Return combined results
             return {
                 'bin_indices': self._bin_indices_result,
                 'pixel_indices': self._spectral_indices
@@ -3076,6 +3116,135 @@ class MUSECube:
             logger.error(f"Error creating binned analysis plots: {e}")
             return figures
 
+    def plot_bin_index_calculation(self, bin_idx, save_dir=None):
+        """
+        Plot the spectral index calculation visualization for a bin
+        
+        Parameters
+        ----------
+        bin_idx : int
+            Bin index to plot
+        save_dir : str, optional
+            Directory to save the plot
+            
+        Returns
+        -------
+        tuple
+            (fig, axes) - Figure and axes objects
+        """
+        if not hasattr(self, '_is_binned') or not self._is_binned:
+            logger.warning("Not in binned mode, can't plot bin indices")
+            return None
+        
+        if bin_idx < 0 or bin_idx >= self._n_bins:
+            logger.warning(f"Invalid bin index: {bin_idx}")
+            return None
+        
+        try:
+            # Get bin data
+            bin_spectrum = self._binned_spectra[:, bin_idx]
+            
+            # Skip bins with insufficient data
+            if not np.any(np.isfinite(bin_spectrum)):
+                logger.warning(f"No valid data for bin {bin_idx}")
+                return None
+            
+            # Get velocity
+            velocity = 0.0
+            if hasattr(self, '_bin_velocity') and bin_idx < len(self._bin_velocity):
+                velocity = self._bin_velocity[bin_idx]
+                if not np.isfinite(velocity):
+                    velocity = 0.0
+            
+            # Get optimal template - CRITICAL: This must match how it's done in index calculation
+            optimal_template = None
+            if hasattr(self, '_bin_optimal_tmpls') and self._bin_optimal_tmpls is not None:
+                optimal_template = self._bin_optimal_tmpls[:, bin_idx]
+            else:
+                # Try to compute it from weights if available (from initial fitting)
+                if hasattr(self, '_bin_weights') and len(self._bin_weights) > bin_idx:
+                    weights = self._bin_weights[bin_idx]
+                    if hasattr(self, '_sps') and hasattr(self._sps, 'templates'):
+                        # Basic optimal template from weights
+                        optimal_template = np.dot(weights, self._sps.templates.T)
+                        
+                        # Add polynomial if available (from emission line fitting)
+                        if hasattr(self, '_bin_poly_coeffs'):
+                            for b_idx, poly_coeff in self._bin_poly_coeffs:
+                                if b_idx == bin_idx:
+                                    # Add polynomial evaluated on template wavelength grid
+                                    template_poly = np.poly1d(poly_coeff)(self._sps.lam_temp)
+                                    optimal_template += template_poly
+                                    break
+            
+            # Get proper fit wave and flux
+            if optimal_template is not None and hasattr(self, '_sps'):
+                # Use SPS template wavelength and optimal template
+                fit_wave = self._sps.lam_temp
+                fit_flux = optimal_template
+            else:
+                # Fallback to bestfit if optimal template not available
+                logger.info(f"Falling back to bestfit for bin {bin_idx}")
+                fit_wave = self._binned_wavelength
+                fit_flux = self._bin_bestfit[:, bin_idx] if hasattr(self, '_bin_bestfit') else bin_spectrum
+            
+            # Get emission line model if available
+            em_wave = None
+            em_flux = None
+            if hasattr(self, '_bin_gas_bestfit') and self._bin_gas_bestfit is not None:
+                gas_data = self._bin_gas_bestfit[:, bin_idx]
+                if np.any(np.isfinite(gas_data)):
+                    em_wave = self._binned_wavelength
+                    em_flux = gas_data
+            
+            # Print diagnostic info
+            logger.info(f"Bin {bin_idx} - Velocity: {velocity:.2f} km/s")
+            logger.info(f"Bin {bin_idx} - Observed wavelength range: {np.min(self._binned_wavelength):.1f}-{np.max(self._binned_wavelength):.1f}")
+            if fit_wave is not None:
+                logger.info(f"Bin {bin_idx} - Template wavelength range: {np.min(fit_wave):.1f}-{np.max(fit_wave):.1f}")
+            
+            # Create a LineIndexCalculator
+            from spectral_indices import LineIndexCalculator
+            
+            calculator = LineIndexCalculator(
+                wave=self._binned_wavelength,
+                flux=bin_spectrum,
+                fit_wave=fit_wave,
+                fit_flux=fit_flux,
+                em_wave=em_wave,
+                em_flux_list=em_flux,
+                velocity_correction=velocity,
+                continuum_mode='auto',
+                show_warnings=False
+            )
+            
+            # Create plot
+            mode = self._bin_type if hasattr(self, '_bin_type') else "BIN"
+            
+            # Create save path if requested
+            save_path = None
+            if save_dir:
+                from pathlib import Path
+                save_dir = Path(save_dir)
+                save_dir.mkdir(exist_ok=True, parents=True)
+                save_path = str(save_dir)
+            
+            # Plot with index calculations
+            fig, axes = calculator.plot_all_lines(
+                mode=mode,
+                number=bin_idx,
+                save_path=save_path,
+                show_index=True
+            )
+            
+            return fig, axes
+        
+        except Exception as e:
+            logger.error(f"Error plotting bin index calculation: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return None
+    
     @property
     def redshift(self):
         """Return the galaxy redshift"""

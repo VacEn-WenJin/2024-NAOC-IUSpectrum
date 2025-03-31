@@ -430,95 +430,46 @@ def run_rdb_analysis(args, cube, p2p_results=None):
             if hasattr(cube, '_bin_indices_result') and cube._bin_indices_result:
                 rdb_results['bin_indices'] = cube._bin_indices_result
 
-        # After calculating spectral indices
+        # Add this after spectral indices calculation in both voronoi.py and radial.py:
+
+        # Create spectral index visualizations if requested
         if indices_result is not None and not args.no_plots:
             try:
-                # Create directory for spectral indices plots
+                # Create directory for spectral index visualization
                 indices_plots_dir = plots_dir / "spectral_indices"
                 indices_plots_dir.mkdir(exist_ok=True, parents=True)
                 
-                # Get bins with valid results (up to 5 bins)
-                valid_bins = []
-                max_bins_to_plot = 5  # Limit the number of bins we plot
+                # Plot indices for a few sample bins
+                n_bins_to_plot = min(5, cube._n_bins)
+                bin_indices_to_plot = []
                 
-                if hasattr(cube, '_bin_velocity') and cube._bin_velocity is not None:
-                    # Find bins with valid velocities and prioritize different radii
-                    bin_idx_by_radius = []
-                    if hasattr(cube, '_bin_radii') and cube._bin_radii is not None:
-                        # Sort bins by radius
-                        radius_pairs = [(i, r) for i, r in enumerate(cube._bin_radii) if np.isfinite(cube._bin_velocity[i])]
-                        if radius_pairs:
-                            # Sort by radius
-                            radius_pairs.sort(key=lambda x: x[1])
-                            # Take 5 evenly spaced bins
-                            step = max(1, len(radius_pairs) // max_bins_to_plot)
-                            bin_idx_by_radius = [pair[0] for pair in radius_pairs[::step][:max_bins_to_plot]]
+                # Try to select bins with valid velocities
+                if hasattr(cube, '_bin_velocity'):
+                    valid_bins = [i for i in range(len(cube._bin_velocity)) 
+                                if np.isfinite(cube._bin_velocity[i])]
                     
-                    if bin_idx_by_radius:
-                        valid_bins = bin_idx_by_radius
-                    else:
-                        # Just find valid bins
-                        for i in range(min(len(cube._bin_velocity), cube._n_bins)):
-                            if np.isfinite(cube._bin_velocity[i]):
-                                valid_bins.append(i)
-                                if len(valid_bins) >= max_bins_to_plot:
-                                    break
+                    if len(valid_bins) > 0:
+                        # Get evenly spaced bins
+                        step = max(1, len(valid_bins) // n_bins_to_plot)
+                        bin_indices_to_plot = valid_bins[::step][:n_bins_to_plot]
+                    
+                # If no valid bins found, just use the first few
+                if not bin_indices_to_plot:
+                    bin_indices_to_plot = range(n_bins_to_plot)
                 
-                # If we didn't find any valid bins, just use the first few
-                if not valid_bins:
-                    valid_bins = list(range(min(max_bins_to_plot, cube._n_bins)))
-                
-                # Plot each bin's spectral lines
-                for bin_idx in valid_bins:
+                # Plot each bin
+                for bin_idx in bin_indices_to_plot:
                     try:
-                        # Create a LineIndexCalculator for this bin
-                        from spectral_indices import LineIndexCalculator
-                        
-                        # Get bin spectrum and best-fit
-                        bin_spectrum = cube._binned_spectra[:, bin_idx]
-                        bin_bestfit = cube._bin_bestfit[:, bin_idx]
-                        
-                        # Get velocity for this bin
-                        bin_velocity = cube._bin_velocity[bin_idx] if hasattr(cube, '_bin_velocity') else 0
-                        
-                        # Get gas component if available
-                        bin_gas_bestfit = None
-                        if hasattr(cube, '_bin_gas_bestfit') and cube._bin_gas_bestfit is not None:
-                            bin_gas_bestfit = cube._bin_gas_bestfit[:, bin_idx]
-                        
-                        # Add radius info for the bin name
-                        bin_radius = ""
-                        if hasattr(cube, '_bin_radii') and cube._bin_radii is not None:
-                            bin_radius = f"_{cube._bin_radii[bin_idx]:.1f}r"
-                        
-                        # Create LineIndexCalculator
-                        calculator = LineIndexCalculator(
-                            wave=cube._binned_wavelength,
-                            flux=bin_spectrum,
-                            fit_wave=cube._binned_wavelength,
-                            fit_flux=bin_bestfit,
-                            em_wave=cube._binned_wavelength if bin_gas_bestfit is not None else None,
-                            em_flux_list=bin_gas_bestfit,
-                            velocity_correction=bin_velocity,
-                            continuum_mode='auto',
-                            show_warnings=False
-                        )
-                        
-                        # Plot spectral lines with index calculations
-                        fig, axes = calculator.plot_all_lines(
-                            mode='RDB',
-                            number=f"{bin_idx}{bin_radius}",
-                            save_path=str(indices_plots_dir),
-                            show_index=True
-                        )
-                        
-                        plt.close(fig)  # Close the figure to avoid memory issues
+                        # Use the dedicated method to ensure consistency with calculation
+                        fig, axes = cube.plot_bin_index_calculation(bin_idx, save_dir=indices_plots_dir)
+                        if fig is not None:
+                            plt.close(fig)  # Close to avoid memory issues
                         
                     except Exception as e:
-                        logger.warning(f"Error creating spectral index plot for bin {bin_idx}: {e}")
-            
+                        logger.warning(f"Error plotting spectral indices for bin {bin_idx}: {e}")
+                        
             except Exception as e:
-                logger.warning(f"Error creating spectral index plots: {e}")
+                logger.warning(f"Error creating spectral index visualizations: {e}")
         
         # Save binned data object
         binned_data_path = data_dir / f"{galaxy_name}_RDB_binned_data.npz"
