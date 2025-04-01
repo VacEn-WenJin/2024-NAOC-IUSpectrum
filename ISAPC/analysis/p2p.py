@@ -568,10 +568,10 @@ def create_p2p_plots(args, cube, p2p_results, galaxy_name, bestfit_field, optima
         
         # Use filename to distinguish gas/stellar kinematics
         fig.savefig(plots_dir / f"{galaxy_name}_P2P_{kinematics_type}_kinematics.png", dpi=150)
-        plt.close(fig)
+        plt.close(fig)  # Ensure figure is closed
     except Exception as e:
         logger.error(f"Error creating kinematics plot: {str(e)}")
-        plt.close('all')
+        plt.close('all')  # Close all figures in case of error
     
     # Create stellar population parameter plots
     if 'stellar_population' in p2p_results:

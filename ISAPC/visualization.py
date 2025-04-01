@@ -15,8 +15,27 @@ import os
 import logging
 logger = logging.getLogger(__name__)
 
+# Add this to visualization.py at the top of the file after imports
+import contextlib
 
-def standardize_figure_saving(fig, file_path, dpi=150):
+@contextlib.contextmanager
+def figure_context(*args, **kwargs):
+    """Context manager for matplotlib figures to ensure they are closed properly.
+    
+    Usage:
+        with figure_context(figsize=(10, 5)) as fig:
+            # Do plotting operations on fig
+            # Figure will be automatically closed when exiting the with block
+    """
+    fig = plt.figure(*args, **kwargs)
+    try:
+        yield fig
+    finally:
+        plt.close(fig)
+
+
+# Update the standardize_figure_saving function in visualization.py
+def standardize_figure_saving(fig, file_path, dpi=150, close_after=True):
     """Standard approach to save figures with consistent settings"""
     try:
         # Create directory if it doesn't exist
@@ -25,9 +44,20 @@ def standardize_figure_saving(fig, file_path, dpi=150):
         # Save with consistent settings
         fig.savefig(file_path, dpi=dpi, bbox_inches='tight')
         logger.info(f"Saved figure to {file_path}")
+        
+        # Close figure if requested
+        if close_after:
+            plt.close(fig)
+            
         return True
     except Exception as e:
         logger.warning(f"Error saving figure to {file_path}: {e}")
+        # Still try to close the figure on error
+        if close_after:
+            try:
+                plt.close(fig)
+            except:
+                pass
         return False
     
 

@@ -585,7 +585,8 @@ def calculate_wavelength_intersection(wavelength, velocity_field, n_x):
     return mask, min_wave, max_wave
 
 
-def combine_spectra_efficiently(spectra, wavelength, bin_indices, velocity_field=None, n_x=None):
+def combine_spectra_efficiently(spectra, wavelength, bin_indices, velocity_field=None, n_x=None, 
+                               edge_treatment='extend'):
     """
     Efficiently combine spectra into bins with improved velocity correction.
     
@@ -601,6 +602,11 @@ def combine_spectra_efficiently(spectra, wavelength, bin_indices, velocity_field
         Velocity field for correction
     n_x : int, optional
         Number of pixels in x direction
+    edge_treatment : str, default='extend'
+        How to handle spectrum edges:
+        - 'extend': Extend edge values rather than filling with zeros
+        - 'mask': Use NaN for edge values
+        - 'zero': Fill with zeros (original behavior)
         
     Returns
     -------
@@ -609,6 +615,7 @@ def combine_spectra_efficiently(spectra, wavelength, bin_indices, velocity_field
     """
     n_wave = len(wavelength)
     n_bins = len(bin_indices)
+    c = 299792.458  # Speed of light in km/s
     
     # Initialize output array
     bin_spectra = np.zeros((n_wave, n_bins))
@@ -656,7 +663,7 @@ def combine_spectra_efficiently(spectra, wavelength, bin_indices, velocity_field
                         # Only apply correction for non-zero velocities
                         if abs(median_velocity) > 1.0:  # Minimum 1 km/s to apply correction
                             # Apply velocity shift using Doppler formula
-                            lam_shifted = wavelength * (1 + median_velocity/C_KMS)
+                            lam_shifted = wavelength * (1 + median_velocity/c)
                             
                             # Combine all spectra first, then apply correction once
                             combined_spectrum = np.zeros(n_wave)
@@ -671,9 +678,21 @@ def combine_spectra_efficiently(spectra, wavelength, bin_indices, velocity_field
                             if weight_sum > 0:
                                 combined_spectrum /= weight_sum
                                 
-                                # Use spectres for resampling the combined spectrum
+                                # Use spectres for resampling the combined spectrum with edge handling
                                 try:
-                                    corrected_spectrum = spectres(wavelength, lam_shifted, combined_spectrum, fill=0.0)
+                                    if edge_treatment == 'extend':
+                                        # Use nearest valid values for edges
+                                        corrected_spectrum = spectres(wavelength, lam_shifted, combined_spectrum, 
+                                                                  fill=None, preserve_edges=True)
+                                    elif edge_treatment == 'mask':
+                                        # Use NaN for edges
+                                        corrected_spectrum = spectres(wavelength, lam_shifted, combined_spectrum, 
+                                                                  fill=np.nan, preserve_edges=False)
+                                    else:
+                                        # Original behavior - fill with zeros
+                                        corrected_spectrum = spectres(wavelength, lam_shifted, combined_spectrum, 
+                                                                  fill=0.0, preserve_edges=False)
+                                    
                                     bin_spectra[:, i] = corrected_spectrum
                                     velocity_correction_success = True
                                     continue  # Skip to next bin
@@ -706,11 +725,22 @@ def combine_spectra_efficiently(spectra, wavelength, bin_indices, velocity_field
                                 # Only correct if velocity is valid and non-negligible
                                 if np.isfinite(vel) and abs(vel) > 1.0:
                                     # Apply velocity shift using Doppler formula
-                                    lam_shifted = wavelength * (1 + vel/C_KMS)
+                                    lam_shifted = wavelength * (1 + vel/c)
                                     
                                     try:
-                                        # Use spectres for resampling
-                                        corrected_spectrum = spectres(wavelength, lam_shifted, spectrum, fill=0.0)
+                                        # Use spectres for resampling with improved edge handling
+                                        if edge_treatment == 'extend':
+                                            corrected_spectrum = spectres(wavelength, lam_shifted, spectrum, 
+                                                                      fill=None, preserve_edges=True)
+                                        elif edge_treatment == 'mask':
+                                            # Use NaN values at edges
+                                            corrected_spectrum = spectres(wavelength, lam_shifted, spectrum, 
+                                                                      fill=np.nan, preserve_edges=False)
+                                        else:
+                                            # Original behavior
+                                            corrected_spectrum = spectres(wavelength, lam_shifted, spectrum, 
+                                                                      fill=0.0, preserve_edges=False)
+                                        
                                         bin_spectra_list.append(corrected_spectrum)
                                         continue  # Skip the default append
                                     except Exception as e:

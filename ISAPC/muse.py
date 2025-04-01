@@ -2876,7 +2876,11 @@ class MUSECube:
             )
             
             if result is not None:
+                fig, axes = result
                 results.append(result)
+                
+                # Close the figure after adding to results to prevent memory leaks
+                plt.close(fig)
         
         return results
 

@@ -121,8 +121,9 @@ def combine_radial_spectra_with_velocity_correction(spectra, wavelength, bin_ind
                             # For blueshift (v < 0), we need a redder template, so multiply lambda
                             lam_shifted = wavelength / (1 + vel/c)
                             
-                            # Use spectres for resampling
-                            corrected_spec = spectres(wavelength, lam_shifted, spec)
+                            # Use spectres for resampling with edge preservation
+                            corrected_spec = spectres(wavelength, lam_shifted, spec,
+                                                  fill=None, preserve_edges=True)
                             corrected_spectra.append(corrected_spec)
                         except Exception as e:
                             logger.debug(f"Error in velocity correction for bin {i}, pixel {idx}: {e}")
@@ -141,6 +142,20 @@ def combine_radial_spectra_with_velocity_correction(spectra, wavelength, bin_ind
                 # Set all-NaN wavelengths to NaN in result
                 all_nan = np.all(~np.isfinite(spectra_array), axis=0)
                 bin_spectra[all_nan, i] = np.nan
+                
+                # Handle edge values - ensure ends are not zero
+                if np.any(bin_spectra[:, i] == 0):
+                    # Find zero values
+                    zero_indices = np.where(bin_spectra[:, i] == 0)[0]
+                    non_zero_indices = np.where(bin_spectra[:, i] != 0)[0]
+                    
+                    if len(non_zero_indices) > 0:
+                        # For each zero value, find nearest non-zero value
+                        for zero_idx in zero_indices:
+                            # Find closest non-zero index
+                            nearest_idx = non_zero_indices[np.argmin(np.abs(non_zero_indices - zero_idx))]
+                            # Use value from nearest non-zero index
+                            bin_spectra[zero_idx, i] = bin_spectra[nearest_idx, i]
             else:
                 # No valid spectra
                 bin_spectra[:, i] = np.nan
@@ -150,6 +165,7 @@ def combine_radial_spectra_with_velocity_correction(spectra, wavelength, bin_ind
             bin_spectra[:, i] = np.nan
     
     return bin_spectra
+
 
 def run_rdb_analysis(args, cube, p2p_results=None):
     """

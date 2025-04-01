@@ -55,10 +55,13 @@ def make_bins(wavs):
 
 
 def spectres(new_wavs, spec_wavs, spec_fluxes, spec_errs=None, fill=None,
-             verbose=True):
+             verbose=True, preserve_edges=True):
     """
     Function for resampling spectra (and optionally associated
     uncertainties) onto a new wavelength basis.
+    
+    Added preserve_edges parameter to maintain original values at edges
+    rather than fill with zeros or NaNs.
 
     Parameters
     ----------
@@ -87,6 +90,11 @@ def spectres(new_wavs, spec_wavs, spec_fluxes, spec_errs=None, fill=None,
     verbose : bool (optional)
         Setting verbose to False will suppress the default warning about
         new_wavs extending outside spec_wavs and "fill" being used.
+        
+    preserve_edges : bool (optional)
+        If True, values at the edges of the spectrum will use the nearest
+        valid value instead of the fill value when outside the original
+        wavelength range.
 
     Returns
     -------
@@ -127,19 +135,39 @@ def spectres(new_wavs, spec_wavs, spec_fluxes, spec_errs=None, fill=None,
 
         # Add filler values if new_wavs extends outside of spec_wavs
         if (new_edges[j] < old_edges[0]) or (new_edges[j+1] > old_edges[-1]):
-            new_fluxes[..., j] = fill
+            if preserve_edges:
+                # Instead of using fill value, use nearest valid value from original spectrum
+                if new_edges[j] < old_edges[0]:
+                    # Use first valid value for wavelengths below range
+                    new_fluxes[..., j] = old_fluxes[..., 0]
+                    if spec_errs is not None:
+                        new_errs[..., j] = old_errs[..., 0]
+                else:
+                    # Use last valid value for wavelengths above range
+                    new_fluxes[..., j] = old_fluxes[..., -1]
+                    if spec_errs is not None:
+                        new_errs[..., j] = old_errs[..., -1]
+            else:
+                # Original behavior
+                if fill is None:
+                    new_fluxes[..., j] = 0
+                    if spec_errs is not None:
+                        new_errs[..., j] = 0
+                else:
+                    new_fluxes[..., j] = fill
+                    if spec_errs is not None:
+                        new_errs[..., j] = fill
 
-            if spec_errs is not None:
-                new_errs[..., j] = fill
-
-            # if (j == 0 or j == new_wavs.shape[0]-1) and verbose:
-            #     warnings.warn(
-            #         "Spectres: new_wavs contains values outside the range "
-            #         "in spec_wavs, new_fluxes and new_errs will be filled "
-            #         "with the value set in the 'fill' keyword argument "
-            #         "(by default 0).",
-            #         category=RuntimeWarning,
-            #     )
+            if (j == 0 or j == new_wavs.shape[0]-1) and verbose:
+                if not preserve_edges:
+                    import warnings
+                    warnings.warn(
+                        "Spectres: new_wavs contains values outside the range "
+                        "in spec_wavs, new_fluxes and new_errs will be filled "
+                        "with the value set in the 'fill' keyword argument "
+                        "(by default 0).",
+                        category=RuntimeWarning,
+                    )
             continue
 
         # Find first old bin which is partially covered by the new bin
@@ -190,18 +218,18 @@ def spectres(new_wavs, spec_wavs, spec_fluxes, spec_errs=None, fill=None,
     else:
         return new_fluxes
 
-
 def resample_spectrum(
         new_wvl: Union[list[float], np.ndarray],
         src_wvl: Union[list[float], np.ndarray],
         src_flux: Union[list[float], np.ndarray],
         src_flux_err: Optional[Union[list[float], np.ndarray]] = None,
         fill: float = 0.0,
+        preserve_edges: bool = True,
 ) -> Union[
     tuple[np.ndarray, np.ndarray], np.ndarray
 ]:
     """
-    Resample spectrum to a new wavelength grid.
+    Resample spectrum to a new wavelength grid with improved edge handling.
     
     Parameters
     ----------
@@ -215,6 +243,8 @@ def resample_spectrum(
         Source flux error values
     fill : float, default=0.0
         Fill value for wavelengths outside source range
+    preserve_edges : bool, default=True
+        Whether to preserve edge values rather than filling with zeros
         
     Returns
     -------
@@ -271,7 +301,20 @@ def resample_spectrum(
         new_flux_err = None
 
     for i in range(len(new_wvl)):
+        # Check if beyond source range
         if new_edges[i] < src_edges[0] or new_edges[i + 1] > src_edges[-1]:
+            if preserve_edges:
+                # Use nearest value instead of fill value
+                if new_edges[i] < src_edges[0]:
+                    # For wavelengths below source range, use first value
+                    new_flux[i] = src_flux[0]
+                    if new_flux_err is not None:
+                        new_flux_err[i] = src_flux_err[0]
+                else:
+                    # For wavelengths above source range, use last value
+                    new_flux[i] = src_flux[-1]
+                    if new_flux_err is not None:
+                        new_flux_err[i] = src_flux_err[-1]
             continue
 
         # Identify source bins overlapping with new bin
@@ -310,6 +353,28 @@ def resample_spectrum(
             err_slice = src_flux_err[start_idx:stop_idx + 1]
             weighted_err_sq = np.sum((err_slice * partial_widths) ** 2)
             new_flux_err[i] = np.sqrt(weighted_err_sq) / total_width
+
+    # Check for zero values at edges and replace with nearest valid value
+    if preserve_edges:
+        # Check beginning of spectrum
+        if new_flux[0] == 0 and len(new_flux) > 1:
+            # Find first non-zero value
+            nonzero_indices = np.where(new_flux != 0)[0]
+            if len(nonzero_indices) > 0:
+                first_nonzero = nonzero_indices[0]
+                new_flux[0:first_nonzero] = new_flux[first_nonzero]
+                if new_flux_err is not None:
+                    new_flux_err[0:first_nonzero] = new_flux_err[first_nonzero]
+        
+        # Check end of spectrum
+        if new_flux[-1] == 0 and len(new_flux) > 1:
+            # Find last non-zero value
+            nonzero_indices = np.where(new_flux != 0)[0]
+            if len(nonzero_indices) > 0:
+                last_nonzero = nonzero_indices[-1]
+                new_flux[last_nonzero+1:] = new_flux[last_nonzero]
+                if new_flux_err is not None:
+                    new_flux_err[last_nonzero+1:] = new_flux_err[last_nonzero]
 
     if new_flux_err is not None:
         return new_flux, new_flux_err
