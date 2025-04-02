@@ -23,29 +23,28 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Galaxy data - from the observed galaxy list
+# Galaxy data - updated to match available FITS files
 GALAXIES = [
-    {"name": "M60", "redshift": 0.0034, "type": "E2", "has_emission": False},
-    {"name": "VCC1588", "redshift": 0.0042, "type": "Sd", "has_emission": True},
-    {"name": "VCC1890", "redshift": 0.0040, "type": "dE", "has_emission": False},
-    {"name": "VCC1368", "redshift": 0.0035, "type": "SBa", "has_emission": True},
-    {"name": "VCC1902", "redshift": 0.0038, "type": "SBa", "has_emission": True},
-    {"name": "VCC1523", "redshift": 0.0038, "type": "dE(N)", "has_emission": False},
-    {"name": "VCC1949", "redshift": 0.0058, "type": "dS0(N)", "has_emission": True},
-    {"name": "VCC990", "redshift": 0.0058, "type": "dS0(N)", "has_emission": False},
-    {"name": "VCC1410", "redshift": 0.0054, "type": "Sd", "has_emission": True},
-    {"name": "VCC1695", "redshift": 0.0058, "type": "dE", "has_emission": False},
-    {"name": "VCC667", "redshift": 0.0048, "type": "Sd", "has_emission": True},
-    {"name": "VCC1549", "redshift": 0.0046, "type": "dE(N)", "has_emission": False},
-    {"name": "VCC308", "redshift": 0.0055, "type": "dE", "has_emission": False},
-    {"name": "VCC1431", "redshift": 0.0050, "type": "dE", "has_emission": False},
-    {"name": "VCC1811", "redshift": 0.0023, "type": "Sc", "has_emission": True},
-    {"name": "VCC688", "redshift": 0.0038, "type": "Sc", "has_emission": True},
-    {"name": "VCC1146", "redshift": 0.0023, "type": "E", "has_emission": False},
+    {"name": "VCC0308", "redshift": 0.0055, "type": "dE", "has_emission": False},
+    {"name": "VCC0667", "redshift": 0.0048, "type": "Sd", "has_emission": True},
+    {"name": "VCC0688", "redshift": 0.0038, "type": "Sc", "has_emission": True},
+    {"name": "VCC0990", "redshift": 0.0058, "type": "dS0(N)", "has_emission": False},
     {"name": "VCC1049", "redshift": 0.0021, "type": "dE(N)", "has_emission": False},
+    {"name": "VCC1146", "redshift": 0.0023, "type": "E", "has_emission": False},
     {"name": "VCC1193", "redshift": 0.0025, "type": "Sd", "has_emission": True},
-    {"name": "VCC1910", "redshift": 0.0007, "type": "dE(N)", "has_emission": False},
+    {"name": "VCC1368", "redshift": 0.0035, "type": "SBa", "has_emission": False},
+    {"name": "VCC1410", "redshift": 0.0054, "type": "Sd", "has_emission": True},
+    {"name": "VCC1431", "redshift": 0.0050, "type": "dE", "has_emission": False},
     {"name": "VCC1486", "redshift": 0.0004, "type": "Sc", "has_emission": True},
+    {"name": "VCC1499", "redshift": 0.0055, "type": "dE", "has_emission": False},
+    {"name": "VCC1549", "redshift": 0.0046, "type": "dE(N)", "has_emission": False},
+    {"name": "VCC1588", "redshift": 0.0042, "type": "Sd", "has_emission": True},
+    {"name": "VCC1695", "redshift": 0.0058, "type": "dE", "has_emission": False},
+    {"name": "VCC1811", "redshift": 0.0023, "type": "Sc", "has_emission": True},
+    {"name": "VCC1890", "redshift": 0.0040, "type": "dE", "has_emission": False},
+    {"name": "VCC1902", "redshift": 0.0038, "type": "SBa", "has_emission": False},
+    {"name": "VCC1910", "redshift": 0.0007, "type": "dE(N)", "has_emission": False},
+    {"name": "VCC1949", "redshift": 0.0058, "type": "dS0(N)", "has_emission": False}
 ]
 
 def setup_output_directory(base_dir):
@@ -58,16 +57,21 @@ def setup_output_directory(base_dir):
 def build_command(galaxy, args):
     """Build the command to run ISAPC for a specific galaxy"""
     # Base command
+    galaxy_name = galaxy['name']
+    
+    # Create proper filename based on galaxy name
+    fits_filename = f"{galaxy_name}_stack.fits"
+    
     cmd = [
         sys.executable,
         "main.py",
-        f"data/MUSE/{galaxy['name']}_stack.fits",
+        f"data/MUSE/{fits_filename}",
         "--redshift", f"{galaxy['redshift']}",
         "--n-job", f"{args.n_jobs}",
         "--mode", f"{args.mode}",
         "--target-snr", f"{args.target_snr}",
         "-t", f"{args.template}",
-        "-o", f"{args.output_dir}/{galaxy['name']}"
+        "-o", f"{args.output_dir}/{galaxy_name}"
     ]
     
     # Add emission line option if galaxy doesn't have emission lines
@@ -89,6 +93,10 @@ def build_command(galaxy, args):
     
     if args.equal_aspect:
         cmd.append("--equal-aspect")
+    
+    # Add no-plots option if specified
+    if args.no_plots:
+        cmd.append("--no-plots")
     
     return cmd
 
@@ -178,6 +186,14 @@ def run_galaxy_pipeline(galaxies, args):
                 # Update progress bar
                 pbar.update(1)
                 
+                # Force matplotlib figures to close to free memory
+                import matplotlib.pyplot as plt
+                plt.close('all')
+                
+                # Force garbage collection
+                import gc
+                gc.collect()
+                
         except Exception as e:
             logger.error(f"Error processing {galaxy['name']}: {str(e)}")
             
@@ -200,6 +216,14 @@ def run_galaxy_pipeline(galaxies, args):
             
             # Update progress bar
             pbar.update(1)
+            
+            # Force matplotlib figures to close
+            import matplotlib.pyplot as plt
+            plt.close('all')
+            
+            # Force garbage collection
+            import gc
+            gc.collect()
     
     # Close progress bar
     pbar.close()
@@ -243,6 +267,8 @@ if __name__ == "__main__":
                       help="Use equal aspect ratio for plots")
     parser.add_argument("--subset", type=int, nargs=2, default=None, 
                       help="Process only a subset of galaxies (start_index end_index)")
+    parser.add_argument("--no-plots", action="store_true",
+                      help="Disable generation of plots to save memory")
     
     args = parser.parse_args()
     
