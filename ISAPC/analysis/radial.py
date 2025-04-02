@@ -233,16 +233,33 @@ def run_rdb_analysis(args, cube, p2p_results=None):
     else:
         n_rings = 10  # Default
     
-    # Get center coordinates
-    center_x = args.center_x if hasattr(args, 'center_x') and args.center_x is not None else cube._n_x // 2
-    center_y = args.center_y if hasattr(args, 'center_y') and args.center_y is not None else cube._n_y // 2
+    # Define data arrays for analysis
+    x = cube.x
+    y = cube.y
     
-    # Get position angle and ellipticity
-    pa = args.pa if hasattr(args, 'pa') and args.pa is not None else 0
-    ellipticity = args.ellipticity if hasattr(args, 'ellipticity') and args.ellipticity is not None else 0
+    # Get center coordinates - now with proper defaults for IFU center
+    center_x = None
+    center_y = None
     
-    # Get log spacing flag
-    log_spacing = args.log_spacing if hasattr(args, 'log_spacing') else False
+    # Check if center coordinates are provided in command line args
+    if hasattr(args, 'center_x') and args.center_x is not None:
+        center_x = args.center_x
+    if hasattr(args, 'center_y') and args.center_y is not None:
+        center_y = args.center_y
+        
+    # Also check for combined center_coordinates in string format
+    if hasattr(args, 'center_coordinates') and args.center_coordinates:
+        try:
+            # Parse "x,y" format
+            center_parts = args.center_coordinates.split(',')
+            if len(center_parts) == 2:
+                if center_x is None:  # Only set if not already set
+                    center_x = float(center_parts[0])
+                if center_y is None:  # Only set if not already set
+                    center_y = float(center_parts[1])
+                logger.info(f"Using provided center coordinates: ({center_x}, {center_y})")
+        except Exception as e:
+            logger.warning(f"Could not parse center coordinates: {e}")
     
     # Try to get PA and center from P2P results if available and not specified
     if p2p_results is not None:
@@ -257,18 +274,22 @@ def run_rdb_analysis(args, cube, p2p_results=None):
             if 'global_kinematics' in p2p_results and 'center' in p2p_results['global_kinematics']:
                 center = p2p_results['global_kinematics']['center']
                 if (isinstance(center, tuple) or isinstance(center, list)) and len(center) == 2:
-                    if (args.center_x is None and args.center_y is None):
+                    if center_x is None and center_y is None:
                         center_x, center_y = center
                         logger.info(f"Using center=({center_x:.1f}, {center_y:.1f}) from P2P results")
         except Exception as e:
             logger.warning(f"Error extracting parameters from P2P results: {e}")
     
-    # Define data arrays for analysis
-    x = cube.x
-    y = cube.y
+    # Get position angle and ellipticity
+    pa = args.pa if hasattr(args, 'pa') and args.pa is not None else 0
+    ellipticity = args.ellipticity if hasattr(args, 'ellipticity') and args.ellipticity is not None else 0
+    
+    # Get log spacing flag
+    log_spacing = args.log_spacing if hasattr(args, 'log_spacing') else False
     
     try:
-        # Calculate radial bins
+        # Calculate radial bins - now with center_x and center_y possibly None
+        # The calculate_radial_bins function will use IFU center if they are None
         indices = np.arange(len(x))
         bin_num, bin_edges, bin_radii = calculate_radial_bins(
             x, y, center_x=center_x, center_y=center_y,
@@ -324,12 +345,12 @@ def run_rdb_analysis(args, cube, p2p_results=None):
             velocity_field, cube._n_x, cube._n_y
         )
         
-        # Create metadata
+        # Create metadata - include center coordinates used
         metadata = {
             'nx': cube._n_x,
             'ny': cube._n_y,
-            'center_x': center_x,
-            'center_y': center_y,
+            'center_x': center_x,  # Will be None if IFU center was used
+            'center_y': center_y,  # Will be None if IFU center was used
             'pa': pa,
             'ellipticity': ellipticity,
             'n_rings': n_rings,
@@ -386,10 +407,6 @@ def run_rdb_analysis(args, cube, p2p_results=None):
             indices_result = cube.calculate_spectral_indices(
                 n_jobs=args.n_jobs
             )
-        
-        # In run_vnb_analysis/run_rdb_analysis:
-
-        
         
         # Prepare standardized output dictionary
         rdb_results = {
@@ -450,8 +467,6 @@ def run_rdb_analysis(args, cube, p2p_results=None):
             if hasattr(cube, '_bin_indices_result') and cube._bin_indices_result:
                 rdb_results['bin_indices'] = cube._bin_indices_result
 
-        # Add this after spectral indices calculation in both voronoi.py and radial.py:
-
         # Create spectral index visualizations if requested
         if indices_result is not None and not args.no_plots:
             try:
@@ -503,9 +518,6 @@ def run_rdb_analysis(args, cube, p2p_results=None):
         if not hasattr(args, 'no_plots') or not args.no_plots:
             binned_data.create_visualization_plots(plots_dir, galaxy_name)
             create_rdb_plots(cube, rdb_results, galaxy_name, plots_dir, args)
-
-        # Add these lines near the end of the run_rdb_analysis function in radial.py
-        # Just before returning the results
 
         # Create bin spectrum plots if requested
         if not args.no_plots:

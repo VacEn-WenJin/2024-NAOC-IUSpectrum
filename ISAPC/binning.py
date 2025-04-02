@@ -1201,9 +1201,9 @@ def _create_fallback_binning(x, y, n_bins=5):
     return bin_num, np.array(x_gen), np.array(y_gen), np.array(sn), np.array(n_pixels), 1.0
 
 
-def calculate_radial_bins(x, y, center_x=0, center_y=0, pa=0, ellipticity=0, n_rings=10, log_spacing=False):
+def calculate_radial_bins(x, y, center_x=None, center_y=None, pa=0, ellipticity=0, n_rings=10, log_spacing=False):
     """
-    Calculate radial bins with improved error handling
+    Calculate radial bins with improved error handling and proper centering
     
     Parameters
     ----------
@@ -1211,10 +1211,10 @@ def calculate_radial_bins(x, y, center_x=0, center_y=0, pa=0, ellipticity=0, n_r
         x coordinates
     y : ndarray
         y coordinates
-    center_x : float, default=0
-        x coordinate of center
-    center_y : float, default=0
-        y coordinate of center
+    center_x : float, optional
+        x coordinate of center. If None, uses center of the IFU field.
+    center_y : float, optional
+        y coordinate of center. If None, uses center of the IFU field.
     pa : float, default=0
         Position angle (degrees)
     ellipticity : float, default=0
@@ -1230,6 +1230,19 @@ def calculate_radial_bins(x, y, center_x=0, center_y=0, pa=0, ellipticity=0, n_r
         (bin_num, bin_edges, bin_radii)
     """
     try:
+        # Determine the center if not provided
+        if center_x is None or center_y is None:
+            # Use the center of the IFU field (geometric center)
+            x_min, x_max = np.min(x[np.isfinite(x)]), np.max(x[np.isfinite(x)])
+            y_min, y_max = np.min(y[np.isfinite(y)]), np.max(y[np.isfinite(y)])
+            
+            if center_x is None:
+                center_x = (x_min + x_max) / 2.0
+            if center_y is None:
+                center_y = (y_min + y_max) / 2.0
+                
+            logger.info(f"Using IFU center as bin center: ({center_x:.2f}, {center_y:.2f})")
+        
         # Convert position angle to radians
         pa_rad = np.radians(pa)
         
