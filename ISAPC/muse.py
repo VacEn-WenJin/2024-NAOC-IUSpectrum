@@ -1836,7 +1836,7 @@ class MUSECube:
             Number of parallel jobs
         verbose : bool, default=False
             Whether to display detailed information
-                
+                    
         Returns
         -------
         dict
@@ -1927,16 +1927,24 @@ class MUSECube:
                 # Get all data at once to minimize Python-level operations
                 observed_spectrum = self._spectra[:, idx]
                 optimal_template = self._optimal_tmpls[:, i, j]
-                velocity = self._velocity_field[i, j]
+                stellar_velocity = self._velocity_field[i, j]
+                
+                # Get gas velocity if available - separate from stellar velocity
+                gas_velocity = None
+                if has_emission_lines and hasattr(self, '_emission_vel'):
+                    # Try to find gas velocity from available emission lines
+                    for line_name, vel_map in self._emission_vel.items():
+                        if np.isfinite(vel_map[i, j]):
+                            gas_velocity = vel_map[i, j]
+                            break
                 
                 # Get gas model if available - only once
                 gas_model = None
                 if has_emission_lines:
                     gas_model = self._gas_bestfit_field[:, i, j]
                     # Verify gas model has valid values
-                    # if not np.any(np.isfinite(gas_model)) or np.all(gas_model == 0):
-                    #     print('!!!!!!')
-                    #     gas_model = None
+                    if not np.any(np.isfinite(gas_model)) or np.all(gas_model == 0):
+                        gas_model = None
                 
                 # Create LineIndexCalculator with warning suppression
                 with warnings.catch_warnings():
@@ -1953,7 +1961,8 @@ class MUSECube:
                             fit_flux=optimal_template,       # Template spectrum
                             em_wave=self._lambda_gal if gas_model is not None else None,  # Emission line wavelength grid
                             em_flux_list=gas_model,    # Emission line spectrum
-                            velocity_correction=velocity,    # Velocity correction
+                            velocity_correction=stellar_velocity,    # Stellar velocity correction
+                            gas_velocity_correction=gas_velocity,    # Gas velocity correction - key change
                             continuum_mode='auto'            # Auto select continuum mode
                         )
                     except Exception as e:
@@ -2013,7 +2022,7 @@ class MUSECube:
             logger.error(f"Error calculating spectral indices: {str(e)}")
             logger.setLevel(original_level)
             return {}
-        
+    
     def _calculate_spectral_indices_binned(self, indices_list=None, n_jobs=-1, verbose=False):
         """
         Calculate spectral indices for binned data using the same approach as pixel-to-pixel mode
@@ -2026,7 +2035,7 @@ class MUSECube:
             Number of parallel jobs
         verbose : bool, default=False
             Whether to display detailed information
-                    
+                        
         Returns
         -------
         dict
@@ -2089,14 +2098,14 @@ class MUSECube:
                     else:
                         # Fallback if no optimal template available
                         optimal_template = None
-                        
+                            
                         # Try to compute it from weights if available (initial fitting)
                         if hasattr(self, '_bin_weights') and len(self._bin_weights) > bin_idx:
                             weights = self._bin_weights[bin_idx]
                             if hasattr(self, '_sps') and hasattr(self._sps, 'templates'):
                                 # Basic optimal template from weights
                                 optimal_template = np.dot(weights, self._sps.templates.T)
-                                
+                                    
                                 # Add polynomial if available
                                 if hasattr(self, '_bin_poly_coeffs'):
                                     for b_idx, poly_coeff in self._bin_poly_coeffs:
@@ -2105,8 +2114,17 @@ class MUSECube:
                                             template_poly = np.poly1d(poly_coeff)(self._sps.lam_temp)
                                             optimal_template += template_poly
                                             break
+                        
+                    stellar_velocity = self._bin_velocity[bin_idx]
                     
-                    velocity = self._bin_velocity[bin_idx]
+                    # Get gas velocity if available - this is the key change
+                    gas_velocity = None
+                    if hasattr(self, '_bin_emission_vel'):
+                        # Try to find gas velocity from available emission lines
+                        for line_name, vel_array in self._bin_emission_vel.items():
+                            if bin_idx < len(vel_array) and np.isfinite(vel_array[bin_idx]):
+                                gas_velocity = vel_array[bin_idx]
+                                break
                     
                     # Get gas model if available - only once
                     gas_model = None
@@ -2132,7 +2150,8 @@ class MUSECube:
                                 fit_flux=optimal_template,               # Template spectrum (now with polynomial)
                                 em_wave=self._binned_wavelength if gas_model is not None else None,  # Emission line wavelength grid
                                 em_flux_list=gas_model,                 # Emission line spectrum
-                                velocity_correction=velocity,           # Velocity correction
+                                velocity_correction=stellar_velocity,   # Stellar velocity correction
+                                gas_velocity_correction=gas_velocity,   # Gas velocity correction - key change
                                 continuum_mode='auto'                   # Auto select continuum mode
                             )
                         except Exception as e:
@@ -2221,7 +2240,7 @@ class MUSECube:
             Number identifier for the plot
         save_path : str, optional
             Path to save the plot
-            
+                
         Returns
         -------
         matplotlib.figure.Figure
@@ -2267,18 +2286,30 @@ class MUSECube:
                     # Get optimal template on original wavelength grid
                     optimal_template = self._optimal_tmpls[:, row, col]
                     
+                    # Get stellar velocity
+                    stellar_velocity = self._velocity_field[row, col]
+                    
+                    # Get gas velocity if available - this is the key change
+                    gas_velocity = None
+                    if hasattr(self, '_emission_vel'):
+                        # Try to find gas velocity from available emission lines
+                        for line_name, vel_map in self._emission_vel.items():
+                            if np.isfinite(vel_map[row, col]):
+                                gas_velocity = vel_map[row, col]
+                                break
+                    
                     # Skip if template is not valid
                     if not np.any(np.isfinite(optimal_template)):
                         logger.warning(f"No valid template for position ({row}, {col})")
                         return None
                     
                     # Get gas model if available
-                    # gas_model = None
-                    # if self._gas_bestfit_field is not None:
-                    gas_model = self._gas_bestfit_field[:, row, col]
+                    gas_model = None
+                    if hasattr(self, '_gas_bestfit_field') and self._gas_bestfit_field is not None:
+                        gas_model = self._gas_bestfit_field[:, row, col]
                         # Verify gas model is valid
-                        # if not np.any(np.isfinite(gas_model)) or np.all(gas_model == 0):
-                        #     gas_model = None
+                        if not np.any(np.isfinite(gas_model)) or np.all(gas_model == 0):
+                            gas_model = None
                     
                     # Create LineIndexCalculator for this position
                     try:
@@ -2289,7 +2320,8 @@ class MUSECube:
                             fit_flux=optimal_template,
                             em_wave=self._lambda_gal if gas_model is not None else None,
                             em_flux_list=gas_model,
-                            velocity_correction=self._velocity_field[row, col],
+                            velocity_correction=stellar_velocity,
+                            gas_velocity_correction=gas_velocity,  # Pass gas velocity separately
                             continuum_mode='auto'
                         )
                     except Exception as e:
@@ -3209,12 +3241,21 @@ class MUSECube:
                 logger.warning(f"No valid data for bin {bin_idx}")
                 return None
             
-            # Get velocity
-            velocity = 0.0
+            # Get stellar velocity
+            stellar_velocity = 0.0
             if hasattr(self, '_bin_velocity') and bin_idx < len(self._bin_velocity):
-                velocity = self._bin_velocity[bin_idx]
-                if not np.isfinite(velocity):
-                    velocity = 0.0
+                stellar_velocity = self._bin_velocity[bin_idx]
+                if not np.isfinite(stellar_velocity):
+                    stellar_velocity = 0.0
+            
+            # Get gas velocity if available - this is the key change
+            gas_velocity = None
+            if hasattr(self, '_bin_emission_vel'):
+                # Try to find gas velocity from available emission lines
+                for line_name, vel_array in self._bin_emission_vel.items():
+                    if bin_idx < len(vel_array) and np.isfinite(vel_array[bin_idx]):
+                        gas_velocity = vel_array[bin_idx]
+                        break
             
             # Get optimal template - CRITICAL: This must match how it's done in index calculation
             optimal_template = None
@@ -3258,7 +3299,9 @@ class MUSECube:
                     em_flux = gas_data
             
             # Print diagnostic info
-            logger.info(f"Bin {bin_idx} - Velocity: {velocity:.2f} km/s")
+            logger.info(f"Bin {bin_idx} - Stellar Velocity: {stellar_velocity:.2f} km/s")
+            if gas_velocity is not None:
+                logger.info(f"Bin {bin_idx} - Gas Velocity: {gas_velocity:.2f} km/s")
             logger.info(f"Bin {bin_idx} - Observed wavelength range: {np.min(self._binned_wavelength):.1f}-{np.max(self._binned_wavelength):.1f}")
             if fit_wave is not None:
                 logger.info(f"Bin {bin_idx} - Template wavelength range: {np.min(fit_wave):.1f}-{np.max(fit_wave):.1f}")
@@ -3273,7 +3316,8 @@ class MUSECube:
                 fit_flux=fit_flux,
                 em_wave=em_wave,
                 em_flux_list=em_flux,
-                velocity_correction=velocity,
+                velocity_correction=stellar_velocity,
+                gas_velocity_correction=gas_velocity,  # Pass gas velocity separately
                 continuum_mode='auto',
                 show_warnings=False
             )
@@ -3304,7 +3348,8 @@ class MUSECube:
             import traceback
             logger.error(traceback.format_exc())
             return None
-    
+
+
     def _post_process_emission_results(self):
         """
         Post-process emission line results by replacing NaN values with zeros

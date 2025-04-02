@@ -121,7 +121,7 @@ def run_galaxy_pipeline(galaxies, args):
         try:
             # Build the command
             cmd = build_command(galaxy, args)
-            
+            # print(cmd)
             # Log the command
             logger.info(f"Running: {' '.join(cmd)}")
             

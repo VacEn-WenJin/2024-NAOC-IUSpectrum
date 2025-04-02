@@ -1,5 +1,0 @@
-2025-03-19 00:45:33 - INFO - ISAPC analysis started, target: data/MUSE/VCC1588_stack.fits
-2025-03-19 00:45:33 - INFO - Parameters: redshift=0.0042, wavelength range=None, mode=P2P
-2025-03-19 00:45:33 - INFO - Data loaded in 0.3 seconds
-2025-03-19 00:45:33 - INFO - Using wavelength range: (4830.830511850229, 5206.632144991037)
-2025-03-19 00:45:33 - INFO - Automatically selected template: templates\spectra_emiles_9.0.npz

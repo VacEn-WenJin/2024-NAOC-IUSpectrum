@@ -53,9 +53,10 @@ def warn(message, category=UserWarning):
 
 class LineIndexCalculator:
     def __init__(self, wave, flux, fit_wave, fit_flux, em_wave=None, em_flux_list=None, 
-                 velocity_correction=0, error=None, continuum_mode='auto', show_warnings=True):
+                 velocity_correction=0, gas_velocity_correction=None, error=None, 
+                 continuum_mode='auto', show_warnings=True):
         """
-        Initialize the absorption line index calculator
+        Initialize the absorption line index calculator with separate gas velocity
         
         Parameters:
         -----------
@@ -72,7 +73,9 @@ class LineIndexCalculator:
         em_flux_list : array-like, optional
             Combined emission line spectrum
         velocity_correction : float, optional
-            Velocity correction value in km/s, default is 0
+            Stellar velocity correction value in km/s, default is 0
+        gas_velocity_correction : float, optional
+            Gas velocity correction value in km/s. If None, uses velocity_correction
         error : array-like, optional
             Error array
         continuum_mode : str, optional
@@ -89,10 +92,12 @@ class LineIndexCalculator:
 
         self.c = 299792.458  # Speed of light in km/s
         self.velocity = velocity_correction
+        # Use stellar velocity for gas if gas velocity not provided
+        self.gas_velocity = gas_velocity_correction if gas_velocity_correction is not None else velocity_correction
         self.continuum_mode = continuum_mode
         
         # Create copies and ensure finite values
-        self.wave = self._apply_velocity_correction(wave)
+        self.wave = self._apply_velocity_correction(wave, self.velocity)
         self.flux = np.array(flux, copy=True)
         
         # Replace any NaN or Inf values with zeros
@@ -111,9 +116,10 @@ class LineIndexCalculator:
         
         self.error = error if error is not None else np.ones_like(flux)
         
-        # Process emission lines
+        # Process emission lines - now with separate gas velocity
         if em_wave is not None and em_flux_list is not None:
-            self.em_wave = self._apply_velocity_correction(em_wave)
+            # Apply gas velocity correction to emission lines
+            self.em_wave = self._apply_velocity_correction(em_wave, self.gas_velocity)
             self.em_flux_list = em_flux_list
             
             # Handle NaNs in emission line flux
@@ -128,6 +134,23 @@ class LineIndexCalculator:
         """根据实例设置发出警告"""
         if self.show_warnings and SHOW_WARNINGS:
             warnings.warn(message, category)
+    
+    def _apply_velocity_correction(self, wave, velocity):
+        """
+        Apply velocity correction to the wavelength
+        
+        Parameters:
+        -----------
+        wave : array-like
+            Original wavelength array
+        velocity : float
+            Velocity correction in km/s
+            
+        Returns:
+        --------
+        array-like : Corrected wavelength array
+        """
+        return wave / (1 + (velocity/self.c))
     
     def _subtract_emission_lines(self):
         """
@@ -148,21 +171,6 @@ class LineIndexCalculator:
         except Exception as e:
             self._warn(f"Error subtracting emission lines: {str(e)}. Continuing without emission line subtraction.")
     
-    def _apply_velocity_correction(self, wave):
-        """
-        Apply velocity correction to the wavelength
-        
-        Parameters:
-        -----------
-        wave : array-like
-            Original wavelength array
-            
-        Returns:
-        --------
-        array-like : Corrected wavelength array
-        """
-        return wave / (1 + (self.velocity/self.c))
-
     def _check_data_coverage(self, wave_range):
         """
         Check if the original data completely covers the given wavelength range
@@ -405,7 +413,7 @@ class LineIndexCalculator:
 
     def plot_all_lines(self, mode=None, number=None, save_path=None, show_index=False):
         """
-        Plot all spectral lines in a complete figure
+        Plot all spectral lines in a complete figure with proper velocity information
         
         Parameters:
         -----------
@@ -765,7 +773,12 @@ class LineIndexCalculator:
             ax.grid(True, alpha=0.3)
             ax.legend(loc='upper right')
         
-        ax1.set_title(f'Original Data Comparison (v={self.velocity:.1f} km/s)')
+        # Add separate velocity information to title
+        if self.gas_velocity != self.velocity:
+            ax1.set_title(f'Original Data Comparison (v_star={self.velocity:.1f}, v_gas={self.gas_velocity:.1f} km/s)')
+        else:
+            ax1.set_title(f'Original Data Comparison (v={self.velocity:.1f} km/s)')
+            
         ax2.set_title('Processed Spectrum with Continuum Fits')
         
         # Apply a safer approach to tight_layout
